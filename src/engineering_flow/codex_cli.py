@@ -84,6 +84,21 @@ def _as_text(value: str | bytes | None) -> str:
     return value
 
 
+def _failure_event_diagnostics(events: list[NormalizedEvent]) -> str:
+    """Return diagnostics only from provider events that declare failure.
+
+    Successful events can contain the generated artifact, whose prose is not
+    provider diagnostic evidence. In particular, an artifact may legitimately
+    discuss authentication without making the execution an auth failure.
+    """
+
+    return " ".join(
+        json.dumps(event.payload, sort_keys=True)
+        for event in events
+        if event.type in _FAILURE_EVENTS
+    )
+
+
 class CodexCliRuntime(AgentRuntime):
     """Execute read-only planning through ``codex exec`` without a shell."""
 
@@ -544,9 +559,8 @@ class CodexCliRuntime(AgentRuntime):
             )
         if returncode not in (0, None):
             diagnostic = safe_stderr or "Codex process exited unsuccessfully"
-            event_diagnostics = " ".join(
-                sanitize_text(json.dumps(event.payload, sort_keys=True), self._secret_values)
-                for event in events
+            event_diagnostics = sanitize_text(
+                _failure_event_diagnostics(events), self._secret_values
             )
             classification = (
                 FailureClassification.AUTHENTICATION
@@ -558,9 +572,8 @@ class CodexCliRuntime(AgentRuntime):
                 TerminalState.FAILED, None, usage, tuple(events), {"returncode": returncode, "stderr": diagnostic},
                 classification, diagnostic,
             )
-        event_diagnostics = " ".join(
-            sanitize_text(json.dumps(event.payload, sort_keys=True), self._secret_values)
-            for event in events
+        event_diagnostics = sanitize_text(
+            _failure_event_diagnostics(events), self._secret_values
         )
         if _AUTHENTICATION_ERROR.search(event_diagnostics):
             detail = "Codex authentication failed"

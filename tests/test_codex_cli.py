@@ -192,6 +192,24 @@ class CodexCliTests(unittest.TestCase):
         self.assertEqual(result.terminal_state, TerminalState.FAILED)
         self.assertEqual(result.failure_classification, FailureClassification.AUTHENTICATION)
 
+    def test_successful_artifact_mentioning_authentication_is_not_auth_failure(self):
+        payload = {
+            "artifact_markdown": "# Authentication\n\nAuthentication is required for deployment.",
+            "summary": "Defines authentication requirements.",
+            "requires_human_approval": True,
+            "approval_reason": "required by policy",
+        }
+        runtime = self.runtime(popen_factory=lambda argv, **kwargs: FakeProcess(
+            json.dumps({"type": "item.completed", "payload": payload}) + "\n"
+            '{"type":"turn.completed","id":"turn-auth-content"}\n'
+        ))
+
+        result = runtime.execute_planning(self.request())
+
+        self.assertEqual(result.terminal_state, TerminalState.SUCCEEDED)
+        self.assertIsNone(result.failure_classification)
+        self.assertEqual(result.content, payload["artifact_markdown"])
+
     def test_jsonl_is_consumed_from_streaming_stdout(self):
         def streaming_popen(argv, **kwargs):
             payload = {
