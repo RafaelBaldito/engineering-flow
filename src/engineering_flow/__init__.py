@@ -24,6 +24,7 @@ from .runtime import (
     TerminalState,
 )
 from .orchestrator import Orchestrator, PlanningOrchestrator
+from .config import Config, FlowConfig, load_config
 
 __all__ = [
     "ApprovalDecision",
@@ -47,4 +48,7 @@ __all__ = [
     "TerminalState",
     "Orchestrator",
     "PlanningOrchestrator",
+    "Config",
+    "FlowConfig",
+    "load_config",
 ]

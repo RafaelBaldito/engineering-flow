@@ -14,7 +14,7 @@ delivery, other providers, and a UI/service.
 | TASK-001 | Establish the Durable Workflow Core | — | PASS |
 | TASK-002 | Implement the Codex Planning Runtime Adapter | TASK-001 | PASS |
 | TASK-003 | Implement Controlled Planning Orchestration | TASK-001, TASK-002 | PASS |
-| TASK-004 | Deliver Configuration and the CLI Control Surface | TASK-003 | PENDING |
+| TASK-004 | Deliver Configuration and the CLI Control Surface | TASK-003 | PASS |
 
 ## Coverage
 
