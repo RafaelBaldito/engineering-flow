@@ -22,11 +22,35 @@ _ENVIRONMENT_KEYS = frozenset({"env", "environment"})
 
 
 def _is_sensitive_key(key: str) -> bool:
-    return bool(re.search(
-        r"(?i)(?:api[_-]?key|access[_-]?key|secret|token|password|passwd|"
-        r"authorization|credential|private[_-]?key)",
-        key,
-    ))
+    """Identify credential-bearing keys without hiding usage counters.
+
+    Provider responses commonly report usage as fields such as
+    ``input_tokens`` and ``cached_input_tokens``.  Those counters are not
+    credentials and are required workflow observability metadata.  Treat
+    ``token`` as sensitive only when it is a complete key component, leaving
+    the plural ``tokens`` counter component intact.
+    """
+
+    components = [
+        component
+        for component in re.split(r"[_\-.]+", key.casefold())
+        if component
+    ]
+    joined = "_".join(components)
+    sensitive_components = {
+        "secret",
+        "token",
+        "password",
+        "passwd",
+        "authorization",
+        "credential",
+    }
+    return (
+        any(component in sensitive_components for component in components)
+        or "api_key" in joined
+        or "access_key" in joined
+        or "private_key" in joined
+    )
 
 
 def sanitize_text(value: str, secret_values: Iterable[str] = ()) -> str:

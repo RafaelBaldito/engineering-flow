@@ -142,6 +142,7 @@ class StoreTests(unittest.TestCase):
             payload={
                 "env": {"PATH": "C:/event-path"},
                 "nested": {"ENVIRONMENT": {"HOME": "C:/event-home"}},
+                "input_tokens": 101,
             },
         )
         intent = self.store.create_generation_intent(
@@ -151,16 +152,18 @@ class StoreTests(unittest.TestCase):
             capability_report={
                 "password": "TOP-SECRET",
                 "environment": {"HOME": "C:/capability-home"},
+                "cached_input_tokens": 202,
             },
         )
         self.store.complete_generation(intent.operation.idempotency_key, content="content", stage=Stage.PRD,
                                        revision=1, artifact_path=Path(self.temp_dir.name) / "workflows" / workflow.id
                                        / "artifacts" / "001-prd.md",
-                                       terminal_result={
-                                           "stderr": "token=TOP-SECRET",
-                                           "env": {"SHELL": "C:/terminal-shell"},
-                                           "nested": {"environment": {"TEMP": "C:/terminal-temp"}},
-                                       })
+            terminal_result={
+                "stderr": "token=TOP-SECRET",
+                "env": {"SHELL": "C:/terminal-shell"},
+                "nested": {"environment": {"TEMP": "C:/terminal-temp"}},
+                "output_tokens": 303,
+            })
         events = self.store.list_events(workflow.id)
         self.assertEqual([event.sequence for event in events], list(range(1, len(events) + 1)))
         encoded = json.dumps([event.payload for event in events])
@@ -182,6 +185,10 @@ class StoreTests(unittest.TestCase):
         self.assertNotIn("env", json.dumps(execution.terminal_result))
         self.assertNotIn("environment", json.dumps(execution.terminal_result))
         self.assertNotIn("C:/terminal-shell", json.dumps(execution.terminal_result))
+        diagnostic_event = next(event for event in events if event.type == "diagnostic.environment")
+        self.assertEqual(diagnostic_event.payload["input_tokens"], 101)
+        self.assertEqual(intent.execution.capability_report["cached_input_tokens"], 202)
+        self.assertEqual(execution.terminal_result["output_tokens"], 303)
         self.assertEqual(self.store.get_workflow(workflow.id).configuration_snapshot["api_token"], "[REDACTED]")
         self.assertNotIn("environment", self.store.get_workflow(workflow.id).configuration_snapshot)
         self.assertNotIn("C:/sensitive-runtime-path", json.dumps(

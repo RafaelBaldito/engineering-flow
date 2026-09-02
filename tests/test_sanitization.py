@@ -24,6 +24,23 @@ class SanitizationTests(unittest.TestCase):
         self.assertEqual(result["items"], ["[REDACTED]"])
         self.assertEqual(payload["settings"]["api_key"], "secret-value")
 
+    def test_numeric_provider_usage_counters_are_preserved_while_tokens_are_redacted(self):
+        payload = {
+            "input_tokens": 123,
+            "cached_input_tokens": 45,
+            "output_tokens": 67,
+            "authorization": "Bearer secret-value",
+            "access_token": "secret-value",
+        }
+
+        result = sanitize_payload(payload, ("secret-value",))
+
+        self.assertEqual(result["input_tokens"], 123)
+        self.assertEqual(result["cached_input_tokens"], 45)
+        self.assertEqual(result["output_tokens"], 67)
+        self.assertEqual(result["authorization"], "[REDACTED]")
+        self.assertEqual(result["access_token"], "[REDACTED]")
+
     def test_persisted_payload_removes_nested_environment_mappings(self):
         payload = {
             "keep": "value",
