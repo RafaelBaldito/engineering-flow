@@ -1,588 +1,458 @@
 ---
-description: |
-  Perform the final project-level acceptance audit after all planned
-  delivery scopes and tasks have completed task-level review. Validate
-  end-to-end traceability from approved requirements through delivery
-  plans, technical specifications, tasks, implementation, and tests.
-  Detect missing implementation, specification drift, integration
-  defects, and undocumented scope. Produce PASS, FIX_REQUIRED,
-  SPEC_CHANGE_REQUIRED, or BLOCKED with evidence-based findings. Do not
-  fix code or silently change approved specifications.
 name: final-review
+description: |
+  Perform the final release-level acceptance audit after every delivery scope
+  included in the approved release has completed its Wave-level or equivalent
+  acceptance review. Validate end-to-end traceability from approved
+  requirements through delivery plans, architecture, technical specifications,
+  accepted Waves, implementation, tests, and release-level behavior. Produce
+  PASS, FIX_REQUIRED, SPEC_CHANGE_REQUIRED, or BLOCKED with evidence-based
+  findings. Persist the authoritative final review artifact. Do not fix code,
+  re-review Waves, or silently change approved specifications.
 ---
 
 # Final Review
 
 ## Purpose
 
-Perform an independent final audit of the complete approved delivery.
+Perform an independent final acceptance audit of the complete approved release.
 
-Unlike `review-task`, which validates one implementation task, this
-skill verifies that the project as a whole is coherent, complete,
-integrated, and traceable.
+This skill is release-level.
 
-The final review answers two complementary questions:
+It MUST NOT be used as the acceptance gate for a single Wave when the approved
+delivery contains additional Waves.
 
-1.  Was everything that was approved actually delivered?
-2.  Is everything that was delivered consistent with what was approved?
+Use `wave-review` to accept an individual Wave.
 
-The review must validate the full chain:
+The final review answers:
 
-`PRD → Delivery Plan → Architecture → TECHSPEC(s) → Tasks → Code → Tests`
+1. Was the complete approved release delivered?
+2. Are all included delivery scopes accepted and mutually coherent?
+3. Does the integrated release satisfy approved product and architecture
+   expectations?
 
-Not every project will contain every artifact. The review must adapt to
-the approved delivery mode and repository conventions without inventing
-missing ceremony.
+The release traceability chain is:
+
+`PRD → Delivery Plan → Architecture → Accepted Wave(s) → TECHSPEC(s) → Tasks → Code → Tests → Release Validation`
 
 ## When to Use
 
 Use this skill when:
 
--   all planned `SINGLE` tasks have completed task-level review; or
--   all planned Waves intended for the current release have completed
-    their task-level reviews;
--   the project or release is believed to be implementation-complete;
--   a final acceptance audit is requested before declaring delivery
-    complete;
--   a previously failed final review has been remediated and needs
-    re-review.
+- all Waves included in the release have completed `wave-review` with `PASS`; or
+- a `SINGLE` delivery has completed its equivalent implementation/review gate;
+- the release is believed implementation-complete;
+- a final release acceptance audit is requested;
+- a previously failed final review has been remediated and needs re-review.
 
 Do not use this skill when:
 
--   implementation tasks are still intentionally pending;
--   individual task defects are already known and have not been
-    remediated;
--   the request is to implement or fix code;
--   the request is only to review one task;
--   product or technical planning is still actively changing.
+- any included Wave still lacks Wave-level acceptance;
+- a Wave has unresolved blocking findings;
+- implementation tasks are still intentionally pending;
+- the request is to accept one Wave;
+- the request is to fix code;
+- product or technical planning is still actively changing.
 
 ## Inputs
 
 ### Required
 
--   approved PRD;
--   approved delivery definition for the release:
-    -   `SINGLE`, or
-    -   the set of Waves included in the release;
--   repository implementation state.
+- approved PRD;
+- approved release boundary;
+- approved Delivery Plan or equivalent delivery definition;
+- repository implementation state;
+- authoritative Wave-review evidence for all included Waves.
 
 ### Conditionally Required
 
-When present in the approved workflow:
+When present:
 
--   approved Delivery Plan;
--   approved architecture documentation or ADRs;
--   approved TECHSPEC(s);
--   task indexes and task specifications;
--   task review status/evidence.
+- architecture overview and ADRs;
+- approved TECHSPECs;
+- Wave task indexes;
+- task-review evidence;
+- release/manual acceptance procedure;
+- runtime/provider acceptance evidence.
 
 ### Optional
 
 Load when necessary:
 
--   `AGENTS.md`;
--   repository README;
--   validation configuration;
--   deployment or runtime configuration;
--   relevant operational documentation;
--   previous final-review findings when performing re-review.
+- `AGENTS.md`;
+- README;
+- validation/deployment/runtime configuration;
+- previous final review;
+- final-review remediation evidence.
 
 ## Authoritative Sources
 
-Use the following precedence unless the user explicitly establishes
-another authority:
+Use this precedence unless explicitly overridden by an authorized user
+instruction:
 
-1.  current explicit user instructions authorized to define final-review
-    scope;
-2.  approved PRD;
-3.  approved Delivery Plan;
-4.  approved architecture decisions and ADRs;
-5.  approved TECHSPEC(s);
-6.  approved task specifications;
-7.  explicit repository constraints and conventions;
-8.  implementation and tests as delivery evidence.
+1. current explicit user instructions defining final-review release scope;
+2. approved PRD;
+3. approved Delivery Plan;
+4. approved architecture/ADRs;
+5. approved TECHSPECs;
+6. authoritative accepted Wave-review artifacts;
+7. approved task specifications;
+8. repository constraints/conventions;
+9. implementation and tests as delivery evidence.
 
-Lower-level artifacts and code must not silently redefine approved
-upstream scope.
+A lower-level artifact cannot silently redefine approved upstream scope.
 
-Task-level `PASS` is evidence, but it does not guarantee project-level
-acceptance. Integration and traceability must still be verified.
+Wave-level `PASS` is required evidence but does not guarantee release-level
+acceptance. Cross-Wave integration and complete release traceability must still
+be verified.
 
 ## Preconditions
 
 Before beginning final acceptance:
 
--   [ ] the release boundary can be identified;
--   [ ] required approved specification artifacts are available;
--   [ ] all tasks expected for the release have a known status;
--   [ ] no intentionally incomplete delivery scope is being presented as
-    complete;
--   [ ] repository state represents the release being reviewed.
+- [ ] release boundary is explicit;
+- [ ] every included Wave is identified;
+- [ ] every included Wave has authoritative Wave-review `PASS`;
+- [ ] required approved specification artifacts are available;
+- [ ] repository state represents the release being reviewed;
+- [ ] no intentionally incomplete scope is presented as complete.
 
-If required artifacts or release boundaries cannot be established,
-report `BLOCKED`.
+If any included Wave lacks authoritative `PASS`, report `BLOCKED`.
 
-If approved artifacts contradict each other in a way that prevents final
-acceptance, report `SPEC_CHANGE_REQUIRED`.
+Do not use final review to perform missing Wave acceptance.
+
+If approved artifacts materially contradict each other, report
+`SPEC_CHANGE_REQUIRED`.
 
 ## Workflow
 
-### 1. Establish the final-review boundary
-
-Determine exactly what is being accepted.
-
-For `SINGLE`, identify the complete approved delivery scope.
-
-For `WAVES`, identify which approved Waves belong to the release under
-review.
+### 1. Establish the release boundary
 
 Record:
 
--   included product requirements;
--   included delivery scopes;
--   explicitly deferred requirements or Waves;
--   non-goals;
--   applicable global constraints.
+- release identifier/name when present;
+- included requirements;
+- included Waves/scopes;
+- explicitly deferred Waves/requirements;
+- non-goals;
+- applicable global constraints.
 
-Do not treat intentionally deferred work as missing implementation.
+Do not fail approved deferred work outside the release boundary.
 
-### 2. Build the traceability map
+### 2. Verify Wave acceptance evidence
 
-Construct a working traceability map from approved requirements to
-delivery evidence.
+For every included Wave:
 
-For each applicable requirement, trace where possible:
+- locate the authoritative `WAVE-REVIEW.md` or equivalent;
+- verify its current result is `PASS`;
+- verify the artifact corresponds to the implementation state represented by the
+  release;
+- detect contradictory or stale Wave acceptance evidence.
 
-`Requirement → Delivery Scope → TECHSPEC → Task(s) → Implementation → Test/Validation`
+If Wave acceptance evidence is missing, stale, contradictory, or not `PASS`,
+report ownership `WAVE_REVIEW_REQUIRED`.
 
-The map is an audit mechanism and does not need to become a permanent
-artifact unless repository conventions require it.
+Do not perform the Wave review yourself.
 
-Flag broken links such as:
+### 3. Build release traceability
 
--   approved requirement with no delivery scope;
--   delivery scope with no technical realization;
--   TECHSPEC decision with no task coverage;
--   task with no implementation evidence;
--   implemented behavior with no approved source;
--   important behavior with no meaningful validation evidence.
+Trace applicable requirements through the accepted delivery:
 
-### 3. Verify delivery-plan completion
+`Requirement → Delivery Scope/Wave → TECHSPEC → Accepted Wave Evidence → Implementation → Release Validation`
 
-For `WAVES`:
+Flag:
 
--   confirm every Wave included in the release reached its intended
-    demonstrable outcome;
--   confirm dependencies between Waves are satisfied;
--   verify no required release behavior was left only in a future
-    outline.
+- approved requirement with no delivered Wave;
+- requirement split across Waves but not integrated;
+- cross-Wave contract not realized;
+- implementation with no approved source;
+- critical behavior with no release-level validation evidence.
 
-For `SINGLE`:
+### 4. Verify delivery-plan completion
 
--   confirm the approved complete delivery boundary was implemented.
+Confirm:
 
-Do not require future Waves that are explicitly outside the release
-boundary.
-
-### 4. Verify task completion and review state
-
-Inspect task indexes/statuses and review evidence.
-
-Confirm that every required implementation task is:
-
--   implemented;
--   independently reviewed;
--   accepted with `PASS`, unless the repository uses an equivalent
-    approved state.
-
-Identify:
-
--   `PENDING` tasks;
--   `IMPLEMENTED` but unreviewed tasks;
--   unresolved `FIX_REQUIRED`;
--   `BLOCKED`;
--   `SPEC_CHANGE_REQUIRED`;
--   tasks missing from expected coverage.
-
-A release cannot receive final `PASS` while required task-level blockers
-remain.
+- every included Wave reached its approved demonstrable outcome;
+- dependencies between included Waves are satisfied;
+- no required release behavior exists only in future/deferred scope;
+- Wave boundaries compose into the approved release.
 
 ### 5. Audit requirements completeness
 
-Review every applicable PRD requirement.
-
-Determine whether each requirement is:
+Classify each applicable PRD requirement:
 
 `DELIVERED`
-
-Implementation and validation evidence support it.
-
 `PARTIAL`
-
-Some required behavior exists but the approved requirement is not fully
-satisfied.
-
 `MISSING`
-
-No sufficient implementation evidence exists.
-
 `DEFERRED`
-
-Explicitly outside the current approved release boundary.
-
 `NOT_VERIFIABLE`
 
-Available evidence is insufficient to determine delivery.
+Do not infer delivery solely from task or Wave names.
 
-Do not infer delivery merely from task names or documentation claims.
+### 6. Audit cross-Wave and release integration
 
-### 6. Audit implementation drift
+Focus on concerns that cannot be fully proven by a single Wave review:
 
-Inspect implementation for behavior that materially exceeds or
-contradicts the approved scope.
+- shared contracts;
+- state transitions across Waves;
+- persistence compatibility;
+- provider/runtime boundaries;
+- configuration consistency;
+- event/observability continuity;
+- Git/PR/delivery boundaries;
+- safety/failure behavior;
+- release packaging/startup behavior.
 
-Look for:
+### 7. Audit implementation drift
 
--   undocumented user-visible behavior;
--   implementation of deferred/future scope;
--   incompatible contract changes;
--   architectural divergence;
--   unapproved dependencies or integrations;
--   changed assumptions not reflected upstream.
+Identify material behavior that:
 
-Not every incidental implementation detail requires documentation.
+- exceeds approved release scope;
+- contradicts approved decisions;
+- implements deferred/future scope;
+- changes public or provider contracts without approval;
+- creates security/operational incompatibility.
 
-Report drift when it materially affects product behavior, architecture,
-security, compatibility, operations, or future maintenance.
+### 8. Run release-level deterministic validation
 
-### 7. Verify architecture coherence
-
-When architecture documentation or ADRs exist, verify that the
-integrated system respects them.
-
-Check relevant cross-cutting concerns such as:
-
--   component boundaries;
--   dependency direction;
--   shared contracts;
--   persistence strategy;
--   integration boundaries;
--   configuration;
--   security boundaries;
--   global error-handling conventions.
-
-Do not invent architecture requirements that were never approved.
-
-### 8. Run project-level deterministic validation
-
-Run the broadest applicable repository-native checks needed for final
-acceptance.
-
-Depending on the project, this may include:
-
--   full test suite;
--   integration tests;
--   end-to-end tests;
--   lint;
--   type checking;
--   build/import checks;
--   migration/database checks;
--   packaging checks;
--   established security/static analysis;
--   runtime smoke tests.
-
-Prefer repository-defined commands.
-
-Never claim a check passed unless it was actually executed.
-
-Record failures and unavailable checks explicitly.
-
-### 9. Validate end-to-end behavior
-
-Task-level tests may pass while integrated behavior fails.
-
-Where the product exposes a meaningful complete flow, validate the
-primary approved flow end to end.
+Run the broadest repository-native checks needed for final acceptance.
 
 Examples:
 
--   input → processing → persistence → retrieval;
--   request → service → database → response;
--   ingestion → indexing → retrieval → generated response;
--   CLI command → application behavior → output.
+- full test suite;
+- integration suite;
+- release end-to-end tests;
+- lint/type checking;
+- build/import/compile;
+- packaging/install checks;
+- migration/database checks;
+- established security/static analysis;
+- runtime smoke tests.
 
-Use the product's actual approved flow rather than creating artificial
-end-to-end scenarios.
+Never claim a check passed unless executed.
 
-### 10. Review cross-cutting quality
+### 9. Validate the complete release flow
 
-Evaluate project-level concerns that may not belong to a single task.
+Validate the primary complete approved product flow.
 
-Consider when applicable:
+This should be broader than any single Wave outcome.
 
--   error handling across boundaries;
--   configuration consistency;
--   security hygiene;
--   secrets handling;
--   dependency consistency;
--   startup/runtime behavior;
--   persistence/integration consistency;
--   observability;
--   documentation required to operate the solution;
--   backward compatibility;
--   migration coherence.
+If required live/manual release acceptance is documented, execute or verify its
+persisted evidence.
 
-Focus on material acceptance risks rather than style preferences.
+Classify missing executable evidence as `MANUAL_VALIDATION_REQUIRED`.
 
-### 11. Review delivery documentation
+Classify unavailable external tooling/infrastructure/credentials as
+`ENVIRONMENT_BLOCKED`.
 
-Verify that documentation required for use, execution, or evaluation
-matches the delivered implementation.
+### 10. Review release documentation
 
-Depending on the project this may include:
+Verify documentation necessary to run, evaluate, operate, or hand off the
+complete release.
 
--   README execution instructions;
--   required environment variables;
--   setup commands;
--   database/bootstrap steps;
--   example usage;
--   operational limitations.
+Check when applicable:
 
-Documentation defects are blocking when they prevent the approved
-product from being reliably run, evaluated, or operated as required.
+- README;
+- installation/setup;
+- environment variables;
+- runtime prerequisites;
+- provider authentication;
+- CLI examples;
+- operational limitations;
+- release/manual acceptance.
 
-### 12. Classify findings
+### 11. Classify findings
 
-Use the same severity model as task review.
+Severity:
 
 `CRITICAL`
-
--   severe security, data-loss, correctness, or release-level
-    specification failure that makes acceptance unsafe.
+- severe security, data-loss, correctness, or release-level acceptance failure.
 
 `HIGH`
-
--   major approved requirement missing;
--   primary flow broken;
--   required Wave incomplete;
--   significant architecture or integration violation;
--   critical project-level validation failure.
+- major approved requirement missing;
+- primary release flow broken;
+- required Wave not accepted;
+- significant architecture/cross-Wave integration violation;
+- required release validation failure.
 
 `MEDIUM`
-
--   real integration, quality, testing, documentation, or
-    maintainability issue that should be resolved before final
-    acceptance.
+- material integration, validation, documentation, maintainability, or quality
+  problem that should be resolved before final acceptance.
 
 `LOW`
-
--   concrete non-blocking improvement.
+- concrete non-blocking improvement.
 
 Each material finding must include:
 
--   identifier;
--   severity;
--   category;
--   affected requirement/scope when applicable;
--   location;
--   issue;
--   evidence;
--   expected state;
--   recommended remediation direction.
+- identifier;
+- severity;
+- category;
+- ownership;
+- affected requirement/scope when applicable;
+- location;
+- issue;
+- evidence;
+- expected state;
+- remediation direction.
 
-Do not create duplicate findings for the same root cause.
+### 12. Determine remediation ownership
 
-### 13. Determine remediation ownership
+Use one primary ownership value:
 
-For each blocking finding, determine where the correction belongs.
+`RELEASE_FIX`
 
-Use:
+The approved release specification is correct and an implementation,
+integration, test, configuration, or non-approved documentation correction is
+required at release scope.
 
-`TASK_FIX`
+`WAVE_REVIEW_REQUIRED`
 
-The approved specification is correct and implementation must be
-corrected.
+An included Wave lacks current authoritative acceptance evidence or its evidence
+is contradictory/stale.
 
-`NEW_TASK_REQUIRED`
+`NEW_WAVE_OR_TASK_REQUIRED`
 
-The approved scope contains required work that was never represented by
-an implementation task.
+Approved release scope contains required implementation work that was not
+represented in the approved delivery decomposition.
+
+`MANUAL_VALIDATION_REQUIRED`
+
+Required release acceptance evidence must be produced by executing an approved
+manual/live validation.
+
+`ENVIRONMENT_BLOCKED`
+
+External tooling, credentials, infrastructure, sandboxing, runtime availability,
+or local environment prevents required release validation.
 
 `SPEC_CHANGE_REQUIRED`
 
-Approved artifacts are contradictory, incorrect, or must change before a
-valid implementation decision can be made.
+Approved PRD, Delivery Plan, Architecture, or TECHSPEC must change before valid
+release acceptance.
 
-`BLOCKED`
+The final review identifies remediation ownership but does not perform
+remediation.
 
-External context, infrastructure, or evidence prevents resolution.
-
-The final review identifies remediation ownership but does not implement
-it.
-
-### 14. Determine final outcome
+### 13. Determine final outcome
 
 Return `PASS` only when:
 
--   all applicable approved requirements are delivered;
--   all required tasks have passed independent review;
--   included delivery scopes are complete;
--   project-level deterministic validation passes;
--   primary integrated behavior is validated where applicable;
--   no `CRITICAL`, `HIGH`, or `MEDIUM` blocking finding remains;
--   no material undocumented scope drift remains.
+- all applicable approved requirements are delivered;
+- all included Waves have authoritative `PASS`;
+- release-level deterministic validation passes;
+- required live/manual acceptance evidence exists;
+- primary integrated release behavior is validated;
+- no `CRITICAL`, `HIGH`, or `MEDIUM` blocking finding remains;
+- no material undocumented scope drift remains.
 
-Return `FIX_REQUIRED` when defects can be corrected without changing
-approved upstream specifications.
+Return `FIX_REQUIRED` when one or more blocking release-level defects can be
+corrected without changing approved upstream specifications.
 
-Return `SPEC_CHANGE_REQUIRED` when final acceptance requires changing
-approved product, delivery, architecture, or technical specifications.
+Return `SPEC_CHANGE_REQUIRED` when acceptance requires changing approved
+product, delivery, architecture, or technical specifications.
 
-Return `BLOCKED` when reliable final acceptance cannot be completed.
+Return `BLOCKED` when reliable release acceptance cannot be completed.
 
-### 15. Produce the final-review report
+### 14. Persist the final review
 
-Return a concise but complete audit result.
+The final review MUST be persisted.
 
-Do not fix implementation.
+Default artifact:
 
-Do not modify approved specifications.
+`reviews/FINAL-REVIEW.md`
 
-Do not automatically create tasks or invoke remediation skills.
+If an explicit repository convention defines another release-review path, use
+that convention and report it.
+
+The persisted artifact is the authoritative final-review record.
+
+Do not leave findings only in console output.
+
+On re-review, update or supersede the authoritative artifact so the current
+release acceptance state is unambiguous.
 
 ## Rules
 
 ### MUST
 
--   review the complete approved release boundary;
--   verify both missing implementation and implementation drift;
--   maintain requirement-to-evidence traceability;
--   verify task review completion;
--   run applicable project-level validation;
--   validate integrated behavior when applicable;
--   inspect cross-cutting architecture and quality concerns;
--   distinguish implementation defects from specification defects;
--   classify findings by severity and remediation ownership;
--   base acceptance on evidence;
--   stop after producing the final-review result.
+- review the complete approved release boundary;
+- require accepted Wave evidence for every included Wave;
+- verify missing implementation and scope drift;
+- maintain requirement-to-release-evidence traceability;
+- run applicable release-level validation;
+- validate complete integrated behavior;
+- classify remediation ownership;
+- persist the authoritative final-review artifact;
+- base acceptance on current evidence;
+- stop after producing the final-review result.
 
 ### MUST NOT
 
--   modify production code;
--   modify tests to make validation pass;
--   silently fix findings;
--   change the PRD;
--   change the Delivery Plan;
--   change architecture decisions;
--   change TECHSPECs;
--   create implementation tasks automatically;
--   accept required tasks that remain unreviewed;
--   treat task-level `PASS` as sufficient evidence of complete project
-    acceptance;
--   invent requirements not present in approved scope;
--   fail deferred scope that is explicitly outside the release boundary;
--   claim validation passed when it was not executed;
--   automatically invoke another workflow stage.
+- modify production code;
+- modify tests to make validation pass;
+- silently fix findings;
+- run `wave-review`;
+- run `review-task`;
+- run remediation skills;
+- change approved specifications;
+- create tasks or Waves automatically;
+- accept an included Wave lacking authoritative `PASS`;
+- use final review as a substitute for Wave review;
+- claim validation passed when it was not executed;
+- automatically invoke another workflow stage.
 
 ### SHOULD
 
--   use traceability to focus repository inspection;
--   prefer repository-native validation commands;
--   use task review evidence rather than repeating every task-level
-    investigation;
--   focus deeper inspection on integration boundaries and cross-cutting
-    behavior;
--   keep findings actionable and non-duplicative;
--   distinguish blocking findings from release notes and future
-    improvements;
--   keep final acceptance evidence understandable without chat history.
-
-## Context Management
-
-Final review necessarily has a broader Context Surface than task-level
-skills, but context should still be loaded progressively.
-
-Read first:
-
--   approved PRD;
--   approved Delivery Plan when applicable;
--   task indexes/statuses for included delivery scopes;
--   `AGENTS.md` when present.
-
-Then load as needed:
-
--   relevant TECHSPEC sections;
--   architecture overview and applicable ADRs;
--   individual task specifications;
--   task review evidence;
--   implementation files associated with traceability gaps or
-    integration paths;
--   relevant tests;
--   repository validation configuration;
--   README/runtime documentation.
-
-Do not load by default:
-
--   future Waves outside the release;
--   unrelated historical specifications;
--   obsolete review history;
--   complete repository history;
--   every source file merely for completeness.
-
-Use task-level `PASS` results to reduce redundant deep inspection, while
-still verifying project-level integration and traceability.
+- use accepted Wave evidence to reduce redundant deep inspection;
+- focus deeper inspection on release integration and cross-Wave behavior;
+- distinguish missing validation from environment failure;
+- keep findings actionable and non-duplicative;
+- keep final acceptance evidence understandable without chat history.
 
 ## Output
 
-Do not modify production artifacts.
+Persist:
 
-Update final status metadata only if the repository explicitly defines
-such a convention.
-
-Return:
-
-``` markdown
+```markdown
 ## Final Review Result
 
 <PASS | FIX_REQUIRED | SPEC_CHANGE_REQUIRED | BLOCKED>
 
 ## Release Scope
 
+- Release: <identifier/name if present>
 - Delivery mode: <SINGLE | WAVES>
 - Included scopes: <scope(s)>
 - Deferred scopes: <if any>
 
+## Wave Acceptance Summary
+
+| Wave | Review Artifact | Result | Evidence Status |
+|---|---|---|---|
+| ... | ... | PASS / ... | CURRENT / STALE / MISSING / CONTRADICTORY |
+
 ## Traceability Summary
 
-| Requirement | Delivery Scope | Task(s) | Evidence | Status |
-|-------------|----------------|---------|----------|--------|
-| FR-001 | ... | ... | ... | DELIVERED / PARTIAL / MISSING / DEFERRED / NOT_VERIFIABLE |
+| Requirement | Delivery Scope | Evidence | Status |
+|---|---|---|---|
+| FR-001 | ... | ... | DELIVERED / PARTIAL / MISSING / DEFERRED / NOT_VERIFIABLE |
 
-## Task Review Summary
-
-- Total required tasks: <n>
-- PASS: <n>
-- Pending/unreviewed: <n>
-- FIX_REQUIRED: <n>
-- BLOCKED: <n>
-- SPEC_CHANGE_REQUIRED: <n>
-
-## Project Validation
+## Release Validation
 
 | Check | Result | Evidence |
-|-------|--------|----------|
+|---|---|---|
 | `<command or check>` | PASS / FAIL / NOT RUN | <concise evidence> |
 
 ## End-to-End Validation
 
-- <flow> — PASS / FAIL / NOT RUN — <evidence>
+- <release flow> — PASS / FAIL / NOT RUN — <evidence>
 
 ## Findings
 
 ### FINAL-001 — <Severity> — <Title>
 
-- Category: <Requirements | Integration | Architecture | Validation | Documentation | Scope Drift | Security | Other>
-- Ownership: <TASK_FIX | NEW_TASK_REQUIRED | SPEC_CHANGE_REQUIRED | BLOCKED>
+- Category: <Requirements | Integration | Architecture | Validation | Documentation | Scope Drift | Security | Wave Evidence | Environment | Other>
+- Ownership: <RELEASE_FIX | WAVE_REVIEW_REQUIRED | NEW_WAVE_OR_TASK_REQUIRED | MANUAL_VALIDATION_REQUIRED | ENVIRONMENT_BLOCKED | SPEC_CHANGE_REQUIRED>
 - Requirement/Scope: <identifier when applicable>
 - Location: `<path:symbol-or-line>` or artifact
 - Issue: <what is wrong>
@@ -590,89 +460,31 @@ Return:
 - Expected: <approved expected state>
 - Remediation direction: <concise guidance>
 
+## Blocking Conditions
+
+- <blocking conditions, or `None.`>
+
 ## Non-Blocking Notes
 
 - <optional LOW findings or release observations>
 
 ## Summary
 
-<concise final acceptance rationale>
+<concise release acceptance rationale>
 ```
 
-For `PASS`, the Findings section may be omitted when no findings exist.
+For `PASS`, Findings may be omitted if none exist.
 
-Do not create a separate report file unless repository conventions
-explicitly require one.
+After persisting the artifact, console output must contain only:
 
-## Validation
-
-Before completing, verify:
-
--   [ ] the release boundary is explicit;
--   [ ] every applicable approved requirement has a traceability status;
--   [ ] deferred requirements are explicitly approved as outside the
-    release;
--   [ ] required tasks have known review states;
--   [ ] task-level blockers were not ignored;
--   [ ] relevant architecture constraints were checked;
--   [ ] project-level validation was actually run when possible;
--   [ ] primary integrated behavior was validated when applicable;
--   [ ] documentation required to run/evaluate the product was checked;
--   [ ] implementation drift was considered;
--   [ ] findings contain concrete evidence;
--   [ ] remediation ownership is identified;
--   [ ] implementation and specification defects are distinguished;
--   [ ] no code, tests, tasks, or approved specifications were modified;
--   [ ] no remediation stage was started automatically.
+1. final-review status;
+2. authoritative artifact path;
+3. number of blocking findings;
+4. recommended next workflow action.
 
 ## Completion
 
-Return `PASS` when the complete release is accepted.
+A final `PASS` means the complete approved release is accepted.
 
-A final `PASS` means:
-
--   approved release requirements are delivered;
--   implementation is traceable to approved specifications;
--   required task-level reviews are complete;
--   integrated validation is satisfactory;
--   no blocking final-review finding remains.
-
-Return `FIX_REQUIRED` when one or more blocking defects can be corrected
-within the existing approved specifications.
-
-For each `FIX_REQUIRED` finding, identify whether remediation belongs to
-an existing task (`TASK_FIX`) or requires an explicitly approved new
-task (`NEW_TASK_REQUIRED`).
-
-Do not create or execute remediation automatically.
-
-## Escalation
-
-Return `BLOCKED` when:
-
--   the release boundary cannot be established;
--   required specification or review artifacts are unavailable;
--   repository state does not represent a reviewable release;
--   mandatory project-level validation infrastructure is unavailable and
-    prevents a reliable acceptance decision;
--   critical delivery evidence cannot be obtained.
-
-Return `SPEC_CHANGE_REQUIRED` when:
-
--   approved requirements contradict each other;
--   Delivery Plan and PRD cannot be reconciled;
--   approved architecture and TECHSPEC decisions conflict materially;
--   delivered behavior can only be accepted by changing approved scope;
--   a missing implementation requirement exposes a genuine upstream
-    specification gap rather than a task-decomposition omission.
-
-When escalating:
-
-1.  identify the exact affected requirement or approved artifact;
-2.  provide concrete implementation, traceability, or validation
-    evidence;
-3.  explain why implementation-only remediation is insufficient;
-4.  identify the minimum upstream decision required.
-
-Do not change approved artifacts merely to make the delivered
-implementation appear compliant.
+Do not automatically commit, push, open a PR, deploy, or invoke another workflow
+stage unless a separate approved workflow step explicitly requests it.
