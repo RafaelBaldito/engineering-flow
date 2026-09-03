@@ -13,7 +13,7 @@ Wave 3.
 
 | Task | Title | Depends On | Status |
 |------|-------|------------|--------|
-| TASK-001 | Establish Durable Task Definitions and Lifecycle Evidence | — | PENDING |
+| TASK-001 | Establish Durable Task Definitions and Lifecycle Evidence | — | PASS |
 | TASK-002 | Generalize Runtime Contracts and Codex Role Execution | TASK-001 | PENDING |
 | TASK-003 | Implement Sequential Task Orchestration | TASK-001, TASK-002 | PENDING |
 | TASK-004 | Expose Execution Policy and Task Lifecycle CLI Controls | TASK-003 | PENDING |
