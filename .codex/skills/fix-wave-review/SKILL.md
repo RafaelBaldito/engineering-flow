@@ -222,7 +222,8 @@ Use these remediation statuses:
 
 The corrective action is complete and validated, but still requires independent
 Wave re-review before acceptance. A later Wave remains blocked until that
-authoritative PASS and explicit persisted start authorization.
+authoritative PASS and exactly one valid active canonical
+`WAVE-START-AUTHORIZATION.md`, as defined by the approved Delivery Plan.
 
 `REVIEW_REQUIRED`
 

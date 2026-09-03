@@ -492,7 +492,8 @@ Before finalizing, verify:
 When the document is ready for review, return `AWAITING_HUMAN_APPROVAL`.
 Do not create a TECHSPEC automatically. After explicit approval, the selected
 initial scope may proceed to `create-techspec`; later Waves also require
-predecessor Wave PASS and explicit persisted start authorization.
+predecessor Wave PASS and exactly one valid active canonical
+`WAVE-START-AUTHORIZATION.md`, as defined by the approved Delivery Plan.
 
 After creating the document, report:
 

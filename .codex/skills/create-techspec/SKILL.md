@@ -31,8 +31,9 @@ Use this skill when:
     is ready for technical design;
 -   the approved delivery mode is `WAVES` and one specific Wave has been
     selected for just-in-time technical design, its predecessor (when any) has
-    authoritative Wave acceptance, and explicit persisted authorization to
-    start that Wave exists;
+    authoritative Wave acceptance, and a valid active canonical
+    `WAVE-START-AUTHORIZATION.md` exists for that Wave under the approved
+    Delivery Plan;
 -   an existing TECHSPEC requires an explicitly approved technical
     update;
 -   task creation is blocked because the current delivery scope lacks
@@ -44,8 +45,8 @@ Do not use this skill when:
 -   the Delivery Plan is not approved;
 -   the approved delivery plan requires an architecture overview that is absent
     or awaiting approval;
--   a later Wave lacks predecessor authoritative acceptance or explicit
-    persisted start authorization;
+-   a later Wave lacks predecessor authoritative acceptance or a valid active
+    canonical `WAVE-START-AUTHORIZATION.md`;
 -   no current delivery scope has been selected;
 -   the request is to redesign product requirements;
 -   the request is to detail future Waves;
@@ -68,8 +69,9 @@ Load only when relevant to the selected scope:
 
 -   approved Delivery Plan;
 -   approved architecture overview when the Delivery Plan marks it `REQUIRED`;
--   authoritative predecessor Wave-review PASS and explicit persisted next-Wave
-    authorization when designing a later Wave;
+-   authoritative predecessor Wave-review PASS and the target Wave's valid
+    active canonical `WAVE-START-AUTHORIZATION.md` when designing a later
+    Wave;
 -   `AGENTS.md`;
 -   existing global architecture documentation;
 -   relevant ADRs;
@@ -119,7 +121,8 @@ Before producing an approval-ready TECHSPEC:
 -   [ ] the plan-required architecture overview is approved, when applicable;
 -   [ ] exactly one current delivery scope is selected;
 -   [ ] for a later Wave, the predecessor has authoritative Wave-review `PASS`
-      and explicit persisted authorization to start the selected Wave;
+      and the target Wave has exactly one valid active canonical
+      `WAVE-START-AUTHORIZATION.md`, as defined by the approved Delivery Plan;
 -   [ ] mandatory architecture decisions for the scope are available or
     can be safely defined within the current boundary.
 

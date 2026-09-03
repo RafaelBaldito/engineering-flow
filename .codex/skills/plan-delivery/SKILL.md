@@ -444,7 +444,8 @@ marks the architecture overview `REQUIRED`, `create-architecture-overview` is
 the next stage and its artifact requires approval before any TECHSPEC. If it is
 `NOT REQUIRED`, the selected initial scope's TECHSPEC may be initiated
 separately. For a later Wave, its TECHSPEC additionally requires predecessor
-Wave PASS and explicit persisted authorization to start that Wave.
+Wave PASS and exactly one valid active canonical
+`WAVE-START-AUTHORIZATION.md`, as defined by the approved Delivery Plan.
 
 ## Escalation
 
