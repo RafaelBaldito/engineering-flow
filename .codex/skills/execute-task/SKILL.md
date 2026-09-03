@@ -1,11 +1,11 @@
 ---
 description: |
   Implement exactly one approved task from the current delivery scope.
-  Use after the task set has been explicitly approved and one task has
-  been selected for execution. Read only the bounded context required by
-  that task, implement the approved change, run applicable validation,
-  and report the result. Do not redesign approved specifications, expand
-  scope, review other tasks, or continue automatically to another task.
+  Use after an approved task plan exists and one dependency-ready task has
+  been selected for execution. Read only the bounded context required by that
+  task, implement the approved change, run applicable validation, and report
+  the result. Do not redesign approved specifications, expand scope, review
+  other tasks, or continue automatically to another task.
 name: execute-task
 ---
 
@@ -28,7 +28,7 @@ execution models.
 
 Use this skill when:
 
--   an approved task set exists;
+-   an approved task plan exists;
 -   one specific task has been selected;
 -   the selected task is ready according to its declared dependencies;
 -   implementation of that task is the requested next action;
@@ -38,6 +38,7 @@ Use this skill when:
 Do not use this skill when:
 
 -   task decomposition is still awaiting approval;
+-   no approved task plan exists;
 -   no specific task has been selected;
 -   prerequisite tasks are incomplete;
 -   the request is primarily to review an implementation;
@@ -48,7 +49,7 @@ Do not use this skill when:
 
 ### Required
 
--   one selected approved `TASK-XXX.md`.
+-   one selected approved `TASK-XXX.md` from an approved task plan.
 
 ### Optional
 
@@ -91,8 +92,9 @@ choose a side silently. Report `SPEC_CHANGE_REQUIRED`.
 Before changing the repository:
 
 -   [ ] exactly one task is selected;
--   [ ] the task belongs to an approved task set;
--   [ ] all declared blocking dependencies are complete;
+-   [ ] the task belongs to an approved task plan;
+-   [ ] all declared blocking dependencies are satisfied by authoritative
+    `review-task` `PASS` evidence;
 -   [ ] required task context is available;
 -   [ ] the task has actionable acceptance criteria.
 
@@ -150,6 +152,10 @@ documentation, or the whole repository by default.
 
 Confirm that declared prerequisite tasks have produced the repository
 state or artifacts this task expects.
+
+For a declared task dependency, require authoritative `review-task` `PASS`
+evidence. Implementation completion or a task status label alone does not
+satisfy a dependency.
 
 Do not reimplement completed prerequisite work.
 
@@ -372,6 +378,8 @@ Do not invoke `review-task` or begin the next task automatically.
 -   automatically invoke `review-task`;
 -   automatically start the next task;
 -   claim review acceptance.
+-   execute a task whose declared dependencies lack authoritative
+    `review-task` `PASS` evidence.
 
 ### SHOULD
 
