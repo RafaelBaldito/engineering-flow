@@ -36,6 +36,11 @@ Use this skill when:
     regenerated or updated;
 -   implementation needs smaller work units before `execute-task`.
 
+For a Wave governed by this repository's bootstrap governance, use this skill
+only after the separate active `TASK-PLANNING-AUTHORIZATION.md` required by
+`docs/DELIVERY-PLAN.md` §7.1 has been persisted and validated. A Wave-start
+authorization and TECHSPEC approval do not substitute for it.
+
 Do not use this skill when:
 
 -   the current TECHSPEC is not approved;
@@ -50,6 +55,8 @@ Do not use this skill when:
 ### Required
 
 -   one approved current-scope TECHSPEC.
+-   for a bootstrap-governed Wave, one valid active task-planning authorization
+    bound to that exact Wave and TECHSPEC revision.
 
 ### Optional
 
@@ -71,12 +78,17 @@ another authority:
 
 1.  current explicit user instructions authorized to change task
     decomposition;
-2.  approved current-scope TECHSPEC;
-3.  approved architecture decisions referenced by the TECHSPEC;
-4.  approved Delivery Plan boundary;
-5.  approved PRD requirements assigned to the scope;
-6.  explicit repository constraints and conventions;
-7.  existing implementation as evidence of current state.
+2.  for a bootstrap-governed Wave, the valid active task-planning
+    authorization bound to the selected TECHSPEC;
+3.  approved current-scope TECHSPEC;
+4.  approved architecture decisions referenced by the TECHSPEC;
+5.  approved Delivery Plan boundary;
+6.  approved PRD requirements assigned to the scope;
+7.  explicit repository constraints and conventions;
+8.  existing implementation as evidence of current state.
+
+Current instructions can select task decomposition, but cannot replace the
+persisted bootstrap authorization where it is required.
 
 Task decomposition must implement the approved technical design, not
 redesign it.
@@ -94,8 +106,20 @@ Before creating tasks:
 -   [ ] the TECHSPEC has been explicitly approved;
 -   [ ] critical technical questions required for implementation are
     resolved.
+-   [ ] for a bootstrap-governed Wave, a separate active
+    `TASK-PLANNING-AUTHORIZATION.md` validates under
+    `docs/DELIVERY-PLAN.md` §7.1: exact target Wave, exact approved TECHSPEC
+    path and SHA-256, approval/status evidence, applicable predecessor PASS
+    evidence, exact limited scope, and no revocation, supersession, or
+    duplicate active authorization.
 
 If approval or scope cannot be established, report `BLOCKED`.
+
+For a bootstrap-governed Wave, report `BLOCKED` if task-planning
+authorization cannot be established or validated. Do not treat the
+authorization as task-set approval, and do not use it for task execution,
+tests, implementation, review, fixes, Wave/release actions, delivery, commit,
+push, or Pull Request creation.
 
 If safe task decomposition requires changing the approved design, report
 `SPEC_CHANGE_REQUIRED`.
@@ -372,6 +396,8 @@ Do not execute any task automatically.
 -   keep implementation and directly related tests together when that
     creates a more cohesive outcome;
 -   stop after producing an approval-ready task set.
+-   for a bootstrap-governed Wave, consume the task-planning authorization only
+    to create the bound task set and stop at `AWAITING_HUMAN_APPROVAL`.
 
 ### MUST NOT
 
@@ -387,6 +413,9 @@ Do not execute any task automatically.
 -   require the full PRD or full repository as default task context;
 -   automatically invoke `execute-task`;
 -   claim human approval that was not explicitly provided.
+-   treat task-planning authorization as approval of the generated task set;
+-   use task-planning authorization for implementation or any later lifecycle
+    stage.
 
 ### SHOULD
 
@@ -569,6 +598,9 @@ Return `BLOCKED` when:
 
 -   the current TECHSPEC cannot be located;
 -   TECHSPEC approval cannot be established;
+-   a required bootstrap task-planning authorization is missing, mismatches the
+    selected Wave or TECHSPEC digest, lacks valid approval/predecessor evidence,
+    is revoked or superseded, has non-exact scope, or is not uniquely active;
 -   the selected delivery scope is ambiguous;
 -   repository context required to define executable tasks is
     unavailable.

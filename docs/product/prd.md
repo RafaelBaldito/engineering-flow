@@ -78,7 +78,7 @@ Provider, role, skill, session, and execution are distinct concepts. A skill is 
 
 ### Workflow orchestration
 
-- **FR-001:** The product must accept a feature request and coordinate the controlled lifecycle: PRD; PRD approval; delivery-plan creation and approval; architecture-overview creation and approval when the approved delivery plan requires it; per-scope TECHSPEC creation and approval; task-plan creation and approval; sequential task execution; task review/fix cycles; Wave acceptance; release-level final review; explicit delivery authorization; and controlled commit, push, and PR creation.
+- **FR-001:** The product must accept a feature request and coordinate the controlled lifecycle: PRD; PRD approval; delivery planning and approval; conditional architecture-overview creation and approval when the approved delivery plan requires it; Wave-start authorization; per-Wave TECHSPEC creation and approval; task planning and approval; sequential task execution/review/fix loops; Wave review/remediation and acceptance; explicit next-Wave authorization; release-level final review/remediation and acceptance after all included Waves pass; explicit delivery authorization; and controlled commit, push, and PR creation.
 - **FR-002:** The product must own workflow progression and state transitions. Providers may perform engineering work but must not arbitrarily advance the workflow.
 - **FR-003:** The product must represent workflow lifecycle state explicitly, including progress through planning and task stages, completion, cancellation, failure, and a state requiring human attention.
 - **FR-004:** The product must manage the roles required by the V1 lifecycle: PRD, Architect, Planner, Developer, and independent Reviewer.
@@ -88,7 +88,7 @@ Provider, role, skill, session, and execution are distinct concepts. A skill is 
 
 - **FR-006:** The product must support approval policies of required, automatic, and conditional at applicable workflow stages.
 - **FR-007:** In the initial V1 policy, the PRD, delivery plan, required architecture overview, each current-scope TECHSPEC, and each task plan require human approval before the next planning stage proceeds. After an approved task plan, task execution and its bounded review/fix loop may proceed automatically within the approved scope.
-- **FR-008:** The product must allow the workflow owner to approve or reject approval requests and must record the resulting decision.
+- **FR-008:** The product must allow an identifiable authorized actor to approve, reject, authorize, revoke, or supersede applicable workflow decisions and must persist the decision, scope, timestamp, authoritative evidence references, and relationship to any affected decision. The product does not require a concrete external identity technology in V1 architecture planning.
 - **FR-009:** The product must require human intervention when the configured maximum review/fix cycles is reached. A maximum review-cycle limit is mandatory.
 - **FR-010:** Merge must remain human-gated and outside autonomous V1 completion.
 
@@ -103,21 +103,21 @@ Provider, role, skill, session, and execution are distinct concepts. A skill is 
 
 ### Acceptance and delivery control
 
-- **FR-033:** The product must preserve distinct acceptance layers: a task is accepted only by `review-task` PASS after implementation and required validation; a Wave is accepted only by authoritative `wave-review` PASS after all required task acceptance; and the complete release is accepted only by authoritative release-level `final-review` PASS after all included Waves are accepted.
-- **FR-034:** A Wave-review PASS must not automatically start a later Wave. Starting a later Wave requires an explicit, persisted authorization after its predecessor has authoritative Wave acceptance.
-- **FR-035:** Runtime/product final validation is a quality gate that proves the product behavior required for a scope or release. It is not release acceptance and does not replace `final-review`. Commit, push, and PR creation may occur only after release acceptance and explicit persisted delivery authorization.
+- **FR-033:** The product must preserve distinct acceptance layers: a task is accepted only by `review-task` PASS after implementation and required validation; a Wave is accepted only by authoritative `wave-review` PASS after all required task acceptance and applicable remediation routing; and the complete release is accepted only by authoritative release-level `final-review` PASS after all included Waves are accepted.
+- **FR-034:** A Wave-review PASS must not automatically start a later Wave. Starting a later Wave requires an explicit, persisted, auditable authorization after its predecessor has authoritative Wave acceptance; that authorization has explicit revocation and supersession semantics.
+- **FR-035:** Runtime/product final validation is a quality gate that proves the product behavior required for a scope or release. It is not release acceptance and does not replace `final-review`. Commit, push, and PR creation may occur only after release acceptance and an active, explicit persisted delivery authorization.
 
 ### Provider support
 
 - **FR-017:** V1 must support Codex as its sole coding-agent provider.
 - **FR-018:** The product must treat Codex as a provider integration, not as the core workflow domain or product identity.
-- **FR-019:** The product must maintain provider-neutral boundaries for workflow interaction, sessions, executions, events, and applicable capabilities so future providers can be added without redesigning the workflow.
+- **FR-019:** The product must maintain provider-neutral boundaries for workflow interaction, sessions, executions, events, and domain capabilities so future providers can be added without redesigning the workflow. A domain capability is distinct from a Codex Skill, agent role, and provider/runtime; repository Skill paths or names must not be domain abstractions.
 - **FR-020:** The product must preserve provider-specific behavior that cannot be usefully normalized instead of forcing a lowest-common-denominator experience.
 - **FR-021:** The product must validate that the selected provider has the permissions and capabilities required by an execution before allowing that execution to proceed, to the extent supported in V1.
 
 ### Persistence, recovery, and artifacts
 
-- **FR-022:** The product must assign each workflow a unique identifier and persist enough state to determine the workflow's current stage, task, approvals, selected provider, relevant sessions, review/retry progress, errors, Git state, and PR state.
+- **FR-022:** The product must assign each workflow a unique identifier and persist enough state to determine the workflow's lifecycle version, current stage, scope/Wave membership, task, approvals, acceptance facts, authorizations, selected provider, relevant sessions, review/retry progress, errors, Git state, and PR state. Historical lifecycle records remain valid under their recorded version and missing governance facts must not be inferred.
 - **FR-023:** The product must support recovery from interruption: a workflow can be started, interrupted, restarted, and resumed without losing its controlled lifecycle state.
 - **FR-024:** The product must preserve the feature input, generated planning artifacts, task definitions, review outputs, and workflow record for each workflow.
 - **FR-025:** The product must protect external and lifecycle operations against accidental duplication when resuming or retrying, including approvals, task and workflow completion, commits, pushes, and PR creation.
@@ -161,11 +161,11 @@ Feature request
   -> create-prd -> approval
   -> plan-delivery -> approval
   -> create-architecture-overview when the approved delivery plan requires it -> approval
-  -> per-Wave create-techspec -> approval
+  -> Wave-start authorization -> per-Wave create-techspec -> approval
   -> create-tasks -> approval
   -> execute-task -> tests -> review-task
        -> FIX_REQUIRED: fix-task -> tests -> review-task (within configured limit)
-  -> authoritative wave-review PASS
+  -> authoritative wave-review PASS / remediation routing -> Wave acceptance
   -> explicit persisted authorization before a later Wave starts
   -> after every release Wave has authoritative PASS: final-review
        -> release remediation / routed remediation -> final-review as needed
@@ -180,7 +180,7 @@ If a review limit is exceeded or an unrecoverable/approval-blocking condition oc
 
 ## 11. Acceptance Criteria
 
-- **AC-001:** Given a feature request, a workflow owner can progress through PRD, delivery-plan, required architecture-overview, current-scope TECHSPEC, and task-plan stages; each applicable stage waits for the required approval before the next stage starts.
+- **AC-001:** Given a feature request, an authorized workflow actor can progress through PRD, delivery-plan, required architecture-overview, Wave-start authorization, current-scope TECHSPEC, and task-plan stages; each applicable stage waits for the required approval or authorization before the next stage starts.
 - **AC-002:** After task-plan approval, the system processes tasks one at a time and, for each task, runs implementation, required tests, and independent review.
 - **AC-003:** When review fails, the system supplies the findings for remediation and repeats test and review steps; when the configured cycle limit is reached, it stops for human attention.
 - **AC-004:** A task is completed only when its required tests and review pass and it has no blocking findings.
@@ -205,9 +205,9 @@ The product must enable measurement of workflow duration; duration by stage and 
 
 ## 14. Assumptions
 
-- The workflow owner has authority to approve/reject planning artifacts and review the final PR.
+- The workflow owner or another identifiable authorized actor has authority to make the required planning, Wave-start, release, and delivery decisions; the concrete identity technology remains undecided.
 - The target repository can be validated before autonomous work begins and offers the Git/hosting credentials required for approved delivery actions.
-- Required engineering skills and repository conventions can be made available to the selected provider.
+- Required engineering-process knowledge and repository conventions can be made available to the selected provider. A Codex repository Skill may be one provider-specific mechanism, not a universal product abstraction.
 - Exact provider contracts, storage strategy, configuration schema, command syntax, state representation, event payloads, and quality-gate mechanics will be defined in the TECHSPEC; they are not fixed by this PRD.
 
 ## 15. Open Questions
@@ -217,6 +217,8 @@ The product must enable measurement of workflow duration; duration by stage and 
 - What repository-hosting systems, other than the PR capability assumed by the vision, are in scope for the first release?
 - What recovery and retry policies are appropriate for each failure class, and which require a human decision before retry?
 - What minimum Codex capabilities and permissions must be verified before a workflow can begin?
+- What product-record fields and policies are required to determine authorization actor eligibility without selecting external identity infrastructure?
+- Which capability mechanism equivalence and version checks are required when a Codex adapter uses a repository Skill versus a bounded prompt/template?
 
 ## 16. Requirement Traceability
 

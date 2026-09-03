@@ -11,6 +11,13 @@ planning order, acceptance hierarchy, authorization gates, and Git/PR delivery
 responsibilities. Where an early diagram here differs, the approved artifacts
 control.
 
+**Approved planning alignment:** The target delivery is four Waves: accepted
+historical Controlled Planning Foundation; Autonomous Sequential Engineering
+Loop; Workflow Capability Orchestration; and Release Readiness & Controlled
+Delivery. The durable decision record is
+`docs/planning/workflow-capability-replanning-decision.md`; the prior analysis
+is evidence, not an approved decision.
+
 ---
 
 # 1. Product Overview
@@ -365,9 +372,23 @@ without modifying the workflow itself.
 
 # 10. Capability Model
 
-Not every provider will support the same functionality.
+Not every provider will support the same functionality. The product must keep
+the required domain outcome separate from runtime capabilities and provider
+mechanisms:
 
-Therefore, Engineering Flow should eventually expose provider capabilities.
+```text
+Domain Capability != Codex Skill != Agent Role != Provider / Runtime
+
+Workflow Stage -> Required Capability -> Capability Resolution
+               -> AgentRuntime / Provider -> provider-specific execution mechanism
+```
+
+Engineering Flow selects the required domain capability; the selected runtime
+materializes its bounded execution. A Codex adapter may use a repository Skill
+or a bounded prompt/template as its mechanism, but neither a Skill name nor a
+Skill path is a universal workflow-domain abstraction.
+
+Provider capabilities remain relevant to execution feasibility:
 
 Conceptually:
 
@@ -511,9 +532,10 @@ Fallback is explicitly outside the initial MVP.
 Engineering Flow should distinguish between:
 
 ```text
-Provider
+Domain Capability
+Codex Skill
 Agent Role
-Skill
+Provider / Runtime
 Session
 Execution
 ```
@@ -548,7 +570,7 @@ Reviewer
 
 ## Skill
 
-Reusable instructions or domain knowledge.
+Reusable provider-specific instructions or process knowledge.
 
 Examples:
 
@@ -572,15 +594,26 @@ This separation should remain explicit throughout the architecture.
 
 ---
 
-# 14. Skill Is Not Agent
+# 14. Skill Is Not Agent or Domain Capability
 
 A Skill should not automatically become an independent agent.
 
-A Skill represents:
+A Skill represents reusable instructions and process knowledge. It is not the
+provider-neutral capability required by a workflow stage.
 
 ```text
-capability
-+
+Domain capability: required outcome selected by Engineering Flow
+Skill: reusable provider-specific process knowledge
+Agent role: bounded execution responsibility
+Provider/runtime: environment that materializes the request
+```
+
+Historically useful repository Skills may be reused by a Codex adapter, but
+must not be stored as the product's lifecycle API.
+
+A Skill may contain:
+
+```text
 instructions
 +
 process knowledge
@@ -804,57 +837,25 @@ Engineering Flow should avoid creating an artificial lowest-common-denominator a
 
 # 20. Workflow
 
-The primary workflow is:
+The target canonical workflow is:
 
 ```text
-INPUT
-  ↓
-PRD
-  ↓
-PRD APPROVAL
-  ↓
-ARCHITECTURE / TECHSPEC
-  ↓
-TECHSPEC APPROVAL
-  ↓
-TASK DECOMPOSITION
-  ↓
-PLAN APPROVAL
-  ↓
-TASK EXECUTION
-  ↓
-TEST
-  ↓
-REVIEW
-  ↓
-┌─────────────────────────────┐
-│                             │
-PASS                         FAIL
-│                             │
-│                            FIX
-│                             │
-│                           TEST
-│                             │
-│                           REVIEW
-│                             │
-└─────────────────────────────┘
-              ↓
-          TASK DONE
-              ↓
-          NEXT TASK
-              ↓
-       ALL TASKS DONE
-              ↓
-       FINAL VALIDATION
-              ↓
-            COMMIT
-              ↓
-             PUSH
-              ↓
-        PULL REQUEST
-              ↓
-         HUMAN REVIEW
+feature -> PRD -> approval -> delivery planning -> approval
+-> conditional architecture overview -> approval when required
+-> Wave-start authorization -> per-Wave TECHSPEC -> approval
+-> task planning -> approval
+-> execute -> tests -> independent review -> fix/re-review loop -> task acceptance
+-> Wave review/remediation -> Wave acceptance
+-> explicit authorization to start the next Wave -> subsequent Wave(s)
+-> all included Waves accepted -> release final-review/remediation -> release acceptance
+-> explicit delivery authorization -> deterministic commit -> push -> Pull Request
+-> review-ready Pull Request -> final workflow completion -> human review/merge decision
 ```
+
+Task, Wave, and release acceptance are separate from authorizations. Runtime or
+product final validation is quality evidence, not release-level `final-review`
+or release acceptance. Wave 1's historical direct planning slice remains valid
+only under its recorded lifecycle contract and is not retroactively expanded.
 
 ---
 
@@ -870,7 +871,7 @@ AUTOMATIC
 CONDITIONAL
 ```
 
-Initial example:
+Initial policy direction:
 
 ```yaml
 approval:
@@ -881,27 +882,31 @@ approval:
 
   task_plan: required
 
+  wave_start: required
+
+  wave_acceptance: authoritative_review
+
+  release_acceptance: authoritative_final_review
+
+  delivery_authorization: required
+
   implementation: automatic
 
   review_fix_loop: automatic
 
-  commit: automatic
-
-  push: automatic
-
-  pull_request: automatic
+  commit_push_pull_request: deterministic_after_release_acceptance_and_delivery_authorization
 
   merge: required
 ```
 
-This creates two clear zones:
+The autonomous engineering zone is bounded by governance facts:
 
 ```text
 PRD
  ↓
 HUMAN APPROVAL
 
-TECHSPEC
+DELIVERY PLAN / CONDITIONAL ARCHITECTURE / TECHSPEC
  ↓
 HUMAN APPROVAL
 
@@ -912,24 +917,15 @@ HUMAN APPROVAL
 
 ────── AUTONOMOUS ENGINEERING ZONE ──────
 
-IMPLEMENT
+IMPLEMENT -> TEST -> REVIEW <-> FIX
  ↓
-TEST
+TASK ACCEPTANCE -> WAVE REVIEW -> WAVE ACCEPTANCE
  ↓
-REVIEW
- ↕
-FIX
+NEXT-WAVE AUTHORIZATION / LATER WAVES
  ↓
-COMMIT
+RELEASE FINAL-REVIEW -> RELEASE ACCEPTANCE
  ↓
-PUSH
- ↓
-PR
-
-
-──────────── HUMAN GATE ─────────────────
-
-FINAL PR REVIEW
+DELIVERY AUTHORIZATION -> COMMIT -> PUSH -> PR
 ```
 
 ---
@@ -1058,7 +1054,16 @@ TASK_REVIEWING
 TASK_FIXING
 TASK_COMPLETED
 
+WAVE_REVIEWING
+WAVE_REMEDIATION
+WAVE_ACCEPTED
+NEXT_WAVE_AUTHORIZATION
+
 FINAL_VALIDATION
+RELEASE_FINAL_REVIEWING
+RELEASE_REMEDIATION
+RELEASE_ACCEPTED
+DELIVERY_AUTHORIZATION
 
 COMMITTING
 PUSHING
@@ -1113,6 +1118,9 @@ current_stage
 current_task
 
 approval_status
+acceptance_facts
+authorization_records
+lifecycle_version
 
 selected_provider
 agent_sessions
@@ -1142,25 +1150,15 @@ The orchestrator controls workflow transactions.
 Example:
 
 ```text
-Developer
+all included Waves accepted
    ↓
-implementation
-
-Reviewer
+release-level final-review PASS
    ↓
-PASS
-
-Tests
+explicit active delivery authorization
    ↓
-PASS
-
-Engineering Flow
+Engineering Flow deterministic delivery integration
    ↓
-git add
-   ↓
-git commit
-   ↓
-git push
+git add -> git commit -> git push -> create Pull Request
 ```
 
 Agents may generate:
@@ -1169,7 +1167,9 @@ Agents may generate:
 - PR title;
 - PR description.
 
-The Workflow Engine executes the actual lifecycle according to configured policies.
+The Workflow Engine executes the actual lifecycle according to configured
+policies only after release acceptance and delivery authorization. It must not
+infer either fact from a task or Wave result.
 
 ---
 
@@ -1384,11 +1384,14 @@ workflow:
 
 approval:
   prd: required
+  delivery_plan: required
+  architecture_overview: conditional
+  wave_start: required
   techspec: required
   tasks: required
-  commit: automatic
-  push: automatic
-  pull_request: automatic
+  wave_acceptance: authoritative_review
+  release_acceptance: authoritative_final_review
+  delivery_authorization: required
   merge: required
 
 agents:
@@ -1414,8 +1417,7 @@ agents:
     reasoning: high
 
 git:
-  commit_on_task_success: true
-  push_on_workflow_success: true
+  commit_push_pull_request: deterministic_after_release_acceptance_and_delivery_authorization
 ```
 
 V1 may simplify this configuration substantially.
@@ -1539,11 +1541,11 @@ PRD approved
 
 AND
 
-TECHSPEC approved
+delivery plan and required architecture overview approved
 
 AND
 
-task plan approved
+each included Wave authorized, its TECHSPEC/task plan approved, and accepted
 
 AND
 
@@ -1556,6 +1558,14 @@ required tests passing
 AND
 
 reviews passing
+
+AND
+
+release final-review passed and release accepted
+
+AND
+
+active delivery authorization recorded
 
 AND
 
@@ -1857,15 +1867,19 @@ Feature
    ↓
 PRD
    ↓
-TECHSPEC
+Delivery plan / conditional architecture overview
    ↓
-Tasks
+Wave authorization / TECHSPEC / task plan
    ↓
-Implementation
+Implementation / tests
    ↓
 Review ↔ Fix
    ↓
-Tests
+Wave acceptance / later Waves
+   ↓
+Release final-review / release acceptance
+   ↓
+Delivery authorization
    ↓
 Git
    ↓
