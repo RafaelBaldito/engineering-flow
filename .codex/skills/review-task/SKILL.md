@@ -362,23 +362,30 @@ On `BLOCKED`:
 
 Do not change unrelated task statuses.
 
-### 13. Persist a fix handoff
+### 13. Persist the authoritative review record
 
-When the outcome is `FIX_REQUIRED`, create a durable handoff for `fix-task`.
+Every outcome must have one durable, current review record. This evidence is
+required to resolve task dependencies; an index status label alone is not a
+substitute for the latest detailed review decision.
 
-- Create `<selected-task-parent>/reviews/TASK-XXX-REVIEW.md`. For example,
-  a selected `tasks/<wave-id>/TASK-XXX.md` produces
+- Write the complete review-result format from this skill to
+  `<selected-task-parent>/reviews/TASK-XXX-REVIEW.md`. For example, a selected
+  `tasks/<wave-id>/TASK-XXX.md` produces
   `tasks/<wave-id>/reviews/TASK-XXX-REVIEW.md`; a single-delivery task under
   `tasks/` produces `tasks/reviews/TASK-XXX-REVIEW.md`.
-- Update the selected task's status to `FIX_REQUIRED` in the applicable task
-  index when that index exists.
-- Write the complete review-result format from this skill to the handoff file,
-  including executed validation evidence, each acceptance-criterion result,
-  and all structured findings. It must give `fix-task` sufficient context to
-  act without reconstructing the review.
-- Do not create a handoff artifact for `PASS`, `SPEC_CHANGE_REQUIRED`, or
-  `BLOCKED`. Do not commit or push review artifacts unless the user explicitly
-  asks for that action.
+- Update the selected task's status in the applicable task index, when that
+  index exists, to the outcome selected in step 11. Do not change unrelated
+  task statuses.
+- On a re-review, replace the stable review record with the current result and
+  state that it supersedes the prior result. For a `PASS` after
+  `FIX_REQUIRED`, include a concise recheck of each prior blocking finding.
+  The stable record must never retain a stale `FIX_REQUIRED` result after the
+  task has passed re-review.
+- For `FIX_REQUIRED`, the record is also the durable handoff for `fix-task` and
+  must include all structured findings needed to act without reconstructing
+  the review.
+- Do not commit or push review artifacts unless the user explicitly asks for
+  that action.
 
 ### 14. Produce the review result
 
@@ -518,8 +525,8 @@ Return:
 
 For `PASS`, the Findings section may be omitted when no findings exist.
 
-For `FIX_REQUIRED`, the required handoff artifact above is the exception to
-the normal rule against creating separate review artifacts.
+The authoritative review record above is the exception to the normal rule
+against creating separate review artifacts.
 
 ## Validation
 
@@ -540,8 +547,10 @@ Before completing the review, verify:
 -   [ ] no code or tests were modified;
 -   [ ] no unrelated task was reviewed;
 -   [ ] no fix stage was started automatically.
--   [ ] when `FIX_REQUIRED`, the handoff artifact and applicable task status
-      were updated without committing or pushing.
+-   [ ] the authoritative review record and applicable task status were
+      updated without committing or pushing;
+-   [ ] on re-review, the stable record supersedes the prior result and does
+      not leave contradictory current evidence.
 
 ## Completion
 
