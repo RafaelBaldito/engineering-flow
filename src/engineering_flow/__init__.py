@@ -30,6 +30,10 @@ from .runtime import (
     NormalizedEvent,
     PlanningExecutionRequest,
     PlanningExecutionResult,
+    RuntimeExecutionRequest,
+    RuntimeExecutionResult,
+    TaskExecutionRequest,
+    TaskExecutionResult,
     TerminalState,
 )
 from .orchestrator import Orchestrator, PlanningOrchestrator
@@ -64,6 +68,10 @@ __all__ = [
     "NormalizedEvent",
     "PlanningExecutionRequest",
     "PlanningExecutionResult",
+    "RuntimeExecutionRequest",
+    "RuntimeExecutionResult",
+    "TaskExecutionRequest",
+    "TaskExecutionResult",
     "TerminalState",
     "Orchestrator",
     "PlanningOrchestrator",

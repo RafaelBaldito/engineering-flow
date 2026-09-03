@@ -10,8 +10,8 @@ from types import SimpleNamespace
 sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 
 from engineering_flow.codex_cli import CodexCliRuntime, FINAL_OUTPUT_SCHEMA  # noqa: E402
-from engineering_flow.domain import FailureClassification, Role, Stage, ValidationFailure  # noqa: E402
-from engineering_flow.runtime import PlanningExecutionRequest, TerminalState  # noqa: E402
+from engineering_flow.domain import FailureClassification, Role, Stage, ValidationFailure, WorkKind  # noqa: E402
+from engineering_flow.runtime import PlanningExecutionRequest, TaskExecutionRequest, TerminalState  # noqa: E402
 
 
 class FakeProcess:
@@ -108,6 +108,16 @@ class CodexCliTests(unittest.TestCase):
             run_factory=self.run_factory, git_runner=self.git_runner, **kwargs,
         )
 
+    def task_request(self, role, work_kind, **kwargs):
+        return TaskExecutionRequest(
+            workflow_id="workflow-1", execution_id="execution-task", logical_session_id="logical-task",
+            role=role, work_kind=work_kind, stage=Stage.TASK_EXECUTION,
+            repository_path=str(self.root), authoritative_input_paths=(), authoritative_input_hashes=(),
+            instruction="Perform only the approved task.", output_schema_path=str(self.schema),
+            final_output_path=str(self.output), timeout_seconds=3,
+            **kwargs,
+        )
+
     def test_preflight_requires_read_only_and_capabilities(self):
         runtime = self.runtime(allow_read_only_planning=False)
         report = runtime.verify_planning_capabilities(self.root)
@@ -131,6 +141,36 @@ class CodexCliTests(unittest.TestCase):
         report = missing_final_output.verify_planning_capabilities(self.root)
         self.assertFalse(report.available)
         self.assertIn("output_last_message", report.failure_detail)
+
+        developer = self.task_request(Role.DEVELOPER, WorkKind.DEVELOP)
+        with self.assertRaises(ValidationFailure):
+            self.runtime().execute(developer)
+
+        reviewer = self.task_request(
+            Role.REVIEWER, WorkKind.REVIEW,
+            developer_logical_session_id="developer-session",
+        )
+        with self.assertRaises(ValidationFailure):
+            self.runtime(allow_read_only_planning=False).execute(reviewer)
+
+    def test_developer_preflight_does_not_require_reviewer_sandbox(self):
+        runtime = self.runtime(allow_workspace_write=True)
+        runtime._run = lambda *args, **kwargs: SimpleNamespace(
+            returncode=0,
+            stdout="codex exec --json --output-schema FILE --output-last-message FILE --sandbox workspace-write",
+            stderr="",
+        )
+
+        developer = runtime.verify_capabilities(
+            self.root, ("json_events", "output_schema", "output_last_message", "workspace_write"),
+        )
+        reviewer = runtime.verify_capabilities(
+            self.root, ("json_events", "output_schema", "output_last_message", "read_only"),
+        )
+
+        self.assertTrue(developer.available)
+        self.assertFalse(reviewer.available)
+        self.assertIn("read-only", reviewer.failure_detail)
 
     def test_preflight_rejects_directory_with_only_git_marker(self):
         fake = self.root / "fake"
@@ -229,6 +269,144 @@ class CodexCliTests(unittest.TestCase):
         self.assertTrue(result.success)
         self.assertEqual(result.provider_session_id, "thread-stream")
         self.assertEqual([event.type for event in result.events], ["thread.started", "turn.completed"])
+
+    def test_developer_uses_workspace_write_and_exact_required_test_payload(self):
+        request = self.task_request(
+            Role.DEVELOPER, WorkKind.DEVELOP, required_test_commands=("python -m unittest",),
+        )
+
+        calls = []
+
+        def developer_popen(argv, **kwargs):
+            calls.append((argv, kwargs))
+            self.output.parent.mkdir(parents=True, exist_ok=True)
+            self.output.write_text(json.dumps({
+                "summary": "implemented", "changed_files": ["src/example.py"],
+                "test_results": [{"command": "python -m unittest", "passed": True, "summary": "ok"}],
+            }), encoding="utf-8")
+            return FakeProcess('{"type":"thread.started","thread_id":"developer-thread"}\n'
+                               '{"type":"turn.completed","id":"developer-turn"}\n')
+
+        result = self.runtime(allow_workspace_write=True, popen_factory=developer_popen).execute(request)
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.final_payload["changed_files"], ["src/example.py"])
+        self.assertEqual(calls[0][0][4], "workspace-write")
+        self.assertEqual(calls[0][1]["cwd"], str(self.root.resolve()))
+        self.assertFalse(calls[0][1]["shell"])
+
+    def test_reviewer_is_read_only_and_rejects_semantically_invalid_payload(self):
+        request = self.task_request(
+            Role.REVIEWER, WorkKind.REVIEW, developer_logical_session_id="developer-session",
+        )
+        calls = []
+
+        def reviewer_popen(argv, **kwargs):
+            calls.append((argv, kwargs))
+            self.output.parent.mkdir(parents=True, exist_ok=True)
+            self.output.write_text(json.dumps({"outcome": "PASS", "summary": "looks good", "findings": [{
+                "id": "F-1", "severity": "non_blocking", "description": "observation",
+            }]}), encoding="utf-8")
+            return FakeProcess('{"type":"turn.completed","id":"review-turn"}\n')
+
+        result = self.runtime(popen_factory=reviewer_popen).execute(request)
+
+        self.assertEqual(result.failure_classification, FailureClassification.AGENT_EXECUTION)
+        self.assertEqual(calls[0][0][4], "read-only")
+        self.assertFalse(calls[0][1]["shell"])
+
+    def test_reviewer_rejects_fix_required_mixed_with_non_blocking_findings(self):
+        request = self.task_request(
+            Role.REVIEWER, WorkKind.REVIEW, developer_logical_session_id="developer-session",
+        )
+
+        def reviewer_popen(argv, **kwargs):
+            self.output.parent.mkdir(parents=True, exist_ok=True)
+            self.output.write_text(json.dumps({
+                "outcome": "FIX_REQUIRED", "summary": "needs work", "findings": [
+                    {"id": "F-1", "severity": "blocking", "description": "defect"},
+                    {"id": "F-2", "severity": "non_blocking", "description": "note"},
+                ],
+            }), encoding="utf-8")
+            return FakeProcess('{"type":"turn.completed","id":"review-turn"}\n')
+
+        result = self.runtime(popen_factory=reviewer_popen).execute(request)
+
+        self.assertEqual(result.failure_classification, FailureClassification.AGENT_EXECUTION)
+        self.assertIn("only blocking findings", result.failure_detail)
+
+    def test_developer_continuity_falls_back_when_resume_is_not_advertised(self):
+        request = self.task_request(
+            Role.DEVELOPER, WorkKind.FIX, resume_provider_session_id="old-thread",
+            continuity_bundle={"task_contract": {"key": "TASK-1"}, "review_findings": [{"id": "F-1"}]},
+        )
+        calls = []
+
+        def fallback_popen(argv, **kwargs):
+            calls.append(argv)
+            self.output.parent.mkdir(parents=True, exist_ok=True)
+            self.output.write_text(json.dumps({
+                "summary": "fixed", "changed_files": [], "test_results": [],
+            }), encoding="utf-8")
+            return FakeProcess('{"type":"turn.completed","id":"fix-turn"}\n')
+
+        result = self.runtime(allow_workspace_write=True, popen_factory=fallback_popen).execute(request)
+
+        self.assertTrue(result.success)
+        self.assertTrue(result.metadata["continuity_degraded"])
+        self.assertNotIn("resume", calls[0])
+        self.assertIn("Bounded continuity evidence", calls[0][-1])
+
+    def test_developer_resume_uses_only_advertised_subcommand(self):
+        request = self.task_request(
+            Role.DEVELOPER, WorkKind.FIX, resume_provider_session_id="old-thread",
+        )
+        calls = []
+        self.help_result.stdout += "\ncodex exec resume [SESSION_ID]"
+
+        def resume_popen(argv, **kwargs):
+            calls.append(argv)
+            self.output.parent.mkdir(parents=True, exist_ok=True)
+            self.output.write_text(json.dumps({
+                "summary": "fixed", "changed_files": [], "test_results": [],
+            }), encoding="utf-8")
+            return FakeProcess('{"type":"thread.started","thread_id":"new-thread"}\n'
+                               '{"type":"turn.completed","id":"fix-turn"}\n')
+
+        result = self.runtime(allow_workspace_write=True, popen_factory=resume_popen).execute(request)
+
+        self.assertTrue(result.success)
+        self.assertFalse(result.metadata["continuity_degraded"])
+        self.assertEqual(calls[0][:4], ["codex", "exec", "resume", "old-thread"])
+
+    def test_developer_resume_falls_back_for_prose_or_alternate_syntax(self):
+        request = self.task_request(
+            Role.DEVELOPER, WorkKind.FIX, resume_provider_session_id="old-thread",
+            continuity_bundle={"task_contract": {"key": "TASK-1"}},
+        )
+        self.help_result.stdout += "\nUse resume later or codex exec --resume SESSION_ID"
+        calls = []
+
+        def fallback_popen(argv, **kwargs):
+            calls.append(argv)
+            self.output.parent.mkdir(parents=True, exist_ok=True)
+            self.output.write_text(json.dumps({
+                "summary": "fixed", "changed_files": [], "test_results": [],
+            }), encoding="utf-8")
+            return FakeProcess('{"type":"turn.completed","id":"fix-turn"}\n')
+
+        report = self.runtime(allow_workspace_write=True).verify_capabilities(
+            self.root, ("workspace_write", "json_events", "output_schema", "output_last_message"),
+        )
+        self.assertTrue(report.available)
+        self.assertFalse(report.capabilities["developer_resume"])
+        self.assertEqual(report.metadata["developer_resume_argv"], ())
+
+        result = self.runtime(allow_workspace_write=True, popen_factory=fallback_popen).execute(request)
+
+        self.assertTrue(result.success)
+        self.assertTrue(result.metadata["continuity_degraded"])
+        self.assertNotIn("resume", calls[0])
 
 
 if __name__ == "__main__":

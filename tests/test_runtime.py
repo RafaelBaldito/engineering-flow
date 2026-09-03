@@ -4,13 +4,14 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 
-from engineering_flow.domain import Role, Stage  # noqa: E402
+from engineering_flow.domain import Role, Stage, WorkKind  # noqa: E402
 from engineering_flow.runtime import (  # noqa: E402
     AgentRuntime,
     CapabilityReport,
     NormalizedEvent,
     PlanningExecutionRequest,
     PlanningExecutionResult,
+    TaskExecutionRequest,
     TerminalState,
 )
 
@@ -62,6 +63,31 @@ class RuntimeContractTests(unittest.TestCase):
             PlanningExecutionRequest(
                 "w", "e", Role.PRD, Stage.PRD, "repo", (), (),
                 "instruction", "schema", "output", 0,
+            )
+
+    def test_task_roles_require_matching_work_kind_and_independent_reviewer(self):
+        common = dict(
+            workflow_id="workflow-1", execution_id="execution-1", stage=Stage.TASK_EXECUTION,
+            repository_path="repo", authoritative_input_paths=(), authoritative_input_hashes=(),
+            instruction="Implement the approved task.", output_schema_path="schema", final_output_path="result",
+            timeout_seconds=10,
+        )
+        developer = TaskExecutionRequest(
+            **common, role=Role.DEVELOPER, work_kind=WorkKind.DEVELOP,
+            logical_session_id="developer-session", continuity_bundle={"task_contract": {"key": "TASK-1"}},
+        )
+        self.assertEqual(developer.work_kind, WorkKind.DEVELOP)
+        with self.assertRaises(ValueError):
+            TaskExecutionRequest(**common, role=Role.REVIEWER, work_kind=WorkKind.DEVELOP)
+        with self.assertRaises(ValueError):
+            TaskExecutionRequest(
+                **common, role=Role.REVIEWER, work_kind=WorkKind.REVIEW,
+                logical_session_id="reviewer-session",
+            )
+        with self.assertRaises(ValueError):
+            TaskExecutionRequest(
+                **common, role=Role.REVIEWER, work_kind=WorkKind.REVIEW,
+                logical_session_id="developer-session", developer_logical_session_id="developer-session",
             )
 
 

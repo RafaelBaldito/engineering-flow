@@ -15,13 +15,15 @@ from queue import Empty, Queue
 from pathlib import Path
 from typing import Any
 
-from .domain import FailureClassification, ValidationFailure
+from .domain import FailureClassification, Role, ValidationFailure
 from .runtime import (
     AgentRuntime,
     CapabilityReport,
     NormalizedEvent,
     PlanningExecutionRequest,
     PlanningExecutionResult,
+    RuntimeExecutionRequest,
+    RuntimeExecutionResult,
     TerminalState,
 )
 from .sanitization import sanitize_payload, sanitize_text
@@ -42,6 +44,56 @@ FINAL_OUTPUT_SCHEMA: dict[str, Any] = {
         "summary": {"type": "string"},
         "requires_human_approval": {"type": "boolean"},
         "approval_reason": {"type": "string"},
+    },
+}
+
+DEVELOPER_OUTPUT_SCHEMA: dict[str, Any] = {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["summary", "changed_files", "test_results"],
+    "properties": {
+        "summary": {"type": "string"},
+        "changed_files": {"type": "array", "items": {"type": "string"}},
+        "test_results": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["command", "passed", "summary"],
+                "properties": {
+                    "command": {"type": "string"},
+                    "passed": {"type": "boolean"},
+                    "summary": {"type": "string"},
+                },
+            },
+        },
+    },
+}
+
+REVIEWER_OUTPUT_SCHEMA: dict[str, Any] = {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["outcome", "summary", "findings"],
+    "properties": {
+        "outcome": {"enum": ["PASS", "FIX_REQUIRED"]},
+        "summary": {"type": "string"},
+        "findings": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["id", "severity", "description"],
+                "properties": {
+                    "id": {"type": "string"},
+                    "severity": {"enum": ["blocking", "non_blocking"]},
+                    "description": {"type": "string"},
+                    "path": {"type": "string"},
+                    "line": {"type": "integer", "minimum": 1},
+                },
+            },
+        },
     },
 }
 
@@ -110,6 +162,7 @@ class CodexCliRuntime(AgentRuntime):
         *,
         timeout_seconds: float = 1800,
         allow_read_only_planning: bool = True,
+        allow_workspace_write: bool = False,
         popen_factory: Callable[..., Any] = subprocess.Popen,
         run_factory: Callable[..., Any] = subprocess.run,
         executable_resolver: Callable[[str], str | None] = shutil.which,
@@ -124,6 +177,7 @@ class CodexCliRuntime(AgentRuntime):
         self.command = command
         self.timeout_seconds = timeout_seconds
         self.allow_read_only_planning = allow_read_only_planning
+        self.allow_workspace_write = allow_workspace_write
         self._popen = popen_factory
         self._run = run_factory
         self._resolve_executable = executable_resolver
@@ -196,7 +250,9 @@ class CodexCliRuntime(AgentRuntime):
         values = _as_text(getattr(completed, "stdout", "")).splitlines()
         return [value.strip().lower() for value in values] == ["true", "false"]
 
-    def _help_result(self, repository: Path) -> tuple[bool, str]:
+    def _help_result(
+        self, repository: Path
+    ) -> tuple[dict[str, bool], dict[str, Any], str]:
         try:
             completed = self._run(
                 [self.command, "exec", "--help"],
@@ -211,24 +267,38 @@ class CodexCliRuntime(AgentRuntime):
                 check=False,
             )
         except (OSError, subprocess.TimeoutExpired) as exc:
-            return False, sanitize_text(str(exc), self._secret_values)
+            return {}, {}, sanitize_text(str(exc), self._secret_values)
         output = _as_text(getattr(completed, "stdout", ""))
         error = _as_text(getattr(completed, "stderr", ""))
         if getattr(completed, "returncode", 1) != 0:
-            return False, sanitize_text(error or output or "codex exec capability check failed", self._secret_values)
+            return {}, {}, sanitize_text(error or output or "codex exec capability check failed", self._secret_values)
         help_text = f"{output}\n{error}".lower()
-        required = {
+        # A provider session can only be resumed when the exact invocation we
+        # build is advertised by ``codex exec --help``.  Generic prose, a
+        # different subcommand, or an alternate flag is not evidence that
+        # ``codex exec resume <session-id>`` is supported.
+        resume_argv = (
+            ("exec", "resume")
+            if re.search(
+                r"(?m)^\s*(?:codex\s+)?exec\s+resume"
+                r"(?:\s+\[options\])?\s+[\[<](?:session[_ -]?id|session)[\]>](?:\s|$)",
+                help_text,
+            )
+            else ()
+        )
+        capabilities = {
             "json_events": "--json" in help_text,
             "output_schema": "--output-schema" in help_text,
             "output_last_message": "--output-last-message" in help_text,
             "read_only_sandbox": "--sandbox" in help_text and "read-only" in help_text,
+            "workspace_write_sandbox": "--sandbox" in help_text and "workspace-write" in help_text,
+            "developer_resume": bool(resume_argv),
         }
-        missing = [name for name, supported in required.items() if not supported]
-        if missing:
-            return False, f"codex exec is missing capabilities: {', '.join(missing)}"
-        return True, ""
+        return capabilities, {"developer_resume_argv": resume_argv}, ""
 
-    def verify_planning_capabilities(self, repository: str | Path) -> CapabilityReport:
+    def verify_capabilities(
+        self, repository: str | Path, required_capabilities: tuple[str, ...] = ()
+    ) -> CapabilityReport:
         repository_path = Path(repository).expanduser().resolve()
         capabilities: dict[str, bool] = {
             "executable": False,
@@ -237,13 +307,11 @@ class CodexCliRuntime(AgentRuntime):
             "output_schema": False,
             "output_last_message": False,
             "read_only_sandbox": False,
+            "workspace_write_sandbox": False,
+            "read_only": False,
+            "workspace_write": False,
+            "developer_resume": False,
         }
-        if not self.allow_read_only_planning:
-            return CapabilityReport(
-                self.provider, self.command, str(repository_path), False, capabilities, False,
-                FailureClassification.WORKFLOW,
-                "read-only planning is disabled by configuration",
-            )
         if self._resolved_executable() is None:
             return CapabilityReport(
                 self.provider, self.command, str(repository_path), False, capabilities, True,
@@ -256,25 +324,44 @@ class CodexCliRuntime(AgentRuntime):
                 FailureClassification.WORKFLOW, "target repository is not a Git worktree",
             )
         capabilities["git_worktree"] = True
-        supported, detail = self._help_result(repository_path)
-        if not supported:
+        supported, metadata, detail = self._help_result(repository_path)
+        if not supported or detail:
+            capabilities.update(supported)
             return CapabilityReport(
-                self.provider, self.command, str(repository_path), False, capabilities, True,
-                FailureClassification.PROVIDER, detail,
+                self.provider, self.command, str(repository_path), False, capabilities, False,
+                FailureClassification.PROVIDER, detail, metadata,
             )
-        capabilities.update(
-            json_events=True,
-            output_schema=True,
-            output_last_message=True,
-            read_only_sandbox=True,
-        )
+        capabilities.update(supported)
+        capabilities["read_only"] = self.allow_read_only_planning and capabilities["read_only_sandbox"]
+        capabilities["workspace_write"] = self.allow_workspace_write and capabilities["workspace_write_sandbox"]
+        aliases = {"read_only_planning": "read_only", "read_only_sandbox": "read_only", "workspace_write_sandbox": "workspace_write"}
+        requested = tuple(aliases.get(name, name) for name in required_capabilities)
+        missing = [name for name in requested if not capabilities.get(name, False)]
+        if missing:
+            display = {"read_only": "read-only", "workspace_write": "workspace-write"}
+            detail = "Codex runtime is missing capabilities: " + ", ".join(
+                display.get(name, name) for name in missing
+            )
+            return CapabilityReport(
+                self.provider, self.command, str(repository_path), False, capabilities, capabilities["read_only"],
+                FailureClassification.WORKFLOW, detail, metadata,
+            )
         return CapabilityReport(
-            self.provider, self.command, str(repository_path), True, capabilities, True,
+            self.provider, self.command, str(repository_path), True, capabilities, capabilities["read_only"],
+            metadata=metadata,
+        )
+
+    def verify_planning_capabilities(self, repository: str | Path) -> CapabilityReport:
+        """Wave 1 compatibility wrapper for the generalized preflight."""
+
+        return self.verify_capabilities(
+            repository,
+            ("json_events", "output_schema", "output_last_message", "read_only"),
         )
 
     @staticmethod
-    def _write_schema(path: Path) -> None:
-        encoded = json.dumps(FINAL_OUTPUT_SCHEMA, indent=2, sort_keys=True) + "\n"
+    def _write_schema(path: Path, schema: Mapping[str, Any]) -> None:
+        encoded = json.dumps(schema, indent=2, sort_keys=True) + "\n"
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             if path.exists():
@@ -285,18 +372,42 @@ class CodexCliRuntime(AgentRuntime):
         except OSError as exc:
             raise ValidationFailure(f"could not retain output schema: {exc}") from exc
 
-    def _process(self, request: PlanningExecutionRequest) -> Any:
+    @staticmethod
+    def _schema_for(request: RuntimeExecutionRequest) -> Mapping[str, Any]:
+        if request.role is Role.DEVELOPER:
+            return DEVELOPER_OUTPUT_SCHEMA
+        if request.role is Role.REVIEWER:
+            return REVIEWER_OUTPUT_SCHEMA
+        return FINAL_OUTPUT_SCHEMA
+
+    @staticmethod
+    def _sandbox_for(request: RuntimeExecutionRequest) -> str:
+        if request.role is Role.DEVELOPER:
+            return "workspace-write"
+        return "read-only"
+
+    def _instruction_for(self, request: RuntimeExecutionRequest, *, resume_supported: bool) -> str:
+        if request.role is not Role.DEVELOPER or not request.continuity_bundle or resume_supported:
+            return request.instruction
+        continuity = json.dumps(sanitize_payload(request.continuity_bundle, self._secret_values), sort_keys=True)
+        return f"{request.instruction}\n\nBounded continuity evidence for this task only:\n{continuity}"
+
+    def _process(
+        self, request: RuntimeExecutionRequest, *, resume_argv: tuple[str, ...]
+    ) -> Any:
+        command = [self.command, "exec"]
+        if request.role is Role.DEVELOPER and request.resume_provider_session_id and resume_argv:
+            command = [self.command, *resume_argv, request.resume_provider_session_id]
         argv = [
-            self.command,
-            "exec",
+            *command,
             "--json",
             "--sandbox",
-            "read-only",
+            self._sandbox_for(request),
             "--output-schema",
             str(Path(request.output_schema_path).expanduser().resolve()),
             "--output-last-message",
             str(Path(request.final_output_path).expanduser().resolve()),
-            request.instruction,
+            self._instruction_for(request, resume_supported=bool(resume_argv)),
         ]
         return self._popen(
             argv,
@@ -458,7 +569,13 @@ class CodexCliRuntime(AgentRuntime):
         stderr_thread.join(timeout=0.2)
         return timed_out, "".join(stderr_parts)[-4000:]
 
-    def _read_final_payload(self, path: Path, events: list[NormalizedEvent]) -> tuple[dict[str, Any] | None, str | None]:
+    def _read_final_payload(
+        self,
+        path: Path,
+        events: list[NormalizedEvent],
+        request: RuntimeExecutionRequest,
+    ) -> tuple[dict[str, Any] | None, str | None]:
+        schema = self._schema_for(request)
         raw_payload: Any = None
         if path.is_file():
             try:
@@ -475,14 +592,18 @@ class CodexCliRuntime(AgentRuntime):
                     if isinstance(nested, Mapping):
                         candidate = nested
                         break
-                if all(key in candidate for key in FINAL_OUTPUT_SCHEMA["required"]):
+                if all(key in candidate for key in schema["required"]):
                     raw_payload = candidate
                     break
         if not isinstance(raw_payload, Mapping):
             return None, "final structured output is missing"
-        required = set(FINAL_OUTPUT_SCHEMA["required"])
+        required = set(schema["required"])
         if set(raw_payload) != required:
             return None, "final structured output does not match the approved schema"
+        if request.role is Role.DEVELOPER:
+            return self._validate_developer_payload(raw_payload, request)
+        if request.role is Role.REVIEWER:
+            return self._validate_reviewer_payload(raw_payload, request)
         if not isinstance(raw_payload["artifact_markdown"], str) or not raw_payload["artifact_markdown"].strip():
             return None, "artifact_markdown must be non-empty Markdown"
         if not isinstance(raw_payload["summary"], str):
@@ -491,22 +612,109 @@ class CodexCliRuntime(AgentRuntime):
             return None, "requires_human_approval must be a boolean"
         if not isinstance(raw_payload["approval_reason"], str):
             return None, "approval_reason must be a string"
-        return {key: raw_payload[key] for key in FINAL_OUTPUT_SCHEMA["required"]}, None
+        return {key: raw_payload[key] for key in schema["required"]}, None
 
-    def execute_planning(self, request: PlanningExecutionRequest) -> PlanningExecutionResult:
+    def _validate_developer_payload(
+        self, payload: Mapping[str, Any], request: RuntimeExecutionRequest
+    ) -> tuple[dict[str, Any] | None, str | None]:
+        if not isinstance(payload["summary"], str):
+            return None, "Developer summary must be a string"
+        changed = payload["changed_files"]
+        if not isinstance(changed, list) or not all(isinstance(value, str) for value in changed):
+            return None, "Developer changed_files must be an array of paths"
+        repository = Path(request.repository_path).expanduser().resolve()
+        normalized_paths: list[str] = []
+        for value in changed:
+            candidate = (repository / value).resolve()
+            if not value or candidate == repository or repository not in candidate.parents:
+                return None, "Developer changed_files contains a path outside the repository"
+            normalized_paths.append(str(candidate.relative_to(repository)))
+        results = payload["test_results"]
+        if not isinstance(results, list):
+            return None, "Developer test_results must be an array"
+        seen: set[str] = set()
+        for result in results:
+            if not isinstance(result, Mapping) or set(result) != {"command", "passed", "summary"}:
+                return None, "Developer test result does not match the approved schema"
+            command, passed, summary = result["command"], result["passed"], result["summary"]
+            if not isinstance(command, str) or type(passed) is not bool or not isinstance(summary, str):
+                return None, "Developer test result has invalid field types"
+            if command in seen:
+                return None, "Developer test results contain a duplicate command"
+            seen.add(command)
+        required = tuple(request.required_test_commands)
+        if required and (set(seen) != set(required) or len(seen) != len(required)):
+            return None, "Developer test results do not exactly match required commands"
+        if any(not result["passed"] for result in results if result["command"] in required):
+            return None, "each required Developer test command must pass"
+        return {
+            "summary": payload["summary"],
+            "changed_files": normalized_paths,
+            "test_results": [dict(result) for result in results],
+        }, None
+
+    def _validate_reviewer_payload(
+        self, payload: Mapping[str, Any], request: RuntimeExecutionRequest
+    ) -> tuple[dict[str, Any] | None, str | None]:
+        outcome, summary, findings = payload["outcome"], payload["summary"], payload["findings"]
+        if outcome not in ("PASS", "FIX_REQUIRED") or not isinstance(summary, str) or not isinstance(findings, list):
+            return None, "Reviewer payload has invalid outcome, summary, or findings"
+        ids: set[str] = set()
+        blocking = 0
+        repository = Path(request.repository_path).expanduser().resolve()
+        normalized: list[dict[str, Any]] = []
+        for finding in findings:
+            if not isinstance(finding, Mapping) or set(finding) - {"id", "severity", "description", "path", "line"}:
+                return None, "Reviewer finding does not match the approved schema"
+            if not {"id", "severity", "description"}.issubset(finding):
+                return None, "Reviewer finding is missing a required field"
+            identifier, severity, description = finding["id"], finding["severity"], finding["description"]
+            if not isinstance(identifier, str) or not identifier or identifier in ids:
+                return None, "Reviewer finding IDs must be non-empty and unique"
+            if severity not in ("blocking", "non_blocking") or not isinstance(description, str):
+                return None, "Reviewer finding has invalid fields"
+            safe = {"id": identifier, "severity": severity, "description": description}
+            if "path" in finding:
+                path = finding["path"]
+                candidate = (repository / path).resolve() if isinstance(path, str) else repository
+                if not isinstance(path, str) or not path or candidate == repository or repository not in candidate.parents:
+                    return None, "Reviewer finding path is outside the repository"
+                safe["path"] = str(candidate.relative_to(repository))
+            if "line" in finding:
+                if type(finding["line"]) is not int or finding["line"] <= 0:
+                    return None, "Reviewer finding line must be a positive integer"
+                safe["line"] = finding["line"]
+            ids.add(identifier)
+            blocking += severity == "blocking"
+            normalized.append(safe)
+        if outcome == "PASS" and findings:
+            return None, "Reviewer PASS requires no findings"
+        if outcome == "FIX_REQUIRED" and (not blocking or blocking != len(findings)):
+            return None, "Reviewer FIX_REQUIRED requires only blocking findings"
+        return {"outcome": outcome, "summary": summary, "findings": normalized}, None
+
+    def execute(self, request: RuntimeExecutionRequest) -> RuntimeExecutionResult:
         logical_session_id = request.logical_session_id or request.execution_id
-        report = self.verify_planning_capabilities(request.repository_path)
+        mandatory = (
+            ("json_events", "output_schema", "output_last_message", "workspace_write")
+            if request.role is Role.DEVELOPER
+            else ("json_events", "output_schema", "output_last_message", "read_only")
+        )
+        required = tuple(dict.fromkeys((*mandatory, *request.required_capabilities)))
+        report = self.verify_capabilities(request.repository_path, required)
         if not report.available:
             raise ValidationFailure(
-                report.failure_detail or "Codex planning capabilities are unavailable",
+                report.failure_detail or "Codex runtime capabilities are unavailable",
                 details={"capability_report": report.capabilities},
             )
         schema_path = Path(request.output_schema_path).expanduser().resolve()
         final_output_path = Path(request.final_output_path).expanduser().resolve()
-        self._write_schema(schema_path)
+        self._write_schema(schema_path, self._schema_for(request))
+        resume_argv = tuple(report.metadata.get("developer_resume_argv", ()))
+        resume_supported = bool(resume_argv)
         process: Any
         try:
-            process = self._process(request)
+            process = self._process(request, resume_argv=resume_argv)
         except OSError as exc:
             detail = sanitize_text(str(exc), self._secret_values)
             return PlanningExecutionResult(
@@ -582,7 +790,7 @@ class CodexCliRuntime(AgentRuntime):
                 TerminalState.FAILED, None, usage, tuple(events), {"stderr": safe_stderr},
                 FailureClassification.AUTHENTICATION, detail,
             )
-        payload, payload_error = self._read_final_payload(final_output_path, events)
+        payload, payload_error = self._read_final_payload(final_output_path, events, request)
         has_success = any(event.type in _SUCCESS_EVENTS for event in events)
         if malformed or failure_seen or not has_success or payload_error:
             detail = payload_error or ("provider emitted a failure event" if failure_seen else "terminal success event is missing")
@@ -593,8 +801,20 @@ class CodexCliRuntime(AgentRuntime):
             )
         return PlanningExecutionResult(
             self.provider, logical_session_id, provider_session_id, provider_execution_id,
-            TerminalState.SUCCEEDED, payload, usage, tuple(events), {"stderr": safe_stderr},
+            TerminalState.SUCCEEDED, payload, usage, tuple(events), {
+                "stderr": safe_stderr,
+                "continuity_degraded": bool(
+                    request.role is Role.DEVELOPER
+                    and request.resume_provider_session_id
+                    and not resume_supported
+                ),
+            },
         )
+
+    def execute_planning(self, request: PlanningExecutionRequest) -> PlanningExecutionResult:
+        """Wave 1 compatibility wrapper for the generalized executor."""
+
+        return self.execute(request)
 
 
 __all__ = ["CodexCliRuntime", "FINAL_OUTPUT_SCHEMA"]
