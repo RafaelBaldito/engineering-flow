@@ -4,8 +4,9 @@
 
 This document defines the stable architecture contract for Engineering Flow V1
 (MVP). It is the cross-wave reference for the controlled workflow that moves a
-feature request to a review-ready Pull Request (PR). It does not replace the
-TECHSPEC for Wave 1, Wave 2, or Wave 3.
+feature request to a review-ready Pull Request (PR). The approved delivery plan
+requires this overview and its approval before a Wave TECHSPEC is created. It
+does not replace the TECHSPEC for Wave 1, Wave 2, or Wave 3.
 
 The product is a Python CLI control plane. A coding-agent provider performs
 engineering work in an execution plane; Engineering Flow owns the lifecycle,
@@ -17,8 +18,12 @@ The approved delivery plan has three ordered waves:
 
 1. Controlled planning through an approved task plan.
 2. Sequential implementation, testing, independent review, and bounded fixes.
-3. Final validation, controlled Git delivery, and creation of a review-ready
-   PR.
+3. Release readiness, runtime/product final validation, and controlled Git/PR
+   delivery capability.
+
+The actual release commit, push, and PR occur only after all Waves have
+authoritative Wave acceptance, release-level `final-review` has passed, and a
+separate persisted delivery authorization exists.
 
 The same workflow identity, state ownership, provider boundary, persistence
 rules, event vocabulary, CLI boundary, and safety rules apply throughout all
@@ -41,7 +46,9 @@ fallback, distributed workers, a dashboard, or autonomous merge.
 - CLI commands are clients of orchestration services; they do not embed
   workflow business rules.
 - A task is eligible to complete only after required implementation, tests,
-  independent review, and absence of blocking findings.
+  independent review, and absence of blocking findings. Task acceptance, Wave
+  acceptance, release acceptance, delivery authorization, and final workflow
+  completion are separate durable facts.
 
 ## 4. High-Level System Responsibilities
 
@@ -52,7 +59,7 @@ fallback, distributed workers, a dashboard, or autonomous merge.
 | Provider-native sessions, events, permissions, and result translation | Provider adapter | Keeps provider SDK/protocol details out of the core. |
 | Workflow record, artifacts, execution history, and idempotency evidence | Persistence boundary | Persists controlled lifecycle facts and references. |
 | Commands to run, inspect, approve, reject, resume, and access logs | CLI boundary | Delegates to orchestration services. |
-| Staging, commit, push, PR creation, and their duplicate protection | Controlled Git/PR integration | Agents may propose content but do not freely own repository delivery. |
+| Staging, commit, push, PR creation, and their duplicate protection | Controlled Git/PR integration | The orchestrator performs these deterministic side effects only after release acceptance and explicit delivery authorization; agents may propose content but do not own delivery. |
 
 The roles PRD, Architect, Planner, Developer, and Reviewer are workflow
 responsibilities. A role is distinct from a provider, skill, session, and
@@ -60,15 +67,18 @@ execution.
 
 ## 5. Workflow and State Ownership
 
-The orchestrator owns one authoritative workflow lifecycle. Conceptually it
-progresses through planning, approval waiting, sequential task work, final
-validation, delivery, and terminal states:
+The orchestrator owns one authoritative workflow lifecycle. Its planning and
+acceptance gates are conceptually ordered as follows:
 
 ```text
-created -> planning work -> awaiting required approval
-        -> approved next planning work -> approved task plan
-        -> task implementation/test/review/fix loop
-        -> final validation -> commit -> push -> PR -> completed
+feature -> PRD -> approval -> delivery plan -> approval
+        -> architecture overview when required by the approved plan -> approval
+        -> current-Wave TECHSPEC -> approval -> task plan -> approval
+        -> task implementation/test/review/fix loop -> task acceptance
+        -> Wave review -> Wave acceptance
+        -> explicit authorization before any later Wave starts
+        -> after all release Waves pass: release-level final review -> release acceptance
+        -> explicit delivery authorization -> commit -> push -> PR -> completed
 ```
 
 At every applicable stage, an approval policy is `required`, `automatic`, or
@@ -78,12 +88,16 @@ unrecoverable failure, cancellation, or a safety stop transitions the workflow
 to a recorded waiting, failed, cancelled, or human-attention state rather than
 allowing uncontrolled continuation.
 
-The task lifecycle is sequential in V1. The orchestrator decides when a task
-may begin, retry, enter remediation, complete, or advance to the next task.
-Review failure routes only through the configured bounded remediation loop;
-reaching its mandatory maximum requires human intervention. Completion requires
-all required approvals, quality gates, Git state, push, and PR creation; merge
-is outside workflow completion.
+The task lifecycle is sequential in V1: `execute-task -> review-task`, with
+`fix-task -> review-task` only for actionable task findings. A task-review PASS
+is task acceptance, not Wave acceptance. Once all required tasks are accepted,
+`wave-review` independently accepts the Wave or routes remediation. A
+Wave-review PASS does not start a later Wave; a persisted explicit authorization
+is required. After every release Wave has PASS, `final-review` independently
+accepts the release or routes release-level remediation. Runtime/product final
+validation is evidence for these reviews, not a replacement for either review
+layer. Final workflow completion requires release acceptance, delivery
+authorization, valid Git state, push, and PR creation; merge remains outside it.
 
 ## 6. Agent Runtime and Provider Boundaries
 
@@ -130,7 +144,8 @@ input; they do not grant the reviewer authority to complete a task.
 
 The persistence boundary owns enough durable information to reconstruct and
 control a workflow after termination. This includes the workflow identifier,
-current stage and task, approval requests and decisions, selected provider,
+current stage and task, approval requests and decisions, later-Wave start and
+delivery authorizations, selected provider,
 logical and provider session references, execution history, review/fix and
 retry progress, failures, artifact references, Git state, and PR state.
 
@@ -175,11 +190,12 @@ advance the workflow.
 
 ## 11. Git and Pull Request Integration
 
-Git and PR operations are controlled orchestration side effects. After Wave 2
-has established a final eligible state and Wave 3's final validation passes,
-the controlled integration validates repository, branch, authentication, and
-hosting prerequisites before staging, committing, pushing, and creating the
-PR according to policy.
+Git and PR operations are controlled orchestration side effects, not workflow
+Skills. After all release Waves have authoritative PASS, release-level
+`final-review` has accepted the release, and explicit delivery authorization is
+persisted, the controlled integration validates repository, branch,
+authentication, and hosting prerequisites before staging, committing, pushing,
+and creating the PR according to policy.
 
 Agents may propose commit messages, PR descriptions, changed-file summaries,
 and human-review notes. The orchestration layer owns execution and recording of
@@ -210,7 +226,8 @@ agent may report a failure but cannot silently choose a workflow transition.
 The following contracts are intentionally stable across all delivery waves:
 
 - The orchestration core is the sole authority for workflow, approval,
-  task-lifecycle, retry, and completion decisions.
+  task-lifecycle, Wave/release acceptance recording, authorization, retry, and
+  completion decisions.
 - Provider-neutral runtime, session, execution, event, and capability concepts
   isolate Codex-specific integration behind an adapter.
 - Persisted workflow state and artifacts are authoritative for resume;
@@ -219,15 +236,16 @@ The following contracts are intentionally stable across all delivery waves:
   observability contract exposed through the CLI.
 - Context is role- and stage-scoped; Developer continuity is task-local and
   Reviewer independence is preferred and separately evaluable.
-- Git and PR operations are policy-controlled orchestration responsibilities;
-  agents do not independently control repository delivery and merge is human
-  gated.
+- Git and PR operations are policy-controlled orchestration responsibilities,
+  never workflow-Skill side effects; agents do not independently control
+  repository delivery and merge is human gated.
 - Safety limits and human-attention states take precedence over autonomous
   progress.
 
 Wave 1 establishes these contracts for planning. Wave 2 extends them to task,
-test, and review evidence without changing ownership. Wave 3 applies them to
-irreversible Git and PR delivery operations.
+test, and review evidence without changing ownership. Wave 3 establishes and
+validates release-readiness and controlled delivery capability; actual release
+Git/PR operations remain post-release-acceptance orchestrator responsibilities.
 
 ## 14. Architecture Decisions Deferred to TECHSPECs
 
@@ -249,4 +267,4 @@ Engineering Flow is a durable, observable workflow control plane around a
 provider-neutral agent-runtime boundary. Its stable contracts keep human
 approval, independent review, recovery, safe delivery, and audit evidence
 under orchestrator control while allowing provider adapters to evolve. This
-overview is ready to guide the Wave 1 TECHSPEC.
+overview is ready to guide the currently authorized Wave TECHSPEC.

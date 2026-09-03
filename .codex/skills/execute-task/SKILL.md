@@ -514,7 +514,8 @@ Return `COMPLETED` when:
 If status tracking is used, mark the task as `IMPLEMENTED`, not `PASS`.
 
 A `COMPLETED` execution means implementation is ready for review. It
-does not mean the task has passed review.
+does not mean the task has passed review, accepted the Wave, or authorized any
+later Wave or release action.
 
 Provide the concise result format defined above and stop.
 

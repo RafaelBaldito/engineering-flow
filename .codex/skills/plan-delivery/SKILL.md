@@ -16,9 +16,10 @@ name: plan-delivery
 Transform an approved PRD into a clear delivery strategy that determines
 how the product scope should be implemented incrementally.
 
-The skill decides whether the project is best handled as a single
+The approved delivery plan is the authority for whether the project is handled as a single
 delivery scope (`SINGLE`) or as multiple bounded delivery waves
-(`WAVES`), while keeping future technical design intentionally
+(`WAVES`), their boundaries and dependencies, and whether a global architecture
+overview is required. It keeps future technical design intentionally
 lightweight.
 
 Its primary goal is to reduce planning risk, context growth, and
@@ -222,8 +223,9 @@ share stable boundaries such as:
 
 Do not create the architecture document in this skill.
 
-Record whether one is recommended and what stable concerns it should
-cover.
+Record one of `REQUIRED` or `NOT REQUIRED` and the stable concerns it should
+cover when required. Do not leave architecture applicability as a non-binding
+recommendation.
 
 For small `SINGLE` projects, a separate architecture overview may be
 unnecessary.
@@ -359,9 +361,9 @@ SINGLE | WAVES
 
 ## 4. Requirement Coverage
 
-## 5. Architecture Overview Need
+## 5. Architecture Overview Applicability
 
-Required | Recommended | Not Required
+REQUIRED | NOT REQUIRED
 
 ## 6. Delivery Scope
 
@@ -412,7 +414,8 @@ Before completing, verify:
 -   [ ] future waves remain outline-level;
 -   [ ] wave boundaries are not arbitrary technical-layer splits;
 -   [ ] context efficiency was considered;
--   [ ] architecture-overview need was assessed;
+-   [ ] architecture-overview applicability was decided as `REQUIRED` or
+      `NOT REQUIRED`;
 -   [ ] no TECHSPEC or implementation task was created;
 -   [ ] the plan respects the local document-size target or explains a
     justified exception;
@@ -436,9 +439,12 @@ Provide a concise summary containing:
 
 Do not invoke or simulate human approval.
 
-After explicit human approval, this skill is complete. Architecture
-planning or the selected scope's technical specification may then be
-initiated separately.
+After explicit human approval, this skill is complete. If the approved plan
+marks the architecture overview `REQUIRED`, `create-architecture-overview` is
+the next stage and its artifact requires approval before any TECHSPEC. If it is
+`NOT REQUIRED`, the selected initial scope's TECHSPEC may be initiated
+separately. For a later Wave, its TECHSPEC additionally requires predecessor
+Wave PASS and explicit persisted authorization to start that Wave.
 
 ## Escalation
 

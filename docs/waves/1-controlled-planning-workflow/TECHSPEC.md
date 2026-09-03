@@ -11,6 +11,13 @@ TECHSPEC, and task plan through Codex; and stops after each artifact until the
 applicable approval policy is satisfied. Its successful terminal state is an
 approved, immutable task-plan artifact ready for Wave 2.
 
+**Historical scope clarification:** this direct product-runtime PRD -> TECHSPEC
+-> task-plan state machine was the intentionally bounded Wave 1 implementation
+slice. It does not define the canonical end-to-end documentation lifecycle,
+which is governed by the approved delivery plan and includes delivery-plan and
+conditional architecture-overview approval gates before per-Wave TECHSPECs.
+Wave 1's accepted evidence remains valid for its approved boundary.
+
 This wave includes planning-stage state, artifacts, events, logs, approvals,
 recovery, idempotency records, CLI interaction, and the Codex planning adapter.
 It does **not** implement task execution, tests, review/fix cycles, Git

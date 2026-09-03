@@ -24,6 +24,10 @@ delivery contains additional Waves.
 
 Use `wave-review` to accept an individual Wave.
 
+Runtime/product `final validation` is a quality gate and source of evidence for
+this audit. It is not this release-level `final-review`, and it never replaces
+the required authoritative Wave-review PASS for each included Wave.
+
 The final review answers:
 
 1. Was the complete approved release delivered?
@@ -484,7 +488,10 @@ After persisting the artifact, console output must contain only:
 
 ## Completion
 
-A final `PASS` means the complete approved release is accepted.
+A final `PASS` means the complete approved release is accepted. It is distinct
+from delivery authorization and final workflow completion. The deterministic
+orchestrator-owned commit, push, and PR actions may occur only after a separate
+explicit persisted delivery authorization.
 
 Do not automatically commit, push, open a PR, deploy, or invoke another workflow
-stage unless a separate approved workflow step explicitly requests it.
+stage unless that separate authorized orchestrator step explicitly requests it.

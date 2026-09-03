@@ -414,8 +414,9 @@ Provide a concise summary containing:
 
 Do not invoke or simulate human approval.
 
-After explicit human approval, this skill is complete. The next workflow
-stage may then be initiated separately.
+After explicit human approval, this skill is complete. The next canonical workflow
+stage is `plan-delivery`; do not create an architecture overview, TECHSPEC, or
+tasks from this skill.
 
 ## Escalation
 

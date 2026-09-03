@@ -1,4 +1,13 @@
-# Wave 1 Final Review — Controlled Planning Workflow
+# Superseded Historical Evidence — Wave 1 Final Review
+
+**Status:** Superseded historical evidence. This Wave-scoped report is not the
+authoritative release-level `final-review` and must not be used as current
+release acceptance. Wave 1's authoritative acceptance evidence is
+`tasks/1-controlled-planning-workflow/reviews/WAVE-REVIEW.md` with `PASS`.
+
+---
+
+# Historical Wave 1 Final Review — Controlled Planning Workflow
 
 **Review date:** 2026-09-02  
 **Repository state reviewed:** `9a05078` (`feat(cli): add planning workflow control surface`); working tree clean before this report was added.  

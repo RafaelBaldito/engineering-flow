@@ -471,7 +471,8 @@ Recommended task status after successful remediation:
 
 `IMPLEMENTED`
 
-`COMPLETED` means "ready for re-review", not "accepted".
+`COMPLETED` means "ready for re-review", not "accepted". It cannot be used to
+advance the task, Wave, or release acceptance layer.
 
 Return `FIX_REQUIRED` when:
 

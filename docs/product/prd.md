@@ -78,7 +78,7 @@ Provider, role, skill, session, and execution are distinct concepts. A skill is 
 
 ### Workflow orchestration
 
-- **FR-001:** The product must accept a feature request and coordinate the lifecycle: PRD; PRD approval; TECHSPEC; TECHSPEC approval; task plan; task-plan approval; sequential task execution; testing; review/fix cycles; final validation; commit; push; and PR creation.
+- **FR-001:** The product must accept a feature request and coordinate the controlled lifecycle: PRD; PRD approval; delivery-plan creation and approval; architecture-overview creation and approval when the approved delivery plan requires it; per-scope TECHSPEC creation and approval; task-plan creation and approval; sequential task execution; task review/fix cycles; Wave acceptance; release-level final review; explicit delivery authorization; and controlled commit, push, and PR creation.
 - **FR-002:** The product must own workflow progression and state transitions. Providers may perform engineering work but must not arbitrarily advance the workflow.
 - **FR-003:** The product must represent workflow lifecycle state explicitly, including progress through planning and task stages, completion, cancellation, failure, and a state requiring human attention.
 - **FR-004:** The product must manage the roles required by the V1 lifecycle: PRD, Architect, Planner, Developer, and independent Reviewer.
@@ -87,7 +87,7 @@ Provider, role, skill, session, and execution are distinct concepts. A skill is 
 ### Approval and intervention
 
 - **FR-006:** The product must support approval policies of required, automatic, and conditional at applicable workflow stages.
-- **FR-007:** In the initial V1 policy, PRD, TECHSPEC, and task-plan approval must require human approval before the workflow proceeds; implementation and the review/fix loop may proceed automatically after plan approval.
+- **FR-007:** In the initial V1 policy, the PRD, delivery plan, required architecture overview, each current-scope TECHSPEC, and each task plan require human approval before the next planning stage proceeds. After an approved task plan, task execution and its bounded review/fix loop may proceed automatically within the approved scope.
 - **FR-008:** The product must allow the workflow owner to approve or reject approval requests and must record the resulting decision.
 - **FR-009:** The product must require human intervention when the configured maximum review/fix cycles is reached. A maximum review-cycle limit is mandatory.
 - **FR-010:** Merge must remain human-gated and outside autonomous V1 completion.
@@ -100,6 +100,12 @@ Provider, role, skill, session, and execution are distinct concepts. A skill is 
 - **FR-014:** The Reviewer role must use an independent session whenever practical and must not be treated as self-review by the Developer role.
 - **FR-015:** A task may be marked complete only when implementation is complete, required tests pass, review passes, and there are no blocking review findings.
 - **FR-016:** The product must consume a review pass/fail result without requiring workflow control to infer pass/fail from arbitrary prose. Review results must be structured when the provider supports structured results.
+
+### Acceptance and delivery control
+
+- **FR-033:** The product must preserve distinct acceptance layers: a task is accepted only by `review-task` PASS after implementation and required validation; a Wave is accepted only by authoritative `wave-review` PASS after all required task acceptance; and the complete release is accepted only by authoritative release-level `final-review` PASS after all included Waves are accepted.
+- **FR-034:** A Wave-review PASS must not automatically start a later Wave. Starting a later Wave requires an explicit, persisted authorization after its predecessor has authoritative Wave acceptance.
+- **FR-035:** Runtime/product final validation is a quality gate that proves the product behavior required for a scope or release. It is not release acceptance and does not replace `final-review`. Commit, push, and PR creation may occur only after release acceptance and explicit persisted delivery authorization.
 
 ### Provider support
 
@@ -119,9 +125,9 @@ Provider, role, skill, session, and execution are distinct concepts. A skill is 
 ### Git and PR delivery
 
 - **FR-026:** The product, rather than an agent acting freely, must control the Git lifecycle according to configured policies.
-- **FR-027:** After all required tasks, tests, reviews, and final validation have passed, the product must create a commit, push the branch, and create a PR according to approved workflow policy.
+- **FR-027:** After all required tasks, tests, reviews, Wave acceptances, runtime/product final validation, and release-level final review have passed, and after explicit delivery authorization, the product must deterministically create a commit, push the branch, and create a PR according to approved workflow policy.
 - **FR-028:** A completed V1 workflow must result in a review-ready PR that summarizes requirements, technical approach, implemented tasks, changed files, tests, review cycles and resolved findings, known limitations, and human-review notes when available.
-- **FR-029:** A workflow may be marked complete only after required approvals, task completion, required test and review passes, valid Git state, branch push, and PR creation. Merge is excluded.
+- **FR-029:** Final workflow completion is distinct from Wave acceptance, release acceptance, and delivery authorization. A workflow may be marked complete only after its required planning approvals, task and Wave acceptance, release acceptance, explicit delivery authorization, valid Git state, branch push, and PR creation are durably recorded. Merge is excluded.
 
 ### Operations and user interaction
 
@@ -152,26 +158,35 @@ Provider, role, skill, session, and execution are distinct concepts. A skill is 
 
 ```text
 Feature request
-  -> PRD -> human approval
-  -> TECHSPEC -> human approval
-  -> task plan -> human approval
-  -> sequential implementation -> tests -> independent review
-       -> review failure: fix -> tests -> review (within configured limit)
-  -> final validation -> commit -> push -> review-ready PR
-  -> human PR review / merge decision
+  -> create-prd -> approval
+  -> plan-delivery -> approval
+  -> create-architecture-overview when the approved delivery plan requires it -> approval
+  -> per-Wave create-techspec -> approval
+  -> create-tasks -> approval
+  -> execute-task -> tests -> review-task
+       -> FIX_REQUIRED: fix-task -> tests -> review-task (within configured limit)
+  -> authoritative wave-review PASS
+  -> explicit persisted authorization before a later Wave starts
+  -> after every release Wave has authoritative PASS: final-review
+       -> release remediation / routed remediation -> final-review as needed
+  -> explicit persisted delivery authorization
+  -> deterministic orchestrator commit -> push -> review-ready PR
+  -> final workflow completion -> human PR review / merge decision
 ```
 
 If a review limit is exceeded or an unrecoverable/approval-blocking condition occurs, the workflow must pause in a human-attention state rather than continuing autonomously. An interruption may be resumed from persisted state once the blocking condition is resolved.
 
+`final validation` in this product flow is runtime/product quality validation. It is not the release-level `final-review` acceptance audit. A Wave-review PASS accepts only that Wave; it neither accepts the release nor authorizes the next Wave or Git delivery. A final-review PASS accepts the complete release, but delivery remains blocked until the separate delivery authorization is recorded.
+
 ## 11. Acceptance Criteria
 
-- **AC-001:** Given a feature request, a workflow owner can progress through PRD, TECHSPEC, and task-plan stages, and each stage waits for the required approval before the next stage starts.
+- **AC-001:** Given a feature request, a workflow owner can progress through PRD, delivery-plan, required architecture-overview, current-scope TECHSPEC, and task-plan stages; each applicable stage waits for the required approval before the next stage starts.
 - **AC-002:** After task-plan approval, the system processes tasks one at a time and, for each task, runs implementation, required tests, and independent review.
 - **AC-003:** When review fails, the system supplies the findings for remediation and repeats test and review steps; when the configured cycle limit is reached, it stops for human attention.
 - **AC-004:** A task is completed only when its required tests and review pass and it has no blocking findings.
 - **AC-005:** A process interruption followed by restart and resume continues the identified workflow from persisted progress and does not duplicate completed commits, pushes, PRs, approvals, or completion records.
 - **AC-006:** A user can inspect workflow status and logs sufficient to identify the current/previous stage, task results, approvals, failures, retries, review cycles, and Git/PR outcomes.
-- **AC-007:** A successful workflow produces a pushed branch and a review-ready PR containing the required delivery summary; it does not merge automatically.
+- **AC-007:** A successful workflow produces one pushed branch and a review-ready PR containing the required delivery summary only after release-level final-review PASS and explicit delivery authorization; it does not merge automatically.
 - **AC-008:** The MVP's validation project demonstrates the complete lifecycle with sufficient complexity to exercise API development, persistence, business rules, tests, multiple tasks, architecture decisions, review/fix cycles, Git operations, and PR creation.
 
 ## 12. Success Measures

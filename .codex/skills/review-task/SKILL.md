@@ -555,13 +555,15 @@ task requirements, acceptance criteria, validation contracts, TECHSPECs, or
 architecture. Return `SPEC_CHANGE_REQUIRED` even if the invoking prompt lists
 only `PASS` and `FIX_REQUIRED`.
 
-A `PASS` result means the selected task has completed independent
-review.
+A `PASS` result means the selected task has completed independent review and
+is accepted at the task layer only. It is evidence for, but never a substitute
+for, the later Wave-review acceptance gate.
 
 A `FIX_REQUIRED` result must include sufficient structured findings for
 `fix-task` to act without reconstructing the entire review.
 
-Do not invoke the next workflow stage automatically.
+Do not invoke the next workflow stage automatically. After every required task
+has task-level PASS, `wave-review` may be requested separately for that Wave.
 
 ## Escalation
 

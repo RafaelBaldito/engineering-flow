@@ -558,8 +558,10 @@ Provide a concise summary containing:
 
 Do not invoke or simulate human approval.
 
-After explicit human approval, this skill is complete. Individual tasks
-may then be executed separately using `execute-task`.
+After explicit human approval, this skill is complete. Individual tasks may
+then be executed separately using `execute-task`. Task approval authorizes
+only this task set; it does not accept the Wave, start a later Wave, or
+authorize release delivery.
 
 ## Escalation
 

@@ -2,8 +2,9 @@
 description: |
   Create or update an implementation-ready technical specification for
   the currently approved delivery scope. Use after the PRD and delivery
-  strategy are approved and the current SINGLE scope or Wave has been
-  selected. Do not use to redefine product requirements, plan future
+  plan are approved, required architecture approval is complete, and the
+  current SINGLE scope or Wave has been authorized for technical design. Do not
+  use to redefine product requirements, plan future
   waves in detail, create implementation tasks, or write production
   code.
 name: create-techspec
@@ -29,7 +30,9 @@ Use this skill when:
 -   the approved delivery mode is `SINGLE` and its implementation scope
     is ready for technical design;
 -   the approved delivery mode is `WAVES` and one specific Wave has been
-    selected for just-in-time technical design;
+    selected for just-in-time technical design, its predecessor (when any) has
+    authoritative Wave acceptance, and explicit persisted authorization to
+    start that Wave exists;
 -   an existing TECHSPEC requires an explicitly approved technical
     update;
 -   task creation is blocked because the current delivery scope lacks
@@ -38,7 +41,11 @@ Use this skill when:
 Do not use this skill when:
 
 -   the PRD is not approved;
--   the delivery plan is not approved when one is required;
+-   the Delivery Plan is not approved;
+-   the approved delivery plan requires an architecture overview that is absent
+    or awaiting approval;
+-   a later Wave lacks predecessor authoritative acceptance or explicit
+    persisted start authorization;
 -   no current delivery scope has been selected;
 -   the request is to redesign product requirements;
 -   the request is to detail future Waves;
@@ -50,6 +57,7 @@ Do not use this skill when:
 ### Required
 
 -   approved PRD;
+-   approved Delivery Plan;
 -   approved current delivery scope:
     -   `SINGLE`, or
     -   one selected Wave.
@@ -59,6 +67,9 @@ Do not use this skill when:
 Load only when relevant to the selected scope:
 
 -   approved Delivery Plan;
+-   approved architecture overview when the Delivery Plan marks it `REQUIRED`;
+-   authoritative predecessor Wave-review PASS and explicit persisted next-Wave
+    authorization when designing a later Wave;
 -   `AGENTS.md`;
 -   existing global architecture documentation;
 -   relevant ADRs;
@@ -104,8 +115,11 @@ When sources conflict:
 Before producing an approval-ready TECHSPEC:
 
 -   [ ] an authoritative approved PRD exists;
--   [ ] the delivery strategy is approved when applicable;
+-   [ ] the Delivery Plan is approved;
+-   [ ] the plan-required architecture overview is approved, when applicable;
 -   [ ] exactly one current delivery scope is selected;
+-   [ ] for a later Wave, the predecessor has authoritative Wave-review `PASS`
+      and explicit persisted authorization to start the selected Wave;
 -   [ ] mandatory architecture decisions for the scope are available or
     can be safely defined within the current boundary.
 
@@ -488,8 +502,9 @@ Provide a concise summary containing:
 
 Do not invoke or simulate human approval.
 
-After explicit human approval, this skill is complete. Task
-decomposition may then be initiated separately.
+After explicit human approval, this skill is complete. `create-tasks` may then
+be initiated separately for exactly this approved scope. Do not start task
+execution, accept the Wave, or begin another Wave automatically.
 
 ## Escalation
 

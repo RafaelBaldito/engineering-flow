@@ -1,8 +1,15 @@
 # Engineering Flow
 ## Product Vision & Technical Foundation
 
-**Status:** Concept / Pre-PRD  
+**Status:** Concept / Pre-PRD
 **Purpose:** Source document for formal PRD generation.
+
+**Lifecycle governance:** This pre-PRD vision preserves early conceptual
+workflow material. The approved `docs/product/prd.md`,
+`docs/DELIVERY-PLAN.md`, and required architecture overview govern the canonical
+planning order, acceptance hierarchy, authorization gates, and Git/PR delivery
+responsibilities. Where an early diagram here differs, the approved artifacts
+control.
 
 ---
 

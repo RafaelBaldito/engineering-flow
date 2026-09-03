@@ -15,7 +15,9 @@ description: |
 
 Remediate blocking findings produced by `wave-review` for one Wave.
 
-This skill operates at Wave scope.
+This skill operates at Wave scope. It is part of the Wave-remediation route;
+it cannot accept the Wave, start a later Wave, substitute for `final-review`,
+or authorize release delivery.
 
 It is not a replacement for:
 
@@ -219,7 +221,8 @@ Use these remediation statuses:
 `RESOLVED`
 
 The corrective action is complete and validated, but still requires independent
-Wave re-review before acceptance.
+Wave re-review before acceptance. A later Wave remains blocked until that
+authoritative PASS and explicit persisted start authorization.
 
 `REVIEW_REQUIRED`
 

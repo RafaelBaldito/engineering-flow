@@ -491,7 +491,10 @@ After persisting the artifact, the console completion response must contain only
 
 ## Completion
 
-A Wave `PASS` means the Wave is accepted and may proceed to the next approved
-workflow stage.
+A Wave `PASS` means the reviewed Wave is accepted at the Wave layer. It is not
+release acceptance and it does not automatically begin the next Wave. A later
+Wave may begin only after the workflow owner records explicit persisted
+authorization; its TECHSPEC then follows the approved delivery-plan sequence.
 
-Do not start that stage automatically.
+Do not start that stage automatically. After all release Waves have
+authoritative PASS, `final-review` may be requested separately.

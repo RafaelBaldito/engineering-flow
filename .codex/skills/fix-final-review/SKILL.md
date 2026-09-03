@@ -203,7 +203,9 @@ Persist:
 If repository convention defines another equivalent path, use it.
 
 This artifact records corrective work. It does NOT replace
-`FINAL-REVIEW.md` and does not constitute final acceptance.
+`FINAL-REVIEW.md` and does not constitute final acceptance. When remediation is
+ready, it must return to independent `final-review`; it cannot authorize Git
+delivery.
 
 For each finding use:
 
@@ -258,8 +260,8 @@ Return `SPEC_CHANGE_REQUIRED` when an upstream approved artifact must change.
 - invent manual acceptance evidence;
 - modify production code to mask an external environment failure;
 - claim final release acceptance;
-- commit, push, open PR, or deploy unless separately requested by an approved
-  workflow stage.
+- commit, push, open PR, or deploy; these are post-release-acceptance,
+  explicitly authorized orchestrator responsibilities rather than Skill work.
 
 ### SHOULD
 

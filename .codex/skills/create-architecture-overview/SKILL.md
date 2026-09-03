@@ -22,7 +22,8 @@ Use this skill after:
 
 1. The Product Vision exists.
 2. The PRD has been approved.
-3. The delivery plan has been defined.
+3. The delivery plan has been explicitly approved and marks the architecture
+   overview as `REQUIRED`.
 4. Before the first detailed TECHSPEC is created.
 
 This skill is especially appropriate when:
@@ -44,7 +45,8 @@ Use the following sources when available:
 
 Treat the approved PRD as the authoritative source for product scope.
 
-Treat the delivery plan as the authoritative source for wave boundaries and dependency order.
+Treat the delivery plan as the authoritative source for delivery mode, Wave
+boundaries, dependency order, and architecture-overview applicability.
 
 Do not add product scope that is not supported by the approved PRD.
 
@@ -486,6 +488,11 @@ Before finalizing, verify:
 ---
 
 ## Completion Response
+
+When the document is ready for review, return `AWAITING_HUMAN_APPROVAL`.
+Do not create a TECHSPEC automatically. After explicit approval, the selected
+initial scope may proceed to `create-techspec`; later Waves also require
+predecessor Wave PASS and explicit persisted start authorization.
 
 After creating the document, report:
 

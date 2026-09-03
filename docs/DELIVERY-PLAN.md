@@ -2,9 +2,9 @@
 
 ## 1. Delivery Summary
 
-Engineering Flow V1 (MVP) is a Python command-line control plane that takes a feature request through controlled planning, sequential engineering work, independent review and bounded remediation, then produces a review-ready pull request. It preserves human approval of the PRD, TECHSPEC, and task plan; autonomous merge remains excluded.
+Engineering Flow V1 (MVP) is a Python command-line control plane that takes a feature request through controlled planning, sequential engineering work, independent review and bounded remediation, then produces a review-ready pull request. It preserves human approval of the PRD, delivery plan, required architecture overview, TECHSPEC, and task plan; autonomous merge remains excluded.
 
-This plan organizes the approved MVP into three ordered, coherent waves. It does not add product scope or prescribe implementation design.
+This approved plan is the authority for delivery mode, Wave boundaries, Wave dependencies, and whether a global architecture overview is required. It does not add product scope or prescribe implementation design.
 
 ## 2. Delivery Mode
 
@@ -30,6 +30,7 @@ Each wave is a vertical user outcome and can be validated without depending on u
 | Approval and intervention (FR-006–FR-010) | Waves 1–2: Wave 1 delivers planning approvals and their record; Wave 2 adds review-cycle intervention. Merge remains excluded in every wave. |
 | Sequential execution, tests, independent review, remediation, structured outcomes (FR-011–FR-016) | Wave 2 |
 | Codex-only provider support with provider-neutral boundaries and capability validation (FR-017–FR-021) | Waves 1–2: Wave 1 establishes provider interaction for planning and execution eligibility; Wave 2 completes session, independent-review, and structured-review use. |
+| Acceptance hierarchy and authorization gates (FR-033–FR-035) | Wave 2 establishes task/Wave evidence and review routing; Wave 3 establishes release-readiness and delivery capability; release-level final review and post-acceptance delivery authorization govern the complete release. |
 | Persisted workflow, artifacts, recovery, and duplicate-side-effect protection (FR-022–FR-025) | Waves 1–3: Wave 1 covers planning state, artifacts, approvals, and resume; Wave 2 covers task/review progress; Wave 3 completes Git/PR side-effect protection. |
 | Controlled Git and PR delivery (FR-026–FR-029) | Wave 3 |
 | CLI, observability, failure classification and configured response (FR-030–FR-032) | Waves 1–3: core CLI/status/log visibility begins in Wave 1; task/review outcomes in Wave 2; Git/PR outcomes and related failures in Wave 3. |
@@ -41,11 +42,19 @@ Each wave is a vertical user outcome and can be validated without depending on u
 | AC-007 | Wave 3 |
 | AC-008 | Wave 3, using the approved new validation project after the end-to-end lifecycle is available. |
 
-## 5. Architecture Overview Need
+## 5. Architecture Overview Applicability
 
-Recommended.
+**Required.** Before any Wave TECHSPEC is created, create and explicitly approve a concise global architecture overview covering stable cross-wave boundaries: workflow ownership and state transitions; provider-neutral interaction, session, execution, event, and capability boundaries; persistence and idempotency boundaries; CLI and artifact/log access; acceptance layers and authorization gates; and Git/PR integration and safety boundaries. It remains an overview, not a substitute for a selected Wave's TECHSPEC.
 
-Before Wave 1 is specified, create a concise global architecture overview covering stable cross-wave boundaries: workflow ownership and state transitions; provider-neutral interaction, session, execution, event, and capability boundaries; persistence and idempotency boundaries; CLI and artifact/log access; and Git/PR integration and safety boundaries. It should remain an overview, not a substitute for the selected wave's TECHSPEC.
+The canonical planning sequence governed by this plan is:
+
+```text
+feature -> create-prd -> approval -> plan-delivery -> approval
+-> create-architecture-overview (required by this plan) -> approval
+-> selected Wave create-techspec -> approval -> create-tasks -> approval
+```
+
+For later Waves, their TECHSPEC may be created only after the predecessor has authoritative Wave acceptance and the workflow owner has persisted explicit authorization to start that next Wave.
 
 ## 6. Delivery Scopes
 
@@ -54,36 +63,55 @@ Before Wave 1 is specified, create a concise global architecture overview coveri
 - **Objective:** Deliver a usable, persisted path from a feature request through PRD, TECHSPEC, and task-plan generation, with required human approvals controlling progression.
 - **Included requirements:** Planning portions of FR-001–FR-008; planning-state and role-context portions of FR-002–FR-005; Codex-only, provider-neutral planning interaction and execution eligibility from FR-017–FR-021; planning persistence, artifacts, recovery, and duplicate protection from FR-022–FR-025; applicable CLI, status, logs, and failure handling from FR-030–FR-032; AC-001 and the planning portion of AC-005/AC-006.
 - **Boundaries:** Ends when an approved task plan is stored and ready for sequential execution. It does not execute tasks, perform review/fix cycles, commit, push, or create a PR.
-- **Dependencies:** Requires the recommended architecture overview and a usable Codex integration with the minimum permissions/capabilities for planning. Wave 2 depends on its approved task-plan artifact, lifecycle records, and resume behavior.
+- **Dependencies:** Requires the architecture overview required by this plan and a usable Codex integration with the minimum permissions/capabilities for planning. Wave 2 depends on its approved task-plan artifact, lifecycle records, resume behavior, authoritative Wave 1 acceptance, and explicit persisted authorization to start Wave 2.
 - **Expected outcome:** A workflow owner can initialize and run a workflow, inspect its progress and logs, approve or reject each planning artifact, interrupt and resume it, and obtain an approved task plan without uncontrolled stage advancement.
 - **Validation criteria:** Demonstrate a feature request moving through PRD, TECHSPEC, and task-plan stages; verify each required approval blocks the next stage until recorded; restart and resume the identified workflow without duplicating planning side effects; and inspect CLI status/log evidence and preserved artifacts.
+
+**Historical implementation note:** Wave 1's direct product-runtime PRD -> TECHSPEC -> task-plan state machine was an intentionally bounded implementation slice. Its authoritative Wave-review PASS remains valid evidence for that scope. It is not the canonical end-to-end planning lifecycle for future delivery work, which is governed by the sequence and approval gates above.
 
 ### Wave 2 — Autonomous Sequential Engineering Loop
 
 - **Objective:** Execute an approved task plan one task at a time through implementation, required tests, independent review, and bounded remediation.
 - **Included requirements:** FR-009 and review-cycle intervention; FR-011–FR-016; task-stage completion of FR-001–FR-005; task/review session and structured-result behavior from FR-017–FR-021; task/review persistence, recovery, artifacts, and duplicate protection from FR-022–FR-025; applicable CLI, observability, and failure handling from FR-030–FR-032; AC-002–AC-004 and the task/review portions of AC-005/AC-006.
 - **Boundaries:** Starts only from Wave 1's approved task plan. Ends after all planned tasks have passed their required tests and independent review, or the workflow is safely in a human-attention state. It excludes final commit, push, and PR creation.
-- **Dependencies:** Depends on Wave 1's controlled workflow state, approved task artifact, provider boundary, persistence, approval record, CLI visibility, and recovery behavior. Wave 3 depends on its verified task outcomes, review evidence, and final eligible workflow state.
+- **Dependencies:** Depends on Wave 1's controlled workflow state, approved task artifact, provider boundary, persistence, approval record, CLI visibility, recovery behavior, authoritative Wave 1 acceptance, and explicit persisted authorization to start Wave 2. The release-readiness Wave depends on its verified task outcomes, review evidence, authoritative Wave 2 acceptance, and its own explicit start authorization.
 - **Expected outcome:** After task-plan approval, Engineering Flow advances sequentially through the planned tasks, retains useful developer context within a task's fix cycle, records independent review results, and pauses for human attention instead of exceeding the configured review-cycle limit.
 - **Validation criteria:** Demonstrate multiple tasks processed in sequence; for each, verify implementation, required tests, independent review, and no blocking findings before completion; demonstrate a review failure followed by remediation and re-review; demonstrate the mandatory cycle limit and human-attention state; and resume an interrupted task/review lifecycle without duplicating completed work or records.
 
-### Wave 3 — Controlled Git and Review-Ready PR Delivery
+### Wave 3 — Release Readiness and Controlled Delivery Capability
 
-- **Objective:** Complete a successful quality-gated workflow through final validation, controlled commit and push, and creation of a review-ready PR.
+- **Objective:** Deliver and validate the runtime/product capability to perform controlled Git and PR delivery after release acceptance and explicit delivery authorization.
+- **Canonical coverage clarification:** This Wave delivers the capability and evidence for FR-026 through FR-029 and FR-035. The actual release delivery side effects remain outside Wave acceptance and require release acceptance plus delivery authorization.
 - **Included requirements:** FR-026–FR-029; Git/PR completion of FR-022–FR-025; Git/PR lifecycle visibility and failure handling in FR-030–FR-032; applicable safety constraints; AC-005–AC-008; and the remaining measurement evidence in the success measures.
-- **Boundaries:** Starts only after Wave 2 has verified all required task, test, and review outcomes. It creates the configured commit, push, and PR and records the required summary. It never merges automatically and does not add provider, dashboard, parallelism, or cloud scope.
-- **Dependencies:** Depends on Wave 2's final eligible state, test/review evidence, and persisted lifecycle history, plus validated repository state, branch policy, authenticated hosting access, and PR capability. Completion requires external Git and hosting operations to be protected against duplication on retry or resume.
-- **Expected outcome:** A completed workflow produces one pushed branch and one review-ready PR with the required requirements, approach, task, change, test, review-cycle, limitation, and human-review information, while leaving merge to a human.
-- **Validation criteria:** Using the approved new validation project, demonstrate the full lifecycle from feature request to PR; verify final validation gates commit/push/PR creation; verify the PR summary content and CLI/log evidence; verify restart/retry does not duplicate commits, pushes, PRs, approvals, or completion; and verify merge automation remains disabled.
+- **Boundaries:** Starts only after authoritative Wave 2 acceptance and explicit persisted authorization to start Wave 3. It implements and validates the deterministic Git/PR delivery capability and runtime/product final-validation gates, including idempotency and summary generation. It does not use the release's own commit, push, or PR as its Wave acceptance operation, and it never merges automatically.
+- **Dependencies:** Depends on Wave 2's final eligible state, test/review evidence, authoritative acceptance, and persisted lifecycle history, plus validated repository state, branch policy, authenticated hosting access, and PR capability. After Wave 3 PASS, the complete release proceeds to release-level `final-review`; only a final-review PASS plus explicit delivery authorization permits actual release Git/PR side effects.
+- **Expected outcome:** The release is ready for independent release acceptance with a validated deterministic delivery capability. After release acceptance and delivery authorization, the orchestrator can produce one pushed branch and one review-ready PR with the required requirements, approach, task, change, test, review-cycle, limitation, and human-review information, while leaving merge to a human.
+- **Validation criteria:** Using the approved new validation project or an isolated delivery fixture, demonstrate final validation and controlled Git/PR capability without treating that exercise as release acceptance; verify duplicate protection and PR-summary behavior; verify merge automation remains disabled; and preserve evidence needed for Wave review and later release-level final review.
 
-## 7. Cross-Cutting Constraints
+## 7. Acceptance, Authorization, and Delivery Sequence
+
+Task, Wave, release, and delivery states are deliberately distinct:
+
+```text
+execute-task -> review-task -> fix-task loop
+-> authoritative wave-review PASS
+-> explicit authorization to start a later Wave
+-> after all release Waves have authoritative PASS: final-review
+-> release remediation / routed remediation -> final-review as needed
+-> explicit delivery authorization
+-> orchestrator-controlled commit -> push -> PR -> final workflow completion
+```
+
+A Wave-review PASS accepts only the reviewed Wave. It does not start a later Wave, accept the release, or authorize Git delivery. `final validation` is a runtime/product quality gate; `final-review` is the independent release-level acceptance audit and may never substitute for Wave review.
+
+## 8. Cross-Cutting Constraints
 
 - The product remains a Python CLI and uses Codex as the sole V1 provider, while workflow-domain boundaries remain provider-neutral.
 - Engineering Flow controls state, policies, approvals, observability, auditability, and Git/PR lifecycle; the provider performs engineering reasoning and execution only within that control.
 - Every wave applies context discipline, structured lifecycle evidence, safety controls, bounded retries/timeouts, secret and log protection, workspace/repository validation, protected-branch handling, and prohibited destructive-command controls to the functionality it introduces.
 - V1 stays sequential, single-user, local/CLI-oriented, and non-merging. All PRD non-goals remain outside these waves.
 
-## 8. Delivery Risks and Dependencies
+## 9. Delivery Risks and Dependencies
 
 | Risk or dependency | Affected waves | Delivery treatment |
 | --- | --- | --- |
@@ -93,6 +121,6 @@ Before Wave 1 is specified, create a concise global architecture overview coveri
 | Repository, authentication, hosting, and branch-protection conditions | 3 | Validate repository and delivery prerequisites before final external operations; retain explicit human merge control. |
 | End-to-end validation realism | 3 | Use a new validation project with the PRD-required API, persistence, business-rule, test, multi-task, review/fix, Git, and PR complexity. |
 
-## 9. Open Delivery Questions
+## 10. Open Delivery Questions
 
 The PRD's open questions remain product/technical decisions for the appropriate later stage; they do not prevent this delivery sequencing. In particular, the exact configurable approval defaults, final-validation gates, hosting-system support, failure-class retry policy, and minimum Codex capability set must be resolved in the relevant architecture overview or wave TECHSPEC without expanding approved MVP scope.
