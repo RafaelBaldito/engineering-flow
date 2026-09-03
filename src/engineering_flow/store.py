@@ -1154,8 +1154,23 @@ class WorkflowStore:
                     raise PersistenceFailure("task operation has no execution record")
                 return TaskOperationIntent(operation, self._execution_from_row(execution_row), task_id, cycle_id, True)
             now = _now()
+            # A Developer's logical session belongs to the task rather than a
+            # single review cycle.  Each operation still gets its own durable
+            # session row/correlation, but remediation can carry the stable
+            # logical identity into the runtime.  Reviewer sessions are
+            # intentionally always fresh.
+            logical_session_id = None
+            if role is Role.DEVELOPER:
+                prior_session = conn.execute(
+                    """SELECT logical_session_id FROM sessions
+                       WHERE workflow_id = ? AND task_id = ? AND role = ?
+                       ORDER BY created_at LIMIT 1""",
+                    (workflow_id, task_id, Role.DEVELOPER.value),
+                ).fetchone()
+                if prior_session is not None:
+                    logical_session_id = prior_session["logical_session_id"]
             session = self._create_session_unlocked(
-                conn, workflow_id, provider, role,
+                conn, workflow_id, provider, role, logical_session_id,
                 task_id=task_id, cycle_id=cycle_id, work_kind=work_kind,
             )
             execution_id = str(uuid.uuid4())
@@ -1446,6 +1461,30 @@ class WorkflowStore:
             row = conn.execute("SELECT * FROM tasks WHERE id = ? AND workflow_id = ?", (task_id, workflow_id)).fetchone()
             if row is None:
                 raise NotFoundFailure(f"task not found: {task_id}")
+            workflow = conn.execute("SELECT stage, status FROM workflows WHERE id = ?", (workflow_id,)).fetchone()
+            if workflow is None:
+                raise NotFoundFailure(f"workflow not found: {workflow_id}")
+            if (workflow["stage"] != Stage.TASK_EXECUTION.value
+                    or workflow["status"] != WorkflowStatus.HUMAN_ATTENTION.value
+                    or row["status"] != TaskStatus.HUMAN_ATTENTION.value):
+                raise ConflictFailure("intervention requires a task-level human-attention boundary")
+            boundary_events = conn.execute(
+                """SELECT payload FROM events
+                   WHERE workflow_id = ? AND type IN
+                   ('task.human_attention', 'task.operation.failed', 'review.limit_reached')""",
+                (workflow_id,),
+            ).fetchall()
+            has_boundary_event = any(
+                self._row_json(event["payload"]).get("task_id") == task_id
+                for event in boundary_events
+            )
+            has_unknown_operation = conn.execute(
+                """SELECT 1 FROM operations
+                   WHERE workflow_id = ? AND task_id = ? AND status = ? LIMIT 1""",
+                (workflow_id, task_id, OperationStatus.UNKNOWN.value),
+            ).fetchone() is not None
+            if not has_boundary_event and not has_unknown_operation:
+                raise ConflictFailure("intervention requires actionable human-attention evidence for the task")
             now = _now()
             safe_actor = sanitize_text(actor, self.secret_values)
             safe_reason = sanitize_text(reason, self.secret_values)
@@ -1471,6 +1510,78 @@ class WorkflowStore:
             return intervention
 
     intervene = record_intervention
+
+    def pause_task(
+        self,
+        task_id: str,
+        *,
+        classification: FailureClassification | str,
+        detail: str,
+        event_type: str = "task.human_attention",
+    ) -> TaskDefinition:
+        """Durably stop one task without making a lifecycle decision for it.
+
+        The orchestrator owns *when* a task must pause; the store only records
+        the requested task/workflow state and an auditable, sanitized reason.
+        """
+        classification = self._require_enum(classification, FailureClassification)
+        if not detail or not detail.strip():
+            raise ValidationFailure("task pause detail is required")
+        with self._transaction() as conn:
+            row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+            if row is None:
+                raise NotFoundFailure(f"task not found: {task_id}")
+            now = _now()
+            conn.execute("UPDATE tasks SET status = ? WHERE id = ?", (TaskStatus.HUMAN_ATTENTION.value, task_id))
+            conn.execute("UPDATE workflows SET status = ?, updated_at = ? WHERE id = ?",
+                         (WorkflowStatus.HUMAN_ATTENTION.value, now, row["workflow_id"]))
+            self._event_unlocked(
+                conn, row["workflow_id"], event_type, stage=Stage.TASK_EXECUTION,
+                payload={"task_id": task_id, "classification": classification.value,
+                         "detail": sanitize_text(detail, self.secret_values)},
+            )
+            updated = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        return self._task_from_row(updated)
+
+    def fail_task_operation(
+        self,
+        operation_key: str,
+        classification: FailureClassification | str,
+        detail: str,
+    ) -> Operation:
+        """Record a known terminal task-operation failure and pause safely."""
+        classification = self._require_enum(classification, FailureClassification)
+        if not detail or not detail.strip():
+            raise ValidationFailure("task failure detail is required")
+        with self._transaction() as conn:
+            row = conn.execute("SELECT * FROM operations WHERE idempotency_key = ?", (operation_key,)).fetchone()
+            if row is None:
+                raise NotFoundFailure(f"operation not found: {operation_key}")
+            operation = self._operation_from_row(row)
+            if operation.task_id is None:
+                raise ValidationFailure("operation is not task-correlated")
+            now = _now()
+            safe_detail = sanitize_text(detail, self.secret_values)
+            if operation.status is OperationStatus.PENDING:
+                conn.execute(
+                    """UPDATE executions SET lifecycle = ?, failure_classification = ?, failure_detail = ?,
+                       updated_at = ? WHERE id = ?""",
+                    (ExecutionLifecycle.FAILED.value, classification.value, safe_detail, now,
+                     operation.related_record_id),
+                )
+                conn.execute("UPDATE operations SET status = ?, updated_at = ? WHERE id = ?",
+                             (OperationStatus.COMPLETED.value, now, operation.id))
+            conn.execute("UPDATE tasks SET status = ? WHERE id = ?",
+                         (TaskStatus.HUMAN_ATTENTION.value, operation.task_id))
+            conn.execute("UPDATE workflows SET status = ?, updated_at = ? WHERE id = ?",
+                         (WorkflowStatus.HUMAN_ATTENTION.value, now, operation.workflow_id))
+            self._event_unlocked(
+                conn, operation.workflow_id, "task.operation.failed", stage=Stage.TASK_EXECUTION,
+                execution_id=operation.related_record_id,
+                payload={"task_id": operation.task_id, "cycle_id": operation.cycle_id,
+                         "classification": classification.value, "detail": safe_detail},
+            )
+        return self.get_operation(operation.id)
 
     def list_interventions(self, task_id: str) -> list[Intervention]:
         rows = self._connection.execute(

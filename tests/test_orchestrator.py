@@ -1,4 +1,5 @@
 import hashlib
+import json
 import sys
 import tempfile
 import unittest
@@ -14,7 +15,10 @@ from engineering_flow.domain import (  # noqa: E402
     ConflictFailure,
     FailureClassification,
     PersistenceFailure,
+    Role,
     Stage,
+    TaskArtifactType,
+    WorkKind,
     WorkflowStatus,
 )
 from engineering_flow.orchestrator import PlanningOrchestrator  # noqa: E402
@@ -421,6 +425,311 @@ class OrchestratorTests(unittest.TestCase):
             self.orchestrator.approve(workflow.id, current.id)
         self.assertEqual(self.store.get_artifact(current.id).approval_state, ApprovalState.APPROVED)
         self.assertEqual(regenerated.stage, Stage.PRD)
+
+
+class TaskExecutionOrchestrationTests(unittest.TestCase):
+    """Focused fake-runtime coverage for the persisted Wave 2 action loop."""
+
+    def setUp(self):
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.root = Path(self.tempdir.name)
+        self.store = WorkflowStore(self.root / ".engineering-flow" / "workflows.sqlite3")
+
+    def tearDown(self):
+        self.store.close()
+        self.tempdir.cleanup()
+
+    @staticmethod
+    def developer(*, passed=True, command="python -m unittest", provider_session_id=None):
+        return PlanningExecutionResult(
+            provider="fake", logical_session_id="developer", provider_session_id=provider_session_id,
+            provider_execution_id="developer-turn", terminal_state=TerminalState.SUCCEEDED,
+            final_payload={"summary": "implemented", "changed_files": [],
+                           "test_results": [{"command": command, "passed": passed, "summary": "ok"}]},
+        )
+
+    @staticmethod
+    def reviewer(outcome="PASS"):
+        findings = [] if outcome == "PASS" else [{
+            "id": "F-1", "severity": "blocking", "description": "fix this",
+        }]
+        return PlanningExecutionResult(
+            provider="fake", logical_session_id="reviewer", provider_session_id=None,
+            provider_execution_id="reviewer-turn", terminal_state=TerminalState.SUCCEEDED,
+            final_payload={"outcome": outcome, "summary": outcome, "findings": findings},
+        )
+
+    def _ready_workflow(self, task_count=2):
+        class Runtime:
+            provider = "fake"
+
+            def __init__(self):
+                self.requests = []
+                self.results = []
+
+            def verify_capabilities(self, repository, required_capabilities=()):
+                return CapabilityReport(
+                    provider="fake", executable="fake", repository_path=str(repository), available=True,
+                    capabilities={name: True for name in required_capabilities},
+                )
+
+            def execute(self, request):
+                self.requests.append(request)
+                return self.results.pop(0)
+
+        runtime = Runtime()
+        workflow = self.store.create_workflow(self.root, provider="fake")
+        tasks = [{
+            "key": f"TASK-{index:03d}", "title": f"Task {index}", "instructions": "Make the approved change.",
+            "acceptance_criteria": ["Observable result"], "required_tests": ["python -m unittest"],
+        } for index in range(1, task_count + 1)]
+        manifest = "```engineering-flow-task-plan\n" + json.dumps({"version": 1, "tasks": tasks}) + "\n```\n"
+        intent = self.store.create_generation_intent(workflow.id, Stage.TASK_PLAN, request_hash="approved-plan", revision=1)
+        artifact_path = self.root / ".engineering-flow" / "workflows" / workflow.id / "artifacts" / "001-task-plan.md"
+        artifact = self.store.complete_generation(
+            intent.operation.idempotency_key, content=manifest, artifact_path=artifact_path,
+            stage=Stage.TASK_PLAN, revision=1,
+        )
+        self.store.record_approval(workflow.id, artifact.id, ApprovalDecision.APPROVED, actor="human")
+        self.store.set_workflow_state(workflow.id, stage=Stage.READY_FOR_WAVE_2, status=WorkflowStatus.COMPLETED)
+        return PlanningOrchestrator(self.store, runtime), runtime, self.store.get_workflow(workflow.id)
+
+    def test_imports_once_then_dispatches_tasks_in_order_after_independent_passes(self):
+        orchestrator, runtime, workflow = self._ready_workflow()
+        runtime.results = [self.developer(), self.reviewer(), self.developer(), self.reviewer()]
+
+        for _ in range(4):
+            workflow = orchestrator.resume(workflow.id)
+
+        self.assertEqual((workflow.stage, workflow.status),
+                         (Stage.TASKS_READY_FOR_WAVE_REVIEW, WorkflowStatus.COMPLETED))
+        self.assertEqual([request.role for request in runtime.requests],
+                         [Role.DEVELOPER, Role.REVIEWER, Role.DEVELOPER, Role.REVIEWER])
+        self.assertEqual([request.work_kind for request in runtime.requests],
+                         [WorkKind.DEVELOP, WorkKind.REVIEW, WorkKind.DEVELOP, WorkKind.REVIEW])
+        self.assertNotEqual(runtime.requests[0].logical_session_id, runtime.requests[1].logical_session_id)
+        self.assertEqual([task.status.value for task in self.store.list_tasks(workflow.id)], ["accepted", "accepted"])
+        self.assertEqual(len(self.store.list_tasks(workflow.id)), 2)
+
+    def test_invalid_required_test_evidence_pauses_before_reviewer_dispatch(self):
+        orchestrator, runtime, workflow = self._ready_workflow(task_count=1)
+        runtime.results = [self.developer(passed=False)]
+
+        workflow = orchestrator.resume(workflow.id)
+
+        self.assertEqual(workflow.status, WorkflowStatus.HUMAN_ATTENTION)
+        self.assertEqual([request.role for request in runtime.requests], [Role.DEVELOPER])
+        task = self.store.list_tasks(workflow.id)[0]
+        self.assertEqual(task.status.value, "human_attention")
+        self.assertEqual(self.store.get_latest_execution(workflow.id).failure_classification, FailureClassification.TEST)
+
+    def test_duplicate_or_mismatched_required_test_claims_pause_as_test_failures(self):
+        for claims in (
+            [
+                {"command": "python -m unittest", "passed": True, "summary": "first"},
+                {"command": "python -m unittest", "passed": True, "summary": "duplicate"},
+            ],
+            [{"command": "python -m unittest other", "passed": True, "summary": "mismatched"}],
+        ):
+            with self.subTest(claims=claims):
+                orchestrator, runtime, workflow = self._ready_workflow(task_count=1)
+                runtime.results = [PlanningExecutionResult(
+                    provider="fake", logical_session_id="developer", provider_session_id=None,
+                    provider_execution_id="developer-turn", terminal_state=TerminalState.SUCCEEDED,
+                    final_payload={"summary": "implemented", "changed_files": [], "test_results": claims},
+                )]
+
+                workflow = orchestrator.resume(workflow.id)
+
+                self.assertEqual(workflow.status, WorkflowStatus.HUMAN_ATTENTION)
+                self.assertEqual(self.store.get_latest_execution(workflow.id).failure_classification,
+                                 FailureClassification.TEST)
+                self.assertEqual([request.role for request in runtime.requests], [Role.DEVELOPER])
+
+    def test_malformed_reviewer_payload_pauses_without_accepting_the_task(self):
+        orchestrator, runtime, workflow = self._ready_workflow(task_count=1)
+        runtime.results = [
+            self.developer(),
+            PlanningExecutionResult(
+                provider="fake", logical_session_id="reviewer", provider_session_id=None,
+                provider_execution_id="reviewer-turn", terminal_state=TerminalState.SUCCEEDED,
+                final_payload={"outcome": "PASS", "summary": "invalid", "findings": [{
+                    "id": "F-1", "severity": "blocking", "description": "contradiction",
+                }]},
+            ),
+        ]
+
+        orchestrator.resume(workflow.id)
+        workflow = orchestrator.resume(workflow.id)
+
+        self.assertEqual(workflow.status, WorkflowStatus.HUMAN_ATTENTION)
+        self.assertEqual(self.store.list_tasks(workflow.id)[0].status.value, "human_attention")
+        self.assertEqual(self.store.get_latest_execution(workflow.id).failure_classification,
+                         FailureClassification.AGENT_EXECUTION)
+
+    def test_fix_required_below_limit_remediates_then_uses_a_new_reviewer(self):
+        orchestrator, runtime, workflow = self._ready_workflow(task_count=1)
+        runtime.results = [
+            self.developer(provider_session_id="developer-provider-session"),
+            self.reviewer("FIX_REQUIRED"),
+            self.developer(),
+            self.reviewer(),
+        ]
+
+        for _ in range(4):
+            workflow = orchestrator.resume(workflow.id)
+
+        self.assertEqual(workflow.status, WorkflowStatus.COMPLETED)
+        self.assertEqual([request.work_kind for request in runtime.requests],
+                         [WorkKind.DEVELOP, WorkKind.REVIEW, WorkKind.FIX, WorkKind.REVIEW])
+        self.assertEqual(runtime.requests[2].continuity_bundle["review_findings"][0]["id"], "F-1")
+        self.assertEqual(runtime.requests[2].resume_provider_session_id, "developer-provider-session")
+        self.assertNotEqual(runtime.requests[1].logical_session_id, runtime.requests[3].logical_session_id)
+
+    def test_intervention_requires_an_existing_task_human_attention_boundary(self):
+        orchestrator, _, workflow = self._ready_workflow(task_count=1)
+        self.store.import_task_plan(workflow.id)
+        self.store.set_workflow_state(workflow.id, stage=Stage.TASK_EXECUTION, status=WorkflowStatus.RUNNING)
+        task = self.store.list_tasks(workflow.id)[0]
+
+        with self.assertRaises(ConflictFailure):
+            self.store.record_intervention(workflow.id, task.id, actor="human", reason="premature")
+
+        unchanged = self.store.get_task(task.id)
+        self.assertEqual((unchanged.status.value, unchanged.current_review_window), ("pending", 1))
+
+    def test_unknown_task_operation_is_not_replayed_after_resume(self):
+        orchestrator, runtime, workflow = self._ready_workflow(task_count=1)
+
+        def lost_process(request):
+            runtime.requests.append(request)
+            raise RuntimeError("provider process disappeared")
+
+        runtime.execute = lost_process
+        workflow = orchestrator.resume(workflow.id)
+        self.assertEqual(workflow.status, WorkflowStatus.HUMAN_ATTENTION)
+        resumed = orchestrator.resume(workflow.id)
+        self.assertEqual(resumed.status, WorkflowStatus.HUMAN_ATTENTION)
+        self.assertEqual(len(runtime.requests), 1)
+        operation = self.store._connection.execute(
+            "SELECT status FROM operations WHERE workflow_id = ? AND task_id IS NOT NULL", (workflow.id,)
+        ).fetchone()
+        self.assertEqual(operation["status"], "unknown")
+
+    def test_reopen_after_developer_artifact_commit_does_not_repeat_the_developer(self):
+        class InterruptingStore(WorkflowStore):
+            interrupt = True
+
+            def complete_task_operation(self, *args, **kwargs):
+                artifact = super().complete_task_operation(*args, **kwargs)
+                if self.interrupt and kwargs.get("artifact_type") is TaskArtifactType.DEVELOPER_RESULT:
+                    self.interrupt = False
+                    raise RuntimeError("simulated interruption after developer artifact commit")
+                return artifact
+
+        database = self.root / ".engineering-flow" / "workflows.sqlite3"
+        self.store.close()
+        self.store = InterruptingStore(database)
+        orchestrator, runtime, workflow = self._ready_workflow(task_count=1)
+        runtime.results = [self.developer(), self.reviewer()]
+
+        with self.assertRaises(RuntimeError):
+            orchestrator.resume(workflow.id)
+        self.store.close()
+        self.store = WorkflowStore(database)
+        recovered = PlanningOrchestrator(self.store, runtime)
+
+        recovered.resume(workflow.id)
+        workflow = recovered.resume(workflow.id)
+        self.assertEqual(workflow.status, WorkflowStatus.COMPLETED)
+        self.assertEqual([request.role for request in runtime.requests], [Role.DEVELOPER, Role.REVIEWER])
+
+    def test_reopen_after_review_commit_dispatches_remediation_without_a_duplicate_review(self):
+        class InterruptingStore(WorkflowStore):
+            interrupt = True
+
+            def complete_task_cycle(self, *args, **kwargs):
+                result = super().complete_task_cycle(*args, **kwargs)
+                if self.interrupt and kwargs.get("outcome") == "FIX_REQUIRED":
+                    self.interrupt = False
+                    raise RuntimeError("simulated interruption after review commit")
+                return result
+
+        database = self.root / ".engineering-flow" / "workflows.sqlite3"
+        self.store.close()
+        self.store = InterruptingStore(database)
+        orchestrator, runtime, workflow = self._ready_workflow(task_count=1)
+        runtime.results = [self.developer(), self.reviewer("FIX_REQUIRED"), self.developer()]
+
+        orchestrator.resume(workflow.id)
+        with self.assertRaises(RuntimeError):
+            orchestrator.resume(workflow.id)
+        self.store.close()
+        self.store = WorkflowStore(database)
+        recovered = PlanningOrchestrator(self.store, runtime)
+
+        recovered.resume(workflow.id)
+        self.assertEqual([request.role for request in runtime.requests],
+                         [Role.DEVELOPER, Role.REVIEWER, Role.DEVELOPER])
+        self.assertEqual(runtime.requests[-1].work_kind, WorkKind.FIX)
+
+    def test_reopen_after_acceptance_commit_does_not_repeat_acceptance_or_dispatch(self):
+        class InterruptingStore(WorkflowStore):
+            interrupt = True
+
+            def complete_task_cycle(self, *args, **kwargs):
+                result = super().complete_task_cycle(*args, **kwargs)
+                if self.interrupt and kwargs.get("accept"):
+                    self.interrupt = False
+                    raise RuntimeError("simulated interruption after acceptance commit")
+                return result
+
+        database = self.root / ".engineering-flow" / "workflows.sqlite3"
+        self.store.close()
+        self.store = InterruptingStore(database)
+        orchestrator, runtime, workflow = self._ready_workflow(task_count=1)
+        runtime.results = [self.developer(), self.reviewer()]
+
+        orchestrator.resume(workflow.id)
+        with self.assertRaises(RuntimeError):
+            orchestrator.resume(workflow.id)
+        self.store.close()
+        self.store = WorkflowStore(database)
+        recovered = PlanningOrchestrator(self.store, runtime)
+
+        workflow = recovered.resume(workflow.id)
+        self.assertEqual((workflow.stage, workflow.status),
+                         (Stage.TASKS_READY_FOR_WAVE_REVIEW, WorkflowStatus.COMPLETED))
+        self.assertEqual(len(runtime.requests), 2)
+        self.assertEqual(sum(event.type == "task.accepted" for event in self.store.list_events(workflow.id)), 1)
+
+    def test_fix_uses_task_local_developer_continuity_and_intervention_opens_new_window(self):
+        orchestrator, runtime, workflow = self._ready_workflow(task_count=1)
+        orchestrator.max_review_cycles = 1
+        runtime.results = [self.developer(provider_session_id="developer-provider-session"), self.reviewer("FIX_REQUIRED")]
+
+        workflow = orchestrator.resume(workflow.id)
+        workflow = orchestrator.resume(workflow.id)
+        task = self.store.list_tasks(workflow.id)[0]
+        self.assertEqual(workflow.status, WorkflowStatus.HUMAN_ATTENTION)
+        self.assertEqual(self.store.list_task_cycles(task.id)[0].outcome, "FIX_REQUIRED")
+
+        intervention = self.store.record_intervention(workflow.id, task.id, actor="human", reason="apply remediation")
+        self.assertEqual(intervention.prior_review_window, 1)
+        self.assertEqual(self.store.get_task(task.id).status.value, "pending")
+        runtime.results = [self.developer(), self.reviewer()]
+        workflow = orchestrator.resume(workflow.id)
+        workflow = orchestrator.resume(workflow.id)
+
+        self.assertEqual(workflow.status, WorkflowStatus.COMPLETED)
+        self.assertEqual(runtime.requests[2].work_kind, WorkKind.FIX)
+        self.assertEqual(runtime.requests[0].logical_session_id, runtime.requests[2].logical_session_id)
+        self.assertEqual(runtime.requests[2].resume_provider_session_id, "developer-provider-session")
+        self.assertEqual(runtime.requests[2].continuity_bundle["developer_result"]["summary"], "implemented")
+        self.assertEqual(runtime.requests[2].continuity_bundle["test_evidence"]["test_results"][0]["passed"], True)
+        self.assertEqual(runtime.requests[2].continuity_bundle["review_findings"][0]["id"], "F-1")
+        self.assertNotEqual(runtime.requests[1].logical_session_id, runtime.requests[3].logical_session_id)
+        self.assertEqual(self.store.get_task(task.id).current_review_window, 2)
 
 
 if __name__ == "__main__":

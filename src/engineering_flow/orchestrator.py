@@ -17,12 +17,22 @@ from .domain import (
     FailureClassification,
     Role,
     Stage,
+    TaskArtifactType,
+    TaskStatus,
     PersistenceFailure,
     ValidationFailure,
+    WorkKind,
     Workflow,
     WorkflowStatus,
 )
-from .runtime import AgentRuntime, CapabilityReport, PlanningExecutionRequest, PlanningExecutionResult, TerminalState
+from .runtime import (
+    AgentRuntime,
+    CapabilityReport,
+    PlanningExecutionRequest,
+    PlanningExecutionResult,
+    TaskExecutionRequest,
+    TerminalState,
+)
 from .store import WorkflowStore
 
 
@@ -66,13 +76,17 @@ class PlanningOrchestrator:
         approval_policies: Mapping[Stage | str, ApprovalPolicy | str] | None = None,
         timeout_seconds: float = 1800,
         required_capabilities: tuple[str, ...] = ("json_events", "output_schema", "read_only_planning"),
+        max_review_cycles: int = 3,
     ) -> None:
         if timeout_seconds <= 0:
             raise ValidationFailure("timeout_seconds must be positive")
+        if isinstance(max_review_cycles, bool) or not isinstance(max_review_cycles, int) or max_review_cycles < 1:
+            raise ValidationFailure("max_review_cycles must be a positive integer")
         self.store = store
         self.runtime = runtime
         self.timeout_seconds = timeout_seconds
         self.required_capabilities = tuple(required_capabilities)
+        self.max_review_cycles = max_review_cycles
         self.approval_policies = dict(_DEFAULT_POLICIES)
         for stage, policy in (approval_policies or {}).items():
             parsed_stage = self._stage(stage)
@@ -248,7 +262,13 @@ class PlanningOrchestrator:
 
     def resume(self, workflow_id: str, *, regenerate: Stage | str | None = None) -> Workflow:
         workflow = self.store.get_workflow(workflow_id)
-        if workflow.status in (WorkflowStatus.COMPLETED, WorkflowStatus.CANCELLED):
+        if workflow.stage is Stage.TASKS_READY_FOR_WAVE_REVIEW or workflow.status is WorkflowStatus.CANCELLED:
+            return workflow
+        if workflow.stage in (Stage.READY_FOR_WAVE_2, Stage.TASK_EXECUTION):
+            if regenerate is not None:
+                raise ConflictFailure("task execution does not support planning regeneration")
+            return self._resume_task_execution(workflow)
+        if workflow.status is WorkflowStatus.COMPLETED:
             return workflow
         if workflow.status is WorkflowStatus.AWAITING_APPROVAL:
             return self._reconcile_approval_boundary(workflow)
@@ -433,7 +453,9 @@ class PlanningOrchestrator:
 
     def _drive(self, workflow_id: str, *, force_new_revision: bool = False) -> Workflow:
         workflow = self.store.get_workflow(workflow_id)
-        if workflow.stage is Stage.READY_FOR_WAVE_2 or workflow.status is WorkflowStatus.AWAITING_APPROVAL:
+        if workflow.stage in (Stage.READY_FOR_WAVE_2, Stage.TASK_EXECUTION):
+            return self._resume_task_execution(workflow)
+        if workflow.stage is Stage.TASKS_READY_FOR_WAVE_REVIEW or workflow.status is WorkflowStatus.AWAITING_APPROVAL:
             return workflow
         if workflow.status is WorkflowStatus.HUMAN_ATTENTION:
             return workflow
@@ -635,6 +657,402 @@ class PlanningOrchestrator:
             and isinstance(payload["requires_human_approval"], bool)
             and isinstance(payload["approval_reason"], str)
         )
+
+    # Wave 2 task execution -------------------------------------------------
+
+    def _max_review_cycles(self, workflow: Workflow) -> int:
+        """Use a persisted policy snapshot when it is available.
+
+        Wave 2 configuration-file migration belongs to TASK-004.  This keeps
+        the orchestrator deterministic for workflows that already carry the
+        approved execution policy, while retaining the constructor default for
+        older Wave 1 snapshots.
+        """
+        execution = workflow.configuration_snapshot.get("execution", {})
+        if isinstance(execution, Mapping):
+            value = execution.get("max_review_cycles", self.max_review_cycles)
+            if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+                return value
+        return self.max_review_cycles
+
+    def _resume_task_execution(self, workflow: Workflow) -> Workflow:
+        """Perform one persisted, permitted Wave 2 task action."""
+        if workflow.stage is Stage.READY_FOR_WAVE_2:
+            if workflow.status is not WorkflowStatus.COMPLETED:
+                return self.store.set_workflow_state(
+                    workflow.id, status=WorkflowStatus.HUMAN_ATTENTION,
+                    event_type="workflow.human_attention",
+                    payload={"reason": "READY_FOR_WAVE_2 workflow is not completed"},
+                )
+            try:
+                self.store.import_task_plan(workflow.id)
+            except Exception as exc:
+                return self.store.set_workflow_state(
+                    workflow.id, stage=Stage.READY_FOR_WAVE_2, status=WorkflowStatus.HUMAN_ATTENTION,
+                    event_type="workflow.human_attention",
+                    payload={"reason": "approved task-plan import failed", "detail": str(exc)},
+                )
+            workflow = self.store.set_workflow_state(
+                workflow.id, stage=Stage.TASK_EXECUTION, status=WorkflowStatus.RUNNING,
+                event_type="workflow.task_execution.started", payload={},
+            )
+        if workflow.stage is not Stage.TASK_EXECUTION or workflow.status is WorkflowStatus.HUMAN_ATTENTION:
+            return workflow
+        pending = self.store.reconcile_task_operations(workflow.id)
+        if pending:
+            return self.store.get_workflow(workflow.id)
+        task = self.store.select_next_task(workflow.id)
+        if task is None:
+            # Normally complete_task_cycle performs this transition atomically.
+            return self.store.set_workflow_state(
+                workflow.id, stage=Stage.TASKS_READY_FOR_WAVE_REVIEW, status=WorkflowStatus.COMPLETED,
+                event_type="tasks.ready_for_wave_review", payload={},
+            )
+        active = [item for item in self.store.list_tasks(workflow.id)
+                  if item.status is TaskStatus.ACTIVE and item.id != task.id]
+        if active:
+            self.store.pause_task(
+                task.id, classification=FailureClassification.WORKFLOW,
+                detail="a higher-order task is active while a lower-order task remains unaccepted",
+            )
+            return self.store.get_workflow(workflow.id)
+        try:
+            return self._drive_task(workflow, task)
+        except PersistenceFailure as exc:
+            return self._pause_task(task, FailureClassification.PERSISTENCE, str(exc))
+        except (ValidationFailure, ConflictFailure) as exc:
+            return self._pause_task(task, FailureClassification.WORKFLOW, str(exc))
+
+    def _drive_task(self, workflow: Workflow, task) -> Workflow:
+        cycles = [cycle for cycle in self.store.list_task_cycles(task.id)
+                  if cycle.review_window == task.current_review_window]
+        current = cycles[-1] if cycles else None
+        if current is None:
+            kind = WorkKind.FIX if task.current_review_window > 1 else WorkKind.DEVELOP
+            return self._dispatch_task_operation(workflow, task, 1, kind)
+        if current.developer_execution_id is None:
+            kind = WorkKind.FIX if current.cycle > 1 else WorkKind.DEVELOP
+            return self._dispatch_task_operation(workflow, task, current.cycle, kind)
+        developer_artifact = self._cycle_artifact(task.id, current.id, TaskArtifactType.DEVELOPER_RESULT)
+        if developer_artifact is None:
+            return self._pause_task(task, FailureClassification.AGENT_EXECUTION, "Developer execution has no result artifact")
+        if current.required_test_artifact_id is None:
+            payload = self._read_json_task_artifact(developer_artifact.id)
+            error, canonical = self._validate_developer_payload(payload, task.required_tests, workflow.repository_path)
+            if error:
+                return self._pause_task(task, self._developer_payload_failure_classification(error), error)
+            self.store.record_task_test_evidence(task.id, current.id, content={"test_results": canonical["test_results"]})
+            return self.store.get_workflow(workflow.id)
+        if current.reviewer_execution_id is None:
+            return self._dispatch_task_operation(workflow, task, current.cycle, WorkKind.REVIEW, cycle_id=current.id)
+        review_artifact = self._cycle_artifact(task.id, current.id, TaskArtifactType.REVIEW_RESULT)
+        if review_artifact is None:
+            return self._pause_task(task, FailureClassification.AGENT_EXECUTION, "Reviewer execution has no result artifact")
+        payload = self._read_json_task_artifact(review_artifact.id)
+        error, canonical = self._validate_reviewer_payload(payload, workflow.repository_path)
+        if error:
+            return self._pause_task(task, FailureClassification.AGENT_EXECUTION, error)
+        if canonical["outcome"] == "PASS":
+            self.store.complete_task_cycle(task.id, current.id, outcome="PASS", review_artifact_id=review_artifact.id, accept=True)
+            return self.store.get_workflow(workflow.id)
+        if current.cycle >= self._max_review_cycles(workflow):
+            self.store.pause_task(
+                task.id, classification=FailureClassification.REVIEW,
+                detail="review-cycle limit reached", event_type="review.limit_reached",
+            )
+            return self.store.get_workflow(workflow.id)
+        return self._dispatch_task_operation(workflow, task, current.cycle + 1, WorkKind.FIX)
+
+    def _cycle_artifact(self, task_id: str, cycle_id: str, artifact_type: TaskArtifactType):
+        return next((artifact for artifact in self.store.list_task_artifacts(task_id)
+                     if artifact.cycle_id == cycle_id and artifact.artifact_type is artifact_type), None)
+
+    def _pause_task(self, task, classification: FailureClassification, detail: str) -> Workflow:
+        self.store.pause_task(task.id, classification=classification, detail=detail)
+        return self.store.get_workflow(task.workflow_id)
+
+    def _task_inputs(self, workflow: Workflow, task, *, reviewer: bool, cycle_id: str | None = None):
+        definition = self.store.read_task_definition(task.id)
+        definition_artifact = next(artifact for artifact in self.store.list_task_artifacts(task.id)
+                                   if artifact.artifact_type is TaskArtifactType.DEFINITION)
+        self.store.read_task_artifact(definition_artifact.id)
+        paths = [definition_artifact.path]
+        hashes = [definition_artifact.sha256]
+        if not reviewer:
+            source = self.store.get_artifact(task.source_artifact_id)
+            self.store.read_artifact(source.id)
+            paths.append(source.path)
+            hashes.append(source.sha256)
+        repository = Path(workflow.repository_path).resolve()
+        for relative in task.context_paths:
+            path = (repository / relative).resolve()
+            try:
+                path.relative_to(repository)
+            except ValueError as exc:
+                raise PersistenceFailure("task context path escapes the repository") from exc
+            if not path.is_file():
+                raise PersistenceFailure(f"task context file is unavailable: {relative}")
+            paths.append(str(path))
+            hashes.append(hashlib.sha256(path.read_bytes()).hexdigest())
+        if reviewer:
+            if cycle_id is None:
+                raise ValidationFailure("Reviewer input requires a task cycle")
+            for artifact_type in (TaskArtifactType.DEVELOPER_RESULT, TaskArtifactType.TEST_RESULT):
+                artifact = self._cycle_artifact(task.id, cycle_id, artifact_type)
+                if artifact is None:
+                    raise PersistenceFailure("Reviewer input is missing required task evidence")
+                self.store.read_task_artifact(artifact.id)
+                paths.append(artifact.path)
+                hashes.append(artifact.sha256)
+        return definition, tuple(paths), tuple(hashes)
+
+    def _dispatch_task_operation(self, workflow: Workflow, task, cycle: int, work_kind: WorkKind, *, cycle_id: str | None = None) -> Workflow:
+        reviewer = work_kind is WorkKind.REVIEW
+        try:
+            definition, paths, hashes = self._task_inputs(workflow, task, reviewer=reviewer, cycle_id=cycle_id)
+            required_capabilities = (("read_only", "json_events", "output_schema") if reviewer
+                                     else ("workspace_write", "json_events", "output_schema"))
+            capability = self.runtime.verify_capabilities(workflow.repository_path, required_capabilities)
+        except PersistenceFailure as exc:
+            return self._pause_task(task, FailureClassification.PERSISTENCE, f"task input verification failed: {exc}")
+        except (ValidationFailure, ConflictFailure) as exc:
+            return self._pause_task(task, FailureClassification.WORKFLOW, f"task input verification failed: {exc}")
+        except Exception as exc:
+            return self._pause_task(task, FailureClassification.PROVIDER, f"runtime preflight failed: {exc}")
+        capabilities = capability.capabilities or {}
+        if not capability.available or any(not capabilities.get(name, False) for name in required_capabilities):
+            detail = capability.failure_detail or "runtime does not satisfy task role capabilities"
+            return self._pause_task(task, capability.failure_classification or FailureClassification.PROVIDER, detail)
+        instruction = self._task_instruction(task, definition, reviewer=reviewer)
+        request_hash = hashlib.sha256(json.dumps({
+            "task": task.definition_sha256, "window": task.current_review_window,
+            "cycle": cycle, "work_kind": work_kind.value, "inputs": hashes,
+            "instruction": instruction,
+        }, sort_keys=True).encode()).hexdigest()
+        intent = self.store.create_task_operation(
+            workflow.id, task.id, review_window=task.current_review_window, cycle=cycle,
+            work_kind=work_kind, request_hash=request_hash, provider=workflow.provider,
+            capability_report=_json_mapping(capability),
+        )
+        if intent.reused:
+            operation = intent.operation
+            if operation.status.value == "completed":
+                return self.store.get_workflow(workflow.id)
+            self.store.mark_task_operation_unknown(operation.idempotency_key, detail="replayed task operation was incomplete")
+            return self.store.get_workflow(workflow.id)
+        continuity = (
+            self._developer_continuity(task, task.current_review_window, cycle)
+            if not reviewer and work_kind is WorkKind.FIX else {}
+        )
+        resume_provider_session_id = (
+            self._developer_provider_session(task, task.current_review_window, cycle) if continuity else None
+        )
+        developer_session = None
+        if reviewer:
+            task_cycle = self.store.get_task_cycle(intent.cycle_id)
+            developer_session = self.store.get_session(
+                self.store.get_execution(task_cycle.developer_execution_id).session_id
+            ).logical_session_id
+        logical_session_id = self.store.get_session(intent.execution.session_id).logical_session_id
+        request = TaskExecutionRequest(
+            workflow_id=workflow.id, execution_id=intent.execution.id, logical_session_id=logical_session_id,
+            role=Role.REVIEWER if reviewer else Role.DEVELOPER, stage=Stage.TASK_EXECUTION,
+            repository_path=workflow.repository_path, authoritative_input_paths=paths,
+            authoritative_input_hashes=hashes, instruction=instruction,
+            output_schema_path=str(self._runtime_path(workflow.id, intent.execution.id, "task-output.schema.json")),
+            final_output_path=str(self._runtime_path(workflow.id, intent.execution.id, "final-output.json")),
+            timeout_seconds=self.timeout_seconds, required_capabilities=required_capabilities,
+            work_kind=work_kind, required_test_commands=task.required_tests,
+            continuity_bundle=continuity, resume_provider_session_id=resume_provider_session_id,
+            developer_logical_session_id=developer_session,
+        )
+        try:
+            result = self.runtime.execute(request)
+        except Exception as exc:
+            self.store.mark_task_operation_unknown(intent.operation.idempotency_key, detail=str(exc))
+            return self.store.get_workflow(workflow.id)
+        self.store.start_execution(intent.execution.id, provider_execution_id=result.provider_execution_id)
+        for event in result.events:
+            self.store.append_event(workflow.id, f"agent.runtime.{event.type}", stage=Stage.TASK_EXECUTION,
+                                    execution_id=intent.execution.id,
+                                    payload={"provider_event_id": event.provider_event_id, "timestamp": event.timestamp,
+                                             **dict(event.payload)})
+        if result.terminal_state is TerminalState.UNKNOWN:
+            self.store.mark_task_operation_unknown(intent.operation.idempotency_key,
+                                                   detail=result.failure_detail or "unknown provider outcome")
+            return self.store.get_workflow(workflow.id)
+        if not result.success:
+            self.store.fail_task_operation(intent.operation.idempotency_key,
+                                           result.failure_classification or FailureClassification.AGENT_EXECUTION,
+                                           result.failure_detail or "task runtime failed")
+            return self.store.get_workflow(workflow.id)
+        if reviewer:
+            error, canonical = self._validate_reviewer_payload(result.final_payload, workflow.repository_path)
+            if error:
+                self.store.fail_task_operation(intent.operation.idempotency_key, FailureClassification.AGENT_EXECUTION, error)
+                return self.store.get_workflow(workflow.id)
+            artifact = self.store.complete_task_operation(
+                intent.operation.idempotency_key, content=canonical, artifact_type=TaskArtifactType.REVIEW_RESULT,
+                terminal_result=self._terminal_result(result), outcome=canonical["outcome"],
+            )
+            if canonical["outcome"] == "PASS":
+                self.store.complete_task_cycle(task.id, intent.cycle_id, outcome="PASS", review_artifact_id=artifact.id, accept=True)
+            else:
+                self.store.complete_task_cycle(task.id, intent.cycle_id, outcome="FIX_REQUIRED", review_artifact_id=artifact.id)
+                if cycle >= self._max_review_cycles(workflow):
+                    self.store.pause_task(task.id, classification=FailureClassification.REVIEW,
+                                          detail="review-cycle limit reached", event_type="review.limit_reached")
+            return self.store.get_workflow(workflow.id)
+        error, canonical = self._validate_developer_payload(result.final_payload, task.required_tests, workflow.repository_path)
+        if error:
+            self.store.fail_task_operation(
+                intent.operation.idempotency_key, self._developer_payload_failure_classification(error), error
+            )
+            return self.store.get_workflow(workflow.id)
+        self.store.complete_task_operation(
+            intent.operation.idempotency_key, content=canonical, artifact_type=TaskArtifactType.DEVELOPER_RESULT,
+            terminal_result=self._terminal_result(result), outcome="TESTS_REPORTED",
+        )
+        self.store.record_task_test_evidence(task.id, intent.cycle_id, content={"test_results": canonical["test_results"]})
+        return self.store.get_workflow(workflow.id)
+
+    @staticmethod
+    def _terminal_result(result) -> dict[str, Any]:
+        return {"provider": result.provider, "logical_session_id": result.logical_session_id,
+                "provider_session_id": result.provider_session_id,
+                "provider_execution_id": result.provider_execution_id, "usage": dict(result.usage),
+                "metadata": dict(result.metadata)}
+
+    def _developer_continuity(self, task, review_window: int, cycle: int) -> dict[str, Any]:
+        previous = [
+            item for item in self.store.list_task_cycles(task.id)
+            if (item.review_window, item.cycle) < (review_window, cycle)
+        ]
+        if not previous:
+            return {}
+        prior = previous[-1]
+        bundle: dict[str, Any] = {"task_contract": task.definition}
+        developer = self._cycle_artifact(task.id, prior.id, TaskArtifactType.DEVELOPER_RESULT)
+        tests = self._cycle_artifact(task.id, prior.id, TaskArtifactType.TEST_RESULT)
+        review = self._cycle_artifact(task.id, prior.id, TaskArtifactType.REVIEW_RESULT)
+        if developer:
+            bundle["developer_result"] = self._read_json_task_artifact(developer.id)
+        if tests:
+            bundle["test_evidence"] = self._read_json_task_artifact(tests.id)
+        if review:
+            bundle["review_findings"] = self._read_json_task_artifact(review.id).get("findings", [])
+        return bundle
+
+    def _developer_provider_session(self, task, review_window: int, cycle: int) -> str | None:
+        """Return only recorded Developer session evidence from the prior cycle."""
+        previous = [
+            item for item in self.store.list_task_cycles(task.id)
+            if (item.review_window, item.cycle) < (review_window, cycle)
+        ]
+        if not previous or previous[-1].developer_execution_id is None:
+            return None
+        terminal = self.store.get_execution(previous[-1].developer_execution_id).terminal_result
+        if not isinstance(terminal, Mapping):
+            return None
+        value = terminal.get("provider_session_id")
+        return value if isinstance(value, str) and value else None
+
+    def _task_instruction(self, task, definition: str, *, reviewer: bool) -> str:
+        role = "Reviewer" if reviewer else "Developer"
+        boundary = (
+            "Review the immutable task and supplied evidence. Do not modify files, use credentials, read unrelated tasks, "
+            "or treat Developer transcripts as input." if reviewer else
+            "Implement only the immutable task using the supplied context. Do not read unrelated tasks, credentials, future "
+            "Wave material, or perform Git delivery."
+        )
+        return (
+            f"Role: {role}.\nImmutable task definition: {definition}\n"
+            f"Required tests: {json.dumps(list(task.required_tests))}\n{boundary}\n"
+            "You have no authority to select tasks, record a pass, change workflow state, authorize delivery, or advance the workflow. "
+            "Return only the required structured final payload."
+        )
+
+    def _read_json_task_artifact(self, artifact_id: str) -> Mapping[str, Any]:
+        try:
+            value = json.loads(self.store.read_task_artifact_text(artifact_id))
+        except (ValueError, PersistenceFailure) as exc:
+            raise ValidationFailure("task evidence is not valid JSON") from exc
+        if not isinstance(value, Mapping):
+            raise ValidationFailure("task evidence payload must be an object")
+        return value
+
+    @staticmethod
+    def _canonical_claimed_path(value: Any, repository_path: str) -> str | None:
+        if not isinstance(value, str) or not value.strip():
+            return None
+        path = Path(value)
+        if path.is_absolute() or any(part in ("", ".", "..") for part in path.parts):
+            return None
+        candidate = (Path(repository_path).resolve() / path).resolve()
+        try:
+            candidate.relative_to(Path(repository_path).resolve())
+        except ValueError:
+            return None
+        return candidate.relative_to(Path(repository_path).resolve()).as_posix()
+
+    def _validate_developer_payload(self, payload: Any, required_tests: tuple[str, ...], repository_path: str):
+        if not isinstance(payload, Mapping) or set(payload) != {"summary", "changed_files", "test_results"}:
+            return "Developer final payload does not satisfy the output contract", None
+        if not isinstance(payload["summary"], str) or not isinstance(payload["changed_files"], list) or not isinstance(payload["test_results"], list):
+            return "Developer final payload has invalid field types", None
+        changed = [self._canonical_claimed_path(value, repository_path) for value in payload["changed_files"]]
+        if any(value is None for value in changed) or len(set(changed)) != len(changed):
+            return "Developer changed-file claims are not canonical unique repository paths", None
+        observed: list[dict[str, Any]] = []
+        for entry in payload["test_results"]:
+            if not isinstance(entry, Mapping) or set(entry) != {"command", "passed", "summary"}:
+                return "Developer required-test evidence has an invalid shape", None
+            if not isinstance(entry["command"], str) or not isinstance(entry["passed"], bool) or not isinstance(entry["summary"], str):
+                return "Developer required-test evidence has invalid field types", None
+            observed.append(dict(entry))
+        commands = [entry["command"] for entry in observed]
+        if (len(commands) != len(required_tests) or set(commands) != set(required_tests)
+                or len(set(commands)) != len(commands) or any(not entry["passed"] for entry in observed)):
+            return "Developer required-test evidence is missing, duplicate, mismatched, or failed", None
+        return None, {"summary": payload["summary"], "changed_files": changed, "test_results": observed}
+
+    @staticmethod
+    def _developer_payload_failure_classification(error: str) -> FailureClassification:
+        """Keep schema failures distinct from failed exact required-test claims."""
+        if error == "Developer required-test evidence is missing, duplicate, mismatched, or failed":
+            return FailureClassification.TEST
+        return FailureClassification.AGENT_EXECUTION
+
+    def _validate_reviewer_payload(self, payload: Any, repository_path: str):
+        if not isinstance(payload, Mapping) or set(payload) != {"outcome", "summary", "findings"}:
+            return "Reviewer final payload does not satisfy the output contract", None
+        if payload.get("outcome") not in {"PASS", "FIX_REQUIRED"} or not isinstance(payload.get("summary"), str) or not isinstance(payload.get("findings"), list):
+            return "Reviewer final payload has invalid field types", None
+        findings: list[dict[str, Any]] = []
+        identifiers: set[str] = set()
+        for finding in payload["findings"]:
+            if not isinstance(finding, Mapping) or set(finding) - {"id", "severity", "description", "path", "line"}:
+                return "Reviewer finding has an invalid shape", None
+            identifier, severity, description = finding.get("id"), finding.get("severity"), finding.get("description")
+            if (not isinstance(identifier, str) or not identifier or identifier in identifiers or severity not in {"blocking", "non_blocking"}
+                    or not isinstance(description, str)):
+                return "Reviewer finding has invalid fields", None
+            canonical = dict(finding)
+            if "path" in canonical:
+                path = self._canonical_claimed_path(canonical["path"], repository_path)
+                if path is None:
+                    return "Reviewer finding path is not canonical", None
+                canonical["path"] = path
+            if "line" in canonical and (isinstance(canonical["line"], bool) or not isinstance(canonical["line"], int) or canonical["line"] < 1):
+                return "Reviewer finding line is invalid", None
+            identifiers.add(identifier)
+            findings.append(canonical)
+        blocking = [item for item in findings if item["severity"] == "blocking"]
+        if payload["outcome"] == "PASS" and blocking:
+            return "Reviewer PASS payload contains blocking findings", None
+        if payload["outcome"] == "FIX_REQUIRED" and (not blocking or len(blocking) != len(findings)):
+            return "Reviewer FIX_REQUIRED payload must contain only blocking findings", None
+        return None, {"outcome": payload["outcome"], "summary": payload["summary"], "findings": findings}
 
 
 Orchestrator = PlanningOrchestrator
