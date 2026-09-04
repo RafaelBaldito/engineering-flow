@@ -546,6 +546,29 @@ class TaskExecutionOrchestrationTests(unittest.TestCase):
                                  FailureClassification.TEST)
                 self.assertEqual([request.role for request in runtime.requests], [Role.DEVELOPER])
 
+    def test_developer_instruction_requires_one_ordered_result_per_required_test(self):
+        orchestrator, runtime, workflow = self._ready_workflow(task_count=1)
+        runtime.results = [self.developer()]
+
+        orchestrator.resume(workflow.id)
+
+        instruction = runtime.requests[0].instruction
+        self.assertIn("exactly one entry for each Required tests command", instruction)
+        self.assertIn("in that same order", instruction)
+        self.assertIn("do not repeat a command", instruction)
+        self.assertIn("do not include additional commands in test_results", instruction)
+
+    def test_reviewer_instruction_excludes_task_order_and_predecessor_acceptance(self):
+        orchestrator, runtime, workflow = self._ready_workflow(task_count=1)
+        runtime.results = [self.developer(), self.reviewer()]
+
+        orchestrator.resume(workflow.id)
+        orchestrator.resume(workflow.id)
+
+        instruction = runtime.requests[1].instruction
+        self.assertIn("orchestrator alone determines task order and predecessor acceptance", instruction)
+        self.assertIn("do not report a finding about task scheduling", instruction)
+
     def test_malformed_reviewer_payload_pauses_without_accepting_the_task(self):
         orchestrator, runtime, workflow = self._ready_workflow(task_count=1)
         runtime.results = [

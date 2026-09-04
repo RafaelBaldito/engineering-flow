@@ -976,13 +976,20 @@ class PlanningOrchestrator:
         role = "Reviewer" if reviewer else "Developer"
         boundary = (
             "Review the immutable task and supplied evidence. Do not modify files, use credentials, read unrelated tasks, "
-            "or treat Developer transcripts as input." if reviewer else
+            "or treat Developer transcripts as input. The orchestrator alone determines task order and predecessor acceptance; "
+            "do not report a finding about task scheduling or proof of predecessor acceptance." if reviewer else
             "Implement only the immutable task using the supplied context. Do not read unrelated tasks, credentials, future "
             "Wave material, or perform Git delivery."
         )
+        test_evidence_rule = (
+            "\nDeveloper final-payload rule: test_results must contain exactly one entry for each Required tests command "
+            "above, in that same order. Run each required command once for this report; do not repeat a command for draft, "
+            "verification, or any other phase, and do not include additional commands in test_results."
+            if not reviewer else ""
+        )
         return (
             f"Role: {role}.\nImmutable task definition: {definition}\n"
-            f"Required tests: {json.dumps(list(task.required_tests))}\n{boundary}\n"
+            f"Required tests: {json.dumps(list(task.required_tests))}\n{boundary}{test_evidence_rule}\n"
             "You have no authority to select tasks, record a pass, change workflow state, authorize delivery, or advance the workflow. "
             "Return only the required structured final payload."
         )
@@ -1053,13 +1060,14 @@ class PlanningOrchestrator:
                     or not isinstance(description, str)):
                 return "Reviewer finding has invalid fields", None
             canonical = dict(finding)
-            if "path" in canonical:
+            if canonical.get("path") is not None:
                 path = self._canonical_claimed_path(canonical["path"], repository_path)
                 if path is None:
                     return "Reviewer finding path is not canonical", None
                 canonical["path"] = path
-            if "line" in canonical and (isinstance(canonical["line"], bool) or not isinstance(canonical["line"], int) or canonical["line"] < 1):
+            if canonical.get("line") is not None and (isinstance(canonical["line"], bool) or not isinstance(canonical["line"], int) or canonical["line"] < 1):
                 return "Reviewer finding line is invalid", None
+            canonical = {key: value for key, value in canonical.items() if value is not None}
             identifiers.add(identifier)
             findings.append(canonical)
         blocking = [item for item in findings if item["severity"] == "blocking"]

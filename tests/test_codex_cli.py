@@ -9,7 +9,7 @@ from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 
-from engineering_flow.codex_cli import CodexCliRuntime, FINAL_OUTPUT_SCHEMA  # noqa: E402
+from engineering_flow.codex_cli import CodexCliRuntime, FINAL_OUTPUT_SCHEMA, REVIEWER_OUTPUT_SCHEMA  # noqa: E402
 from engineering_flow.domain import FailureClassification, Role, Stage, ValidationFailure, WorkKind  # noqa: E402
 from engineering_flow.runtime import PlanningExecutionRequest, TaskExecutionRequest, TerminalState  # noqa: E402
 
@@ -334,6 +334,30 @@ class CodexCliTests(unittest.TestCase):
 
         self.assertEqual(result.failure_classification, FailureClassification.AGENT_EXECUTION)
         self.assertIn("only blocking findings", result.failure_detail)
+
+    def test_reviewer_nullable_locations_meet_strict_schema_and_are_normalized(self):
+        request = self.task_request(
+            Role.REVIEWER, WorkKind.REVIEW, developer_logical_session_id="developer-session",
+        )
+
+        def reviewer_popen(argv, **kwargs):
+            self.output.parent.mkdir(parents=True, exist_ok=True)
+            self.output.write_text(json.dumps({
+                "outcome": "FIX_REQUIRED", "summary": "needs correction", "findings": [{
+                    "id": "F-1", "severity": "blocking", "description": "defect",
+                    "path": None, "line": None,
+                }],
+            }), encoding="utf-8")
+            return FakeProcess('{"type":"turn.completed","id":"review-turn"}\n')
+
+        result = self.runtime(popen_factory=reviewer_popen).execute(request)
+
+        self.assertTrue(result.success)
+        self.assertEqual(REVIEWER_OUTPUT_SCHEMA["properties"]["findings"]["items"]["required"],
+                         ["id", "severity", "description", "path", "line"])
+        self.assertEqual(result.final_payload["findings"], [{
+            "id": "F-1", "severity": "blocking", "description": "defect",
+        }])
 
     def test_developer_continuity_falls_back_when_resume_is_not_advertised(self):
         request = self.task_request(

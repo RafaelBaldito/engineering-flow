@@ -81,16 +81,16 @@ REVIEWER_OUTPUT_SCHEMA: dict[str, Any] = {
         "summary": {"type": "string"},
         "findings": {
             "type": "array",
-            "items": {
-                "type": "object",
-                "additionalProperties": False,
-                "required": ["id", "severity", "description"],
-                "properties": {
-                    "id": {"type": "string"},
-                    "severity": {"enum": ["blocking", "non_blocking"]},
-                    "description": {"type": "string"},
-                    "path": {"type": "string"},
-                    "line": {"type": "integer", "minimum": 1},
+        "items": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["id", "severity", "description", "path", "line"],
+            "properties": {
+                "id": {"type": "string"},
+                "severity": {"enum": ["blocking", "non_blocking"]},
+                "description": {"type": "string"},
+                "path": {"type": ["string", "null"]},
+                "line": {"type": ["integer", "null"], "minimum": 1},
                 },
             },
         },
@@ -674,13 +674,13 @@ class CodexCliRuntime(AgentRuntime):
             if severity not in ("blocking", "non_blocking") or not isinstance(description, str):
                 return None, "Reviewer finding has invalid fields"
             safe = {"id": identifier, "severity": severity, "description": description}
-            if "path" in finding:
+            if finding.get("path") is not None:
                 path = finding["path"]
                 candidate = (repository / path).resolve() if isinstance(path, str) else repository
                 if not isinstance(path, str) or not path or candidate == repository or repository not in candidate.parents:
                     return None, "Reviewer finding path is outside the repository"
                 safe["path"] = str(candidate.relative_to(repository))
-            if "line" in finding:
+            if finding.get("line") is not None:
                 if type(finding["line"]) is not int or finding["line"] <= 0:
                     return None, "Reviewer finding line must be a positive integer"
                 safe["line"] = finding["line"]
