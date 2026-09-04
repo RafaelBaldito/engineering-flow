@@ -16,8 +16,8 @@ Wave 3.
 | TASK-001 | Establish Durable Task Definitions and Lifecycle Evidence | — | PASS |
 | TASK-002 | Generalize Runtime Contracts and Codex Role Execution | TASK-001 | PASS |
 | TASK-003 | Implement Sequential Task Orchestration | TASK-001, TASK-002 | PASS |
-| TASK-004 | Expose Execution Policy and Task Lifecycle CLI Controls | TASK-003 | PENDING |
-| TASK-005 | Prove the End-to-End Durable Task Lifecycle | TASK-001, TASK-002, TASK-003, TASK-004 | PENDING |
+| TASK-004 | Expose Execution Policy and Task Lifecycle CLI Controls | TASK-003 | PASS |
+| TASK-005 | Prove the End-to-End Durable Task Lifecycle | TASK-001, TASK-002, TASK-003, TASK-004 | PASS |
 
 ## Coverage
 

@@ -92,11 +92,11 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--feature-file", required=True, metavar="PATH")
     run.add_argument("--provider", choices=("codex-cli",), default="codex-cli")
 
-    for name in ("status", "approve", "reject", "resume", "logs"):
+    for name in ("status", "approve", "reject", "resume", "intervene", "logs"):
         command = commands.add_parser(name)
         command.add_argument("--repo", required=True, metavar="PATH")
         command.add_argument("--workflow", required=True, metavar="ID")
-        if name in ("status", "logs"):
+        if name in ("status", "logs", "intervene"):
             command.add_argument("--json", action="store_true", dest="json_output")
         if name in ("approve", "reject"):
             command.add_argument("--artifact", required=True, metavar="ID")
@@ -104,6 +104,9 @@ def build_parser() -> argparse.ArgumentParser:
             command.add_argument("--reason", required=name == "reject", metavar="TEXT")
         if name == "resume":
             command.add_argument("--regenerate", choices=("prd", "techspec", "task-plan"))
+        if name == "intervene":
+            command.add_argument("--task", required=True, metavar="ID")
+            command.add_argument("--reason", required=True, metavar="TEXT")
         if name == "logs":
             command.add_argument("--after", type=_nonnegative_int, default=0, metavar="SEQUENCE")
     return parser
@@ -134,6 +137,10 @@ def _workflow_payload(store: WorkflowStore, workflow: Workflow) -> dict[str, Any
             "failure_classification": latest.failure_classification.value if latest.failure_classification else None,
             "failure_detail": latest.failure_detail,
         }
+    tasks = [_task_payload(store, task) for task in store.list_tasks(workflow.id)]
+    active_task = next((task for task in tasks if task["status"] == "active"), None)
+    if active_task is None:
+        active_task = next((task for task in tasks if task["status"] == "human_attention"), None)
     return {
         "workflow_id": workflow.id,
         "repository_path": workflow.repository_path,
@@ -145,17 +152,67 @@ def _workflow_payload(store: WorkflowStore, workflow: Workflow) -> dict[str, Any
         "current_artifact_revision": workflow.current_artifact_revision,
         "artifacts": artifacts,
         "latest_execution": execution,
+        "tasks": tasks,
+        "active_task": active_task,
+    }
+
+
+def _task_evidence(store: WorkflowStore, artifact_id: str | None, *, kind: str) -> dict[str, Any] | None:
+    """Project verified task evidence without exposing provider prose."""
+    if artifact_id is None:
+        return None
+    try:
+        content = json.loads(store.read_task_artifact_text(artifact_id))
+    except (TypeError, ValueError):
+        return {"result": "invalid"}
+    if not isinstance(content, dict):
+        return {"result": "invalid"}
+    if kind == "test":
+        results = content.get("test_results")
+        if not isinstance(results, list) or not results or not all(isinstance(item, dict) for item in results):
+            return {"result": "invalid"}
+        passed = all(item.get("passed") is True for item in results)
+        return {"result": "pass" if passed else "fail", "passed": passed}
+    outcome = content.get("outcome")
+    return ({"result": outcome, "outcome": outcome}
+            if outcome in {"PASS", "FIX_REQUIRED"} else {"result": "invalid"})
+
+
+def _task_payload(store: WorkflowStore, task: Any) -> dict[str, Any]:
+    # Definitions are immutable workflow evidence just like result artifacts.
+    # Verify their stored hash before projecting the persisted lifecycle state.
+    store.read_task_definition(task.id)
+    cycles = store.list_task_cycles(task.id)
+    latest = cycles[-1] if cycles else None
+    latest_test = _task_evidence(store, latest.required_test_artifact_id if latest else None, kind="test")
+    latest_review = _task_evidence(store, latest.review_artifact_id if latest else None, kind="review")
+    return {
+        "id": task.id,
+        "ordinal": task.ordinal,
+        "key": task.key,
+        "title": task.title,
+        "status": task.status.value,
+        "review_window": task.current_review_window,
+        "cycle": task.current_cycle,
+        "latest_required_test": latest_test,
+        "latest_review": latest_review,
+        "intervention_required": task.status.value == "human_attention",
     }
 
 
 def _event_payload(event: Any) -> dict[str, Any]:
+    payload = dict(event.payload)
     return {
         "sequence": event.sequence,
         "type": event.type,
         "stage": event.stage.value if event.stage else None,
         "artifact_id": event.artifact_id,
         "execution_id": event.execution_id,
-        "payload": dict(event.payload),
+        "task_id": payload.get("task_id"),
+        "cycle_id": payload.get("cycle_id"),
+        "review_window": payload.get("review_window"),
+        "cycle": payload.get("cycle"),
+        "payload": payload,
         "created_at": event.created_at,
     }
 
@@ -249,12 +306,14 @@ def _services(config: FlowConfig) -> tuple[WorkflowStore, PlanningOrchestrator]:
         config.provider_command,
         timeout_seconds=config.timeout_seconds,
         allow_read_only_planning=config.allow_read_only_planning,
+        allow_workspace_write=config.allow_workspace_write_development,
     )
     orchestrator = PlanningOrchestrator(
         store,
         runtime,
         approval_policies=config.approval_policies,
         timeout_seconds=config.timeout_seconds,
+        max_review_cycles=config.max_review_cycles,
     )
     return store, orchestrator
 
@@ -324,6 +383,8 @@ def _run_command(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
         elif command == "resume":
             regenerate = {"prd": Stage.PRD, "techspec": Stage.TECHSPEC, "task-plan": Stage.TASK_PLAN}.get(args.regenerate)
             workflow = orchestrator.resume(args.workflow, regenerate=regenerate)
+        elif command == "intervene":
+            workflow = orchestrator.intervene(args.workflow, args.task, reason=args.reason)
         elif command == "logs":
             workflow = orchestrator.status(args.workflow)
             payload = _workflow_payload(store, workflow)
@@ -347,7 +408,7 @@ def _requested_json_output(argv: list[str]) -> bool:
 def _requested_command(argv: list[str]) -> str:
     """Return the requested stable command without attempting full parsing."""
 
-    commands = {"init", "run", "status", "approve", "reject", "resume", "logs"}
+    commands = {"init", "run", "status", "approve", "reject", "resume", "intervene", "logs"}
     return next((argument for argument in argv if argument in commands), "unknown")
 
 

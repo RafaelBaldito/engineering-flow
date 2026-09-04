@@ -11,6 +11,7 @@ sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 from engineering_flow.cli import INITIAL_CONFIG, main  # noqa: E402
 from engineering_flow.config import load_config  # noqa: E402
 from engineering_flow.domain import ValidationFailure  # noqa: E402
+from engineering_flow.store import WorkflowStore  # noqa: E402
 
 
 class ConfigTests(unittest.TestCase):
@@ -47,6 +48,43 @@ class ConfigTests(unittest.TestCase):
         )
         with self.assertRaises(ValidationFailure):
             load_config(self.repository)
+
+    def test_execution_policy_is_required_and_is_captured_in_the_snapshot(self):
+        application = self.repository / ".engineering-flow"
+        application.mkdir()
+        legacy = (
+            "[provider]\nname='codex-cli'\ncommand='codex'\ntimeout_seconds=1800\n"
+            "[approval]\nprd='required'\ntechspec='required'\ntask_plan='required'\n"
+            "[safety]\nallow_read_only_planning=true\n"
+        )
+        config_path = application / "config.toml"
+        config_path.write_text(legacy, encoding="utf-8")
+        original = config_path.read_bytes()
+        with self.assertRaisesRegex(ValidationFailure, r"missing \[execution\] table"):
+            load_config(self.repository)
+        self.assertEqual(config_path.read_bytes(), original)
+
+        config_path.write_text(legacy + (
+            "[execution]\nmax_review_cycles=4\n"
+            "allow_workspace_write_development=true\nallow_read_only_review=true\n"
+        ), encoding="utf-8")
+        config = load_config(self.repository)
+        self.assertEqual(config.max_review_cycles, 4)
+        self.assertEqual(config.snapshot["execution"], {
+            "max_review_cycles": 4,
+            "allow_workspace_write_development": True,
+            "allow_read_only_review": True,
+        })
+        store = WorkflowStore(config.database_path)
+        workflow = store.create_workflow(self.repository, configuration_snapshot=config.snapshot)
+        config_path.write_text(legacy + (
+            "[execution]\nmax_review_cycles=1\n"
+            "allow_workspace_write_development=true\nallow_read_only_review=true\n"
+        ), encoding="utf-8")
+        self.assertEqual(
+            store.get_workflow(workflow.id).configuration_snapshot["execution"]["max_review_cycles"], 4
+        )
+        store.close()
 
     def test_non_git_repository_is_rejected(self):
         other = Path(self.tempdir.name) / "not-a-repo"
@@ -139,7 +177,8 @@ class ConfigTests(unittest.TestCase):
         (application / "config.toml").write_text(
             "[provider]\nname='codex-cli'\ncommand='codex --api-key this-is-a-private-value'\ntimeout_seconds=1800\n"
             "[approval]\nprd='required'\ntechspec='required'\ntask_plan='required'\n"
-            "[safety]\nallow_read_only_planning=true\n",
+            "[safety]\nallow_read_only_planning=true\n"
+            "[execution]\nmax_review_cycles=3\nallow_workspace_write_development=true\nallow_read_only_review=true\n",
             encoding="utf-8",
         )
         with self.assertRaisesRegex(ValidationFailure, "credential"):
@@ -155,7 +194,9 @@ class ConfigTests(unittest.TestCase):
         (application / "config.toml").write_text(
             "[provider]\nname='codex-cli'\ncommand='codex'\ntimeout_seconds=1800\n"
             "[approval]\nprd='required'\ntechspec='required'\ntask_plan='required'\n"
-            "[safety]\nallow_read_only_planning=true\n[provider.extra]\ntoken='secret'\n",
+            "[safety]\nallow_read_only_planning=true\n"
+            "[execution]\nmax_review_cycles=3\nallow_workspace_write_development=true\nallow_read_only_review=true\n"
+            "[provider.extra]\ntoken='secret'\n",
             encoding="utf-8",
         )
         with self.assertRaises(ValidationFailure):

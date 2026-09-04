@@ -27,6 +27,11 @@ task_plan = "required"
 
 [safety]
 allow_read_only_planning = true
+
+[execution]
+max_review_cycles = 3
+allow_workspace_write_development = true
+allow_read_only_review = true
 """
 
 _CREDENTIAL_PATTERN = re.compile(
@@ -36,10 +41,13 @@ _CREDENTIAL_PATTERN = re.compile(
     r"authorization|credential|private[_-]?key)\b(?:\s|=|$)|"
     r"\bBearer\s+|\b(?:sk|pk)-[A-Za-z0-9_-]{12,}\b"
 )
-_ALLOWED_SECTIONS = frozenset({"provider", "approval", "safety"})
+_ALLOWED_SECTIONS = frozenset({"provider", "approval", "safety", "execution"})
 _ALLOWED_PROVIDER_KEYS = frozenset({"name", "command", "timeout_seconds"})
 _ALLOWED_APPROVAL_KEYS = frozenset({"prd", "techspec", "task_plan"})
 _ALLOWED_SAFETY_KEYS = frozenset({"allow_read_only_planning"})
+_ALLOWED_EXECUTION_KEYS = frozenset({
+    "max_review_cycles", "allow_workspace_write_development", "allow_read_only_review",
+})
 
 
 def _resolved_directory(value: str | Path, label: str) -> Path:
@@ -165,6 +173,9 @@ class FlowConfig:
     timeout_seconds: float
     approval_policies: Mapping[str, ApprovalPolicy]
     allow_read_only_planning: bool
+    max_review_cycles: int
+    allow_workspace_write_development: bool
+    allow_read_only_review: bool
 
     @property
     def provider(self) -> str:
@@ -188,6 +199,11 @@ class FlowConfig:
             },
             "approval": {key: policy.value for key, policy in self.approval_policies.items()},
             "safety": {"allow_read_only_planning": self.allow_read_only_planning},
+            "execution": {
+                "max_review_cycles": self.max_review_cycles,
+                "allow_workspace_write_development": self.allow_workspace_write_development,
+                "allow_read_only_review": self.allow_read_only_review,
+            },
         }
 
     @classmethod
@@ -209,12 +225,24 @@ def load_config(repository_path: str | Path) -> FlowConfig:
             raw = tomllib.load(stream)
     except (OSError, tomllib.TOMLDecodeError) as exc:
         raise ValidationFailure(f"invalid configuration: {exc}") from exc
-    if not isinstance(raw, Mapping) or set(raw) != _ALLOWED_SECTIONS:
-        raise ValidationFailure("configuration must contain provider, approval, and safety tables")
+    if not isinstance(raw, Mapping):
+        raise ValidationFailure("configuration must contain provider, approval, safety, and execution tables")
+    sections = set(raw)
+    if "execution" not in sections:
+        raise ValidationFailure(
+            "missing [execution] table; add the normative Wave 2 execution settings without rewriting this file"
+        )
+    unknown_sections = sections - _ALLOWED_SECTIONS
+    if unknown_sections:
+        raise ValidationFailure(f"unknown configuration table: {sorted(unknown_sections)[0]}")
+    missing_sections = _ALLOWED_SECTIONS - sections
+    if missing_sections:
+        raise ValidationFailure(f"missing configuration table: {sorted(missing_sections)[0]}")
     _reject_credentials(raw)
     provider = _validate_mapping(raw["provider"], "provider", _ALLOWED_PROVIDER_KEYS)
     approval = _validate_mapping(raw["approval"], "approval", _ALLOWED_APPROVAL_KEYS)
     safety = _validate_mapping(raw["safety"], "safety", _ALLOWED_SAFETY_KEYS)
+    execution = _validate_mapping(raw["execution"], "execution", _ALLOWED_EXECUTION_KEYS)
     if provider["name"] != "codex-cli":
         raise ValidationFailure("only the codex-cli provider is supported in Wave 1")
     if (
@@ -236,9 +264,17 @@ def load_config(repository_path: str | Path) -> FlowConfig:
             raise ValidationFailure(f"invalid approval policy for {stage}: {value!r}") from exc
     if safety["allow_read_only_planning"] is not True:
         raise ValidationFailure("safety.allow_read_only_planning must be true")
+    max_review_cycles = execution["max_review_cycles"]
+    if isinstance(max_review_cycles, bool) or not isinstance(max_review_cycles, int) or max_review_cycles < 1:
+        raise ValidationFailure("execution.max_review_cycles must be a positive integer")
+    if execution["allow_workspace_write_development"] is not True:
+        raise ValidationFailure("execution.allow_workspace_write_development must be true")
+    if execution["allow_read_only_review"] is not True:
+        raise ValidationFailure("execution.allow_read_only_review must be true")
     return FlowConfig(
         repository, application, config_path, database_path,
         "codex-cli", provider["command"].strip(), float(timeout), parsed_policies, True,
+        max_review_cycles, True, True,
     )
 
 

@@ -203,6 +203,21 @@ class PlanningOrchestrator:
     def get_logs(self, workflow_id: str, *, after: int = 0):
         return self.logs(workflow_id, after=after)
 
+    def intervene(self, workflow_id: str, task_id: str, *, reason: str, actor: str = "human") -> Workflow:
+        """Record a valid task intervention without advancing task execution.
+
+        The store enforces the persisted human-attention boundary.  Keeping
+        this small delegation here ensures the CLI has no lifecycle authority.
+        """
+        if not workflow_id or not workflow_id.strip():
+            raise ValidationFailure("workflow ID is required")
+        if not task_id or not task_id.strip():
+            raise ValidationFailure("task ID is required")
+        if not reason or not reason.strip():
+            raise ValidationFailure("intervention reason is required")
+        self.store.record_intervention(workflow_id, task_id, actor=actor, reason=reason)
+        return self.store.get_workflow(workflow_id)
+
     def _current_artifact(self, workflow: Workflow):
         if workflow.stage is Stage.READY_FOR_WAVE_2:
             raise ConflictFailure("workflow has no current planning artifact")

@@ -11,7 +11,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 
 from engineering_flow.cli import main  # noqa: E402
-from engineering_flow.domain import Stage  # noqa: E402
+from engineering_flow.domain import ApprovalDecision, Stage, WorkflowStatus  # noqa: E402
 from engineering_flow.runtime import CapabilityReport, PlanningExecutionResult, TerminalState  # noqa: E402
 from engineering_flow.store import WorkflowStore  # noqa: E402
 
@@ -130,6 +130,60 @@ class CliTests(unittest.TestCase):
             self.assertIn("workflow_id", result)
             self.assertIn("status", result)
             self.assertIn("stage", result)
+
+    def test_task_status_logs_and_intervention_are_persisted_projections(self):
+        store = WorkflowStore(self.repository / ".engineering-flow" / "workflows.sqlite3")
+        workflow = store.create_workflow(self.repository, configuration_snapshot={
+            "execution": {"max_review_cycles": 3},
+        })
+        manifest = (
+            "```engineering-flow-task-plan\n"
+            + json.dumps({"version": 1, "tasks": [{
+                "key": "TASK-001", "title": "Projected task", "instructions": "Implement it.",
+                "acceptance_criteria": ["It is visible"], "required_tests": ["python -m unittest"],
+            }]})
+            + "\n```\n"
+        )
+        intent = store.create_generation_intent(workflow.id, Stage.TASK_PLAN, request_hash="plan", revision=1)
+        artifact = store.complete_generation(
+            intent.operation.idempotency_key, content=manifest,
+            artifact_path=self.repository / ".engineering-flow" / "workflows" / workflow.id / "artifacts" / "001-task-plan.md",
+            stage=Stage.TASK_PLAN, revision=1,
+        )
+        store.record_approval(workflow.id, artifact.id, ApprovalDecision.APPROVED, actor="human")
+        store.set_workflow_state(
+            workflow.id, stage=Stage.READY_FOR_WAVE_2, status=WorkflowStatus.COMPLETED,
+        )
+        task = store.import_task_plan(workflow.id)[0]
+        store.set_workflow_state(
+            workflow.id, stage=Stage.TASK_EXECUTION, status=WorkflowStatus.RUNNING,
+        )
+        store.pause_task(task.id, classification="review", detail="operator action is required")
+        store.close()
+
+        code, status = self.invoke(["status", "--repo", str(self.repository), "--workflow", workflow.id, "--json"])
+        self.assertEqual(code, 8)
+        self.assertEqual(status["tasks"][0]["key"], "TASK-001")
+        self.assertEqual(status["tasks"][0]["title"], "Projected task")
+        self.assertTrue(status["tasks"][0]["intervention_required"])
+        self.assertEqual(status["active_task"]["id"], task.id)
+
+        code, logs = self.invoke(["logs", "--repo", str(self.repository), "--workflow", workflow.id, "--json"])
+        self.assertEqual(code, 8)
+        task_events = [event for event in logs["events"] if event["task_id"] == task.id]
+        self.assertTrue(task_events)
+        self.assertEqual([event["sequence"] for event in logs["events"]], sorted(event["sequence"] for event in logs["events"]))
+
+        code, intervention = self.invoke([
+            "intervene", "--repo", str(self.repository), "--workflow", workflow.id,
+            "--task", task.id, "--reason", "Proceed with remediation", "--json",
+        ])
+        self.assertEqual(code, 0)
+        self.assertEqual(intervention["status"], "running")
+        reopened = WorkflowStore(self.repository / ".engineering-flow" / "workflows.sqlite3")
+        self.assertEqual(len(reopened.list_interventions(task.id)), 1)
+        self.assertEqual(reopened.get_task(task.id).status.value, "pending")
+        reopened.close()
 
 
 if __name__ == "__main__":
