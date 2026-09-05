@@ -20,8 +20,8 @@
 
 ## Context discipline
 
-- Start with `git status --short`, then locate and load only the files needed for the selected scope. Search before opening large files; prefer line ranges and bounded search results.
-- Keep tool output small: use targeted tests where appropriate, `git diff --stat` or changed-file lists before full diffs, and request detailed logs only to diagnose a specific failure.
+- Start with `git status --short`, then locate and load only the files needed for the selected scope. When output may be large, begin with targeted, bounded inspection; retain initial output when it is already small. Search before opening large files; prefer relevant line ranges and bounded search results.
+- Keep tool output small: use targeted tests where appropriate, `git diff --stat` or changed-file lists before large raw diffs, and summarize successful validation while preserving command/result evidence. On failure, progressively expand diagnostics until the cause is established; do not truncate authoritative review/acceptance evidence or diagnostics where truncation could hide a material cause.
 
 ## Platform scope
 
