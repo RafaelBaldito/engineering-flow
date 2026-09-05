@@ -2,6 +2,7 @@
 
 ## Runtime and validation
 
+- First readiness command: `./scripts/env-preflight`. It is a read-only environment and checkout diagnostic; it does not replace task-specific or full validation.
 - This Python project requires 3.13. For Linux/WSL work, use the repository-local Linux environment: `.venv/bin/python3`.
 - Application CLI: `.venv/bin/engineering-flow <command>` (`init`, `run`, `status`, `approve`, `reject`, `resume`, `intervene`, `logs`).
 - Full validation: `.venv/bin/python3 -m unittest discover -s tests -q`. No other tracked validation, lint, or formatting entry point exists.
