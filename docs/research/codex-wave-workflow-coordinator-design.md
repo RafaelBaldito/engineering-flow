@@ -1,23 +1,24 @@
-# Bootstrap Codex Wave Workflow Coordinator — Design
+# Bootstrap Codex Wave Workflow Controller — Design
 
 ## Executive decision
 
-Adopt a temporary **prompted Wave Workflow Coordinator**: a bounded control
-procedure run by the Codex Wave Host, not a new program, Skill, product
-architecture, or engineering role.  It coordinates exactly one authorized
-Wave by reading a single persisted control record, validating existing
-authoritative artifacts, dispatching one fresh role child at a time, and
-writing only the control record after evidence validation.
+Adopt a temporary **thin deterministic Python Wave Controller** invoked by the
+Codex Wave Host. It is a small bootstrap program, not a prompted LLM
+Coordinator, autonomous agent, Skill, product architecture, or engineering
+role. It controls exactly one authorized Wave by reading and validating one
+persisted control record and existing authoritative artifacts, then returning
+the next permitted action or a deterministic stop.
 
-The Coordinator uses existing repository Skills to perform engineering work.
-It does not interpret code quality or decide whether an engineering result is
-correct.  Its transition rule is strict: a transition is permitted only when
+The Controller never performs engineering work; Codex role subagents use the
+existing repository Skills for that work. It does not interpret code quality
+or decide whether an engineering result is correct. Its transition rule is
+strict: a transition is permitted only when
 the required current authoritative artifact and a matching durable result
 envelope both exist, their recorded target identity matches the current
 checkout identity, and no human gate is pending.  Ambiguity blocks rather than
 being repaired by inference.
 
-The bootstrap is deliberately Wave-local and ends at `WAVE_ACCEPTED`.  It
+The bootstrap is deliberately Wave-local and ends at `WAVE_ACCEPTED`. It
 neither starts nor authorizes a later Wave, accepts the release, nor performs
 Git delivery.
 
@@ -37,11 +38,14 @@ Goals:
 
 Non-goals:
 
-- Implementing Engineering Flow, a generic runtime, a database, a provider
-  abstraction, an event bus, a plugin, or delivery automation.
+- Implementing Engineering Flow, a database, provider abstraction,
+  `AgentRuntime` abstraction, generic capability registry, event bus,
+  workflow DSL, plugin system, Codex SDK integration (unless later proven
+  strictly necessary), PR/delivery automation, release lifecycle, or generic
+  multi-provider support.
 - Revising Skills, AGENTS.md, approved product/delivery/architecture contracts,
   TECHSPECs, task definitions, or historical evidence.
-- Replacing `review-task`, `wave-review`, or human approval with Coordinator
+- Replacing `review-task`, `wave-review`, or human approval with Controller
   judgment.
 - Strong OS, filesystem, permission, or worktree isolation.  The discovery
   evidence establishes only sufficient conversational isolation with shared
@@ -82,10 +86,12 @@ reviewer isolation is **SUFFICIENT_WITH_CONSTRAINTS**, not strong isolation.
 
 ```text
 Human -- explicit approvals/authorizations only --> Codex Wave Host
-Codex Wave Host -- invokes --> Wave Workflow Coordinator
-Coordinator -- one bounded dispatch --> fresh role child + existing Skill
+Codex Wave Host -- invokes/status/next/result --> Thin Deterministic Python Wave Controller
+Python Wave Controller -- bounded state/transition/handoff metadata --> Codex Wave Host
+Codex Wave Host -- one bounded dispatch --> fresh role child + existing Skill
 Role child -- authoritative engineering evidence --> repository Markdown/code
-Coordinator -- validates pointers/envelope --> Wave control record
+Codex Wave Host -- result/artifact references --> Python Wave Controller
+Python Wave Controller -- validated control record --> next action or stop
 ```
 
 The distinction is mandatory:
@@ -104,11 +110,29 @@ Domain capability is not a Skill name, role, Codex model, or provider/runtime.
 The table is a temporary Codex mapping owned by the bootstrap procedure, not a
 universal domain registry.
 
-The Coordinator may read state/evidence, validate preconditions and identities,
-resolve the next permitted capability, dispatch/wait for one child, persist a
-verified envelope, reconcile, and stop.  It may not edit code, tests, specs,
-reviews, approvals, or task plans; assess engineering correctness; manufacture
-PASS; route around a Skill; or perform Git/PR side effects.
+The Controller owns only deterministic workflow mechanics: parsing and
+validating persisted Wave state; lifecycle transitions and preconditions;
+human-gate detection; dependency readiness; attempt/review-cycle counters;
+checkout fingerprint capture and stale-result detection; one writer lease;
+atomic control-state persistence; artifact/hash and result-envelope validation;
+interruption reconciliation; next-capability determination; and deterministic
+handoff metadata construction. Ambiguous evidence or authority yields
+`BLOCKED`/`HUMAN_ATTENTION`.
+
+It must not write TECHSPEC content, decompose tasks, implement code, review
+code, fix findings, make architectural judgments, approve human gates,
+interpret code quality, invent remediation ownership, bypass Skills, perform
+release/Git delivery, or call itself an agent. It is the sole writer of the
+control record; an LLM must never rewrite workflow state directly.
+
+The Codex Wave Host remains the runtime-facing layer. It invokes the
+Controller; requests status/next allowed action; uses Controller-produced
+handoff metadata; spawns the required Codex child; selects the requested
+model/reasoning tier where supported; waits for completion; returns child
+result/artifact references to the Controller; and stops on `HUMAN_ACTION`,
+`BLOCKED`, or `WAVE_ACCEPTED`. The Host must not independently re-decide
+lifecycle state. If Host prose conflicts with Controller state, Controller
+state plus authoritative artifacts win.
 
 ## Wave lifecycle/state model
 
@@ -116,6 +140,15 @@ Use the repository terminology where it exists.  The bootstrap has **19
 named lifecycle states**; execution states mean an operation has been
 dispatched or is awaiting reconciliation, not that a child response itself is
 trusted.
+
+The lifecycle is unchanged. Its controlling rule is:
+
+```text
+authoritative artifacts + persisted human authority + current checkout identity
++ deterministic Controller transition rules = next permitted workflow action
+```
+
+An LLM must not infer transitions independently.
 
 | State | Meaning / next permitted action |
 | --- | --- |
@@ -139,14 +172,14 @@ trusted.
 | `WAVE_ACCEPTED` | Authoritative current Wave review is PASS; terminal state. Stop. |
 | `HUMAN_ATTENTION` | Evidence, authority, environment, conflict, manual action, or limit requires a human decision/action. Stop. |
 
-`WAVE_ACCEPTED` and `HUMAN_ATTENTION` are terminal for a Coordinator run.
+`WAVE_ACCEPTED` and `HUMAN_ATTENTION` are terminal for a Controller run.
 An approved human intervention can create a new explicitly recorded transition
 out of `HUMAN_ATTENTION`; it cannot be inferred from chat.  There is no
 `NEXT_WAVE` state.
 
 ### Transition table
 
-| From | Preconditions/evidence the Coordinator verifies | Dispatch or decision | To |
+| From | Preconditions/evidence the Controller verifies | Dispatch or decision | To |
 | --- | --- | --- | --- |
 | `WAVE_AUTHORIZED` | Exact active Wave-start authorization, predecessor PASS when applicable, no conflicting authorization | Record validated authorization pointers | `TECHSPEC_REQUIRED` |
 | `TECHSPEC_REQUIRED` | Wave scope and upstream sources identifiable | Architect / technical-design capability | `TECHSPEC_EXECUTION` |
@@ -177,14 +210,14 @@ out of `HUMAN_ATTENTION`; it cannot be inferred from chat.  There is no
 | `WAVE_REMEDIATION` | `NEW_TASK_REQUIRED`, unavailable manual action/environment, spec change, partial/unresolved remediation | Do not create scope or infer authority | `HUMAN_ATTENTION` |
 
 For a `WAVE_FIX` that changes work owned by an already accepted task, the
-Coordinator must first determine whether the Wave review itself routed a
+Controller must first determine whether the Wave review itself routed a
 `TASK_REVIEW_REQUIRED` finding.  If it did, task re-review precedes Wave
 re-review.  It must never decide that a code change does or does not need task
 acceptance on its own.
 
 ## Human gates and acceptance distinctions
 
-The Coordinator stops and requires explicit persisted human authority at:
+The Controller stops and requires explicit persisted human authority at:
 
 1. Wave start: before `WAVE_AUTHORIZED`/TECHSPEC dispatch.
 2. TECHSPEC approval: after technical design, for that exact artifact revision.
@@ -196,7 +229,7 @@ The Coordinator stops and requires explicit persisted human authority at:
 6. Review-cycle-limit intervention, conflicting/missing/stale evidence,
    interrupted/unknown operation, manual validation requiring user action,
    environment blockage, or any unrecoverable ambiguity.
-7. The next Wave: always after `WAVE_ACCEPTED`; this Coordinator has no
+7. The next Wave: always after `WAVE_ACCEPTED`; this Controller has no
    authority or transition to consume it.
 
 Engineering completion means a role completed its bounded work.  Task
@@ -206,8 +239,8 @@ to begin a bounded future action; it is not acceptance.  None implies another.
 
 ## Flat subagent topology and role policy
 
-The first bootstrap is flat.  The Host/Coordinator dispatches children directly
-and children must not spawn or supervise agents.
+The first bootstrap is flat. The Host dispatches children directly using a
+Controller handoff; children must not spawn or supervise agents.
 
 | Role | Fresh child / fork policy | Minimum bounded handoff | Authority and expected evidence | Checkout access | Model / effort |
 | --- | --- | --- | --- | --- | --- |
@@ -219,8 +252,8 @@ and children must not spawn or supervise agents.
 | Wave Reviewer | Fresh for every Wave review/re-review; `none` | Wave ID, bounded authoritative prerequisite references and exact checkout identity | Writes only current authoritative Wave review under `wave-review`; returns decision/ownership | Read-only behavior to extent supported; no code/test edits | DEEP: Terra high |
 | Wave Remediator | Fresh per routed Wave remediation; `none` | Wave ID, source Wave-review path+hash, permitted finding IDs/ownership, approved scope | Writes only executable Wave-local fixes/evidence under `fix-wave-review`; never accepts | Writer only when the routed finding permits it, serialized | STANDARD: Terra medium |
 
-FAST (Terra low) is reserved for non-decisive Coordinator diagnostics only; it
-is not used for engineering acceptance.  These are intended selected tiers,
+FAST (Terra low) is reserved for non-decisive Host diagnostics only; it is not
+used for engineering acceptance. These are intended selected tiers,
 not assertions about quota, pricing, or actual provider availability.  If a
 requested selection cannot be made by the host, record that fact and require
 human confirmation before dispatch rather than silently changing the policy.
@@ -246,22 +279,38 @@ assessment.  They must disregard non-authoritative developer narrative.  A
 re-review is always a different fresh Reviewer child, even if a prior reviewer
 was a PASS or FIX_REQUIRED author.
 
+### Deterministic Controller-to-Host handoff
+
+For one permitted operation, the Controller returns structured metadata, not a
+reasoning-rich engineering prompt. At minimum it contains `wave_id`, `task_id`,
+`required_role`, `required_capability`, required Skill/mechanism reference,
+authoritative input paths and hashes, checkout fingerprint, changed paths/diff
+identity, required validation, expected authoritative output path,
+`fork_turns` policy, intended model/reasoning tier, and `operation_id`.
+
+The Controller does not author natural-language engineering instructions that
+need judgment beyond deterministic templates. The Host may wrap this metadata
+in a minimal role prompt and invoke the existing Skill. This is a simple
+boundary, not a generic prompt framework.
+
 ## Single-writer and checkout-identity protocol
 
 There is one mutable checkout and no worktree isolation.  Therefore:
 
-1. The Coordinator holds a logical Wave writer lease in the control record.
-   It dispatches no second writer while a Developer, Fixer, Planner, Architect,
-   or permitted Wave Remediator has an unresolved operation.
-2. A reviewer is dispatched only after no writer is active and the Coordinator
-   captures a review target identity: `HEAD`, porcelain-v2 status hash,
-   binary-safe diff hash for `HEAD` plus untracked-file manifest hash, and a
-   changed-path manifest.  The control record stores those values.
+1. The Controller holds one logical active-operation/writer lease in the
+   control record. No active writer permits acquisition; a known active writer
+   rejects a second writer; an unknown or unresolved writer blocks for
+   `HUMAN_ATTENTION`; it is never silently overwritten.
+2. A reviewer is dispatched only after no writer is active and the Controller
+   captures the validated aggregate checkout fingerprint: `HEAD`; SHA-256 of
+   raw porcelain-v2 status bytes; SHA-256 of binary diff-from-`HEAD` bytes; a
+   content-hashed untracked-file manifest; a changed-path manifest; and their
+   canonical SHA-256 aggregate. The control record stores all components.
 3. Reviewers/Wave Reviewers are instructed not to modify production code,
    tests, or unapproved workflow artifacts, consistent with their Skills.  The
    host uses the least write capability it can provide, but this is behavioral
    rather than hard permission isolation in the current shared host.
-4. On return, before accepting a review envelope, the Coordinator recaptures
+4. On return, before accepting a review envelope, the Controller recaptures
    identity.  Changes allowed solely for the review artifact/status are
    separately accounted for; any other material checkout or diff change makes
    the review stale.  The result is rejected, recorded `STALE`, and no state
@@ -270,7 +319,7 @@ There is one mutable checkout and no worktree isolation.  Therefore:
    identities.  Unknown concurrent modification, checkout drift, or an
    untracked material file blocks human attention.
 
-The Coordinator is the sole writer of the control record.  Role children own
+The Controller is the sole writer of the control record. Role children own
 only artifacts their existing Skill explicitly permits.  No role may alter an
 approval/authorization record, another role's authoritative review, or the
 control record itself.
@@ -308,24 +357,45 @@ next_capability: <domain capability or HUMAN_ACTION>
 required_role: <role or HUMAN>
 human_gate: {status: OPEN|SATISFIED|NOT_APPLICABLE, reason: <short>, evidence: []}
 authoritative_refs: [{path: <repo-relative>, sha256: <digest>, purpose: <short>}]
-checkout_identity: {head: <sha>, status_hash: <sha>, diff_hash: <sha>, untracked_hash: <sha>, changed_paths_hash: <sha>}
+checkout_identity: {head: <sha>, status_hash: <sha>, diff_hash: <sha>, untracked_hash: <sha>, changed_paths_hash: <sha>, fingerprint: <sha>}
 active_operation: {id: <uuid>, role: <role>, child_task_name: <name>, input_identity: <object>, dispatched_at: <RFC3339>} # or null
 last_result_envelope: <envelope or null>
 blocker: {classification: <or null>, reason: <short>, required_human_action: <short or null>}
 updated_at: <RFC3339>
-updated_by: coordinator
+updated_by: python-wave-controller
 ```
 
-The record uses atomic replace by the Coordinator and records the immediately
+The record uses atomic replacement by the Controller: a same-directory
+temporary file receives complete serialization, flush, file `fsync`,
+`os.replace`, then directory `fsync`. An interruption before replace preserves
+the prior canonical state. It records the immediately
 previous state/transition in a short audit section.  It is not an append-only
 event store.  Existing immutable decision and review artifacts retain their
 own history.  A control-record hash in the result envelope protects against
 accidental stale child completion, but no child is allowed to update it.
 
+### Validated deterministic primitives
+
+The technical spike passed all three primitives in its tested Linux/WSL
+disposable fixture:
+
+- **Checkout identity — PASS.** The aggregate fingerprint algorithm above
+  detected tracked and untracked material changes; a result tied to an earlier
+  fingerprint is rejected as `STALE` when material checkout identity changes.
+- **Atomic state replacement — PASS.** Same-filesystem, same-directory temp
+  serialization, file `fsync`, `os.replace`, and directory `fsync` retained
+  the preceding canonical state when interrupted before replace.
+- **Single-writer lease — PASS.** The logical active-operation record allowed
+  acquisition only without an active writer, rejected a known active writer,
+  and blocked an unknown/unresolved writer.
+
+These experiments validate the tested Linux/WSL fixture, not every filesystem,
+Git edge case, or concurrent-process failure mode.
+
 ## Durable result-envelope contract
 
 Child terminal prose alone has no transition authority.  For every child
-terminal event, the Coordinator creates or updates the `last_result_envelope`
+terminal event, the Controller creates or updates the `last_result_envelope`
 in the state record only after inspecting the referenced artifact and checkout.
 It contains only references and compact facts:
 
@@ -336,8 +406,8 @@ scope: {wave_id: <id>, task_id: <null or TASK-XXX>}
 role: <Architect|Planner|Developer|Reviewer|Fixer|Wave Reviewer|Wave Remediator>
 attempt: <integer>
 child_task_name: <host child task identity>
-input_checkout_identity: {head: <sha>, status_hash: <sha>, diff_hash: <sha>, untracked_hash: <sha>}
-output_checkout_identity: {head: <sha>, status_hash: <sha>, diff_hash: <sha>, untracked_hash: <sha>}
+input_checkout_identity: {head: <sha>, status_hash: <sha>, diff_hash: <sha>, untracked_hash: <sha>, changed_paths_hash: <sha>, fingerprint: <sha>}
+output_checkout_identity: {head: <sha>, status_hash: <sha>, diff_hash: <sha>, untracked_hash: <sha>, changed_paths_hash: <sha>, fingerprint: <sha>}
 terminal_status: COMPLETED|PASS|FIX_REQUIRED|BLOCKED|SPEC_CHANGE_REQUIRED|INTERRUPTED|STALE|INVALID
 authoritative_artifacts: [{path: <repo-relative>, sha256: <digest>, purpose: <short>}]
 validation: [{command: <command>, outcome: PASS|FAIL|NOT_RUN, evidence_ref: <artifact/path>}]
@@ -347,7 +417,7 @@ recorded_at: <RFC3339>
 
 For an implementation/fix that has no required standalone execution-report
 artifact, the envelope references the task definition/status evidence and the
-captured checkout identity; the Coordinator records validation references
+captured checkout identity; the Controller records validation references
 without copying arbitrary prose.  For reviews, the authoritative persisted
 review artifact is mandatory.  For planning, TECHSPEC/task-plan output and its
 approval-ready status are mandatory.  For Wave remediation, the remediation
@@ -359,7 +429,7 @@ not meet the state transition's identity rule.  Both prevent advancement.
 
 ## Recovery, reconciliation, and idempotency
 
-At every Coordinator invocation—and before any new dispatch—perform
+At every Controller invocation—and before any new dispatch—perform
 reconciliation in this order:
 
 1. Parse and validate the state schema, Wave identity, state/role pairing,
@@ -376,8 +446,9 @@ reconciliation in this order:
    `TASKS_READY_FOR_WAVE_REVIEW`.  Record reconciliation as the transition.
 5. If a host vanished after child completion, match operation ID, role, scope,
    input identity, artifacts, and output identity before recording its envelope.
-   If that proof is absent, mark the operation `INTERRUPTED`/`INVALID` and stop
-   or safely redispatch only when no write may have occurred.
+   If that proof is absent, mark the operation `INTERRUPTED`/`INVALID` and
+   stop. Do not rerun a completed writer operation when completion is
+   ambiguous.
 6. If a referenced revision/diff is stale, an artifact is missing, competing
    current artifacts disagree, a reviewer result cannot be tied to its target,
    or a writer may have run concurrently, enter `HUMAN_ATTENTION`.
@@ -386,11 +457,14 @@ Dispatch is idempotent only after reconciliation proves no completed matching
 operation exists.  Never retry a writer following an unknown/interrupted
 operation merely because the state says it was required.  A fresh host does not
 need parent-session continuity; child names are diagnostic metadata, not the
-source of truth.
+source of truth. A completely new Codex session can conceptually run
+`wave-controller status`, `wave-controller reconcile`, and `wave-controller
+next` and receive an unambiguous answer without prior chat history. These are
+interface examples only, not proposed CLI commands.
 
 ## Failure handling and Wave-review remediation
 
-The Coordinator may retry only a pre-dispatch failure (for example, no child
+The Controller may retry only a pre-dispatch failure (for example, no child
 was created) or a deterministic read-only verification that changed no
 checkout state.  It may redispatch a completed capability only after a
 validated envelope/artifact proves the earlier operation did not complete or
@@ -402,7 +476,7 @@ dependency, or scope/specification question.
 Wave review routing is mechanical from the persisted authoritative finding
 ownership; it is not quality judgment:
 
-| Wave-review ownership/outcome | Coordinator route |
+| Wave-review ownership/outcome | Controller route |
 | --- | --- |
 | `PASS` | `WAVE_ACCEPTED`; stop. |
 | `WAVE_FIX` | Dispatch Wave Remediator only for executable scoped findings; require `READY_FOR_WAVE_REVIEW`, then a fresh Wave Reviewer. |
@@ -422,7 +496,7 @@ Wave 3 is the first intended real supervised pilot only after its normal
 Wave-start authorization is valid.  This document neither grants that
 authorization nor starts Wave 3.  The pilot sequence is:
 
-1. Implement this temporary Coordinator and its one control record without
+1. Implement this temporary Controller and its one control record without
    changing existing Skills/contracts; initialize its Wave 3 state only after
    the human records valid Wave-start authorization.
 2. Have a Host reconstruct from the state file, approvals, and checkout, then
@@ -436,7 +510,7 @@ authorization nor starts Wave 3.  The pilot sequence is:
    harmless checkout-identity change **outside the real Wave 3 implementation
    flow**, then prove stale rejection and restore/reconcile before continuing.
    Do not inject defects into Wave 3 to force a fix path.
-5. Prove writer leasing by attempting a second Coordinator dispatch while a
+5. Prove writer leasing by attempting a second Controller operation while a
    test writer lease is active; it must refuse before spawning.  Do not run
    concurrent real writers.
 6. After all task PASS evidence exists, dispatch a fresh `none` Wave Reviewer.
@@ -484,13 +558,13 @@ process/worktree design if any of these occurs:
   concurrent changes;
 - a fresh host cannot deterministically reconcile state/evidence without chat;
 - child completion cannot be durably tied to the correct scope/checkout;
-- repeated coordinator recovery produces ambiguous writer operations; or
+- repeated Controller recovery produces ambiguous writer operations; or
 - the pilot needs true filesystem, credential, worktree, or permission
   isolation beyond the observed shared-host surface.
 
 The fallback is a separately launched Codex process with independently chosen
 permissions and, where required, a separate worktree/container—not a more
-complex in-host coordinator.
+complex in-host controller.
 
 ## Relationship to future Engineering Flow
 
@@ -500,44 +574,49 @@ This bootstrap prototypes, but does not redesign, future product concepts:
 | --- | --- |
 | Wave control record | persisted lifecycle state |
 | evidence/hash preconditions | transition validation and idempotency |
-| capability-to-role map | capability resolution |
-| bounded child dispatch | role/runtime dispatch |
+| deterministic capability/role handoff | handoff manifest |
+| Host child dispatch | runtime dispatch |
 | result envelope | normalized execution result/evidence |
 | reviewer prompt identity | handoff manifest and reviewer isolation |
 | reconciliation pass | interruption recovery |
 | explicit stops | human approval/authorization gates |
 
-Wave 3's approved future TECHSPEC remains the place to decide product schemas,
-provider-neutral registry/resolver, persistence representation, audit model,
-and migration.  The bootstrap should be retired or explicitly migrated only
-after that product capability exists; it must not become a competing permanent
-architecture.
+The Controller may prototype persisted lifecycle state, deterministic
+transition validation, reconciliation, result envelopes, handoff manifests,
+human gates, and stale detection. Wave 3 remains responsible for actual
+product-level capability/lifecycle-governance decisions. Its approved future
+TECHSPEC remains the place to decide product schemas, persistence,
+provider-neutral concerns if any, audit model, and migration. The bootstrap
+must be retired or explicitly migrated only after that product capability
+exists; it must not become the future implementation by accident.
 
-## Open questions
+## Remaining integration risks
 
-1. **OPEN — reviewer hard read-only enforcement.** The active collaboration
+These are unvalidated integration risks, not blockers to implementing the
+minimal Controller. Relevant ones must pass before the real Wave 3 pilot.
+
+1. **Reviewer behavioral write restraint.** The active collaboration
    spawn interface has no per-child sandbox/permission selector.  Required
    experiment: confirm the Host can practically provide an acceptable
    least-privilege reviewer context; otherwise use the separate-process
    fallback.
-2. **OPEN — exact checkout fingerprint command and review-artifact allowance.**
-   The design specifies required identity components, but implementation must
-   select one deterministic binary-safe command sequence and prove that a
-   reviewer artifact/status-only change can be separated from material drift.
-   Required experiment: a disposable-repository stale-diff test.
-3. **OPEN — control-record atomic update mechanics.** The state must be
-   atomically replaced and recoverable on interruption.  Required experiment:
-   interrupt an update in a disposable checkout and prove parse/reconcile
-   behavior.  This is a Coordinator implementation detail, not a new product
-   store decision.
-4. **OPEN — role model availability at implementation time.** Terra tier names
+2. **Reviewer artifact-only checkout allowance.** The validated fingerprint
+   does not yet prove that review artifact/status-only changes can always be
+   distinguished from material drift in integrated operation.
+3. **Integrated Controller + Codex subagent recovery.** Recovery, result
+   envelopes, and lease state must be exercised across an actual Host/child
+   interruption boundary.
+4. **Git/repository edge cases.** Unusual paths, symlinks, submodules, and
+   repository-policy edge cases were outside the disposable fixture.
+5. **Actual dispatch availability.** Terra tier names
    are the current personal policy.  Required pre-dispatch check: record
    whether the host supports the intended explicit model/effort; do not claim
    the choice was applied when it was not.
 
 ## Recommended implementation sequence
 
-1. Define a single Coordinator prompt/procedure and the state-record template
+1. Define the small Python Controller state, fingerprint, transitions, and
+   handoff responsibilities plus the state-record template
    at the proposed Wave-local path; do not alter existing Skills.
 2. Implement deterministic artifact, authorization/hash, dependency, and
    checkout-identity verification before any dispatch capability.
@@ -545,14 +624,15 @@ architecture.
 4. Implement reconciliation and stale/invalid blocking before automated
    progression.
 5. Add bounded role handoff templates, always spawning fresh `none` children.
-6. Exercise disposable state-recovery, stale-identity, writer-lease, and
-   remediation-loop tests.
+6. Exercise the integrated dry-run, including reviewer artifact allowance,
+   behavioral isolation, recovery, and remediation-loop tests.
 7. Only then use the human-authorized Wave 3 pilot; stop at its acceptance.
 
 ## Recommendation
 
-**EXPERIMENT_REQUIRED_BEFORE_IMPLEMENTATION.** The discovery validates the
-critical conversational-isolation premise, but the remaining open experiments
-must prove checkout fingerprinting, atomic state recovery, and acceptable
-reviewer write restraint before a coordinator is allowed to orchestrate the
-real Wave 3 pilot.
+**PROCEED_TO_CONTROLLER_IMPLEMENTATION.** The three required deterministic
+primitives passed and the remaining items are integration risks rather than a
+new implementation blocker. Implementation of the minimal Controller may
+begin. An integrated dry-run remains required before Wave 3, and reviewer
+behavioral isolation remains a later validation gate before the real Wave 3
+pilot.
