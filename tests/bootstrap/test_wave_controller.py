@@ -162,6 +162,40 @@ class WaveControllerTests(unittest.TestCase):
             self.controller.register_tasks()
         self.assertEqual([], self.controller.load()["tasks"])
 
+    def test_public_task_plan_approval_transitions_directly_to_registration(self):
+        evidence = self.approved_task_plan()
+        self.save(lifecycle_state="AWAITING_TASK_PLAN_APPROVAL",
+                  human_gate={"status": "OPEN", "reason": "TASK_PLAN_APPROVAL", "evidence": []})
+        evidence_path = self.root / "task-plan-evidence.json"
+        evidence_path.write_text(json.dumps([evidence]))
+        approved = subprocess.run([
+            sys.executable, "-m", "tools.wave_controller.cli", "--root", str(self.root), "--wave", "fixture",
+            "record-authority", "--gate", "TASK_PLAN_APPROVAL", "--decision", "APPROVE",
+            "--actor", "human@example", "--evidence", str(evidence_path), "--authority-wave", "fixture",
+        ], cwd=Path(__file__).parents[2], check=True, capture_output=True, text=True)
+        self.assertEqual("RECORDED", json.loads(approved.stdout)["status"])
+        fresh = Controller(self.root, "fixture")
+        self.assertEqual("TASK_EXECUTION_REQUIRED", fresh.load()["lifecycle_state"])
+        self.assertEqual("TASK_PLAN_APPROVAL", fresh.load()["human_gate"]["reason"])
+        registered = subprocess.run([
+            sys.executable, "-m", "tools.wave_controller.cli", "--root", str(self.root), "--wave", "fixture",
+            "register-tasks",
+        ], cwd=Path(__file__).parents[2], check=True, capture_output=True, text=True)
+        self.assertEqual("REGISTERED", json.loads(registered.stdout)["status"])
+        recovered = Controller(self.root, "fixture")
+        self.assertEqual(["TASK-A", "TASK-B"], [task["id"] for task in recovered.load()["tasks"]])
+        self.assertEqual("TASK-A", recovered.next()["handoff"]["task_id"])
+
+    def test_task_plan_approval_wrong_wave_and_gate_are_rejected(self):
+        evidence = self.approved_task_plan()
+        self.save(lifecycle_state="AWAITING_TASK_PLAN_APPROVAL",
+                  human_gate={"status": "OPEN", "reason": "TASK_PLAN_APPROVAL", "evidence": []})
+        with self.assertRaisesRegex(ControllerError, "wave"):
+            self.controller.record_authority("TASK_PLAN_APPROVAL", "APPROVE", "human", [evidence], "other")
+        with self.assertRaisesRegex(ControllerError, "gate"):
+            self.controller.record_authority("TECHSPEC_APPROVAL", "APPROVE", "human", [evidence], "fixture")
+        self.assertEqual("AWAITING_TASK_PLAN_APPROVAL", self.controller.load()["lifecycle_state"])
+
     def test_register_tasks_persists_authoritative_order_and_cli_is_public(self):
         self.ready_for_registration()
         result = subprocess.run([

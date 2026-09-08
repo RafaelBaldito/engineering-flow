@@ -294,7 +294,15 @@ class Controller:
         if expected_gate != gate:
             raise ControllerError("authority gate is not currently open")
         state["human_gate"] = proposed
-        self._persist(state, f"AUTHORITY:{gate}")
+        # Task-set registration is the first permitted operation after this
+        # gate.  Advance the existing gate transition here so the public
+        # record-authority -> register-tasks sequence needs neither a task
+        # selection attempt nor a manual reconciliation step.
+        if gate == "TASK_PLAN_APPROVAL":
+            state["lifecycle_state"] = "TASK_EXECUTION_REQUIRED"
+            self._persist(state, "AWAITING_TASK_PLAN_APPROVAL->TASK_EXECUTION_REQUIRED")
+        else:
+            self._persist(state, f"AUTHORITY:{gate}")
         return {"status": "RECORDED", "wave_id": self.wave_id, "gate": gate}
 
     def _task_plan_path(self) -> str:
