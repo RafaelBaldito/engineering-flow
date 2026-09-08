@@ -259,6 +259,10 @@ class Controller:
             "fork_turns": "none", "intended_model": "Terra", "intended_reasoning_tier": "high" if role in {"Architect", "Planner", "Reviewer", "Wave Reviewer"} else "medium"}
         if role in {"Reviewer", "Wave Reviewer"}:
             handoff["allowed_output_paths"] = [output]
+            # Review validation must leave the checkout unchanged except for
+            # the authoritative review artifact. The Host applies this only
+            # to Python validation for these read-mostly roles.
+            handoff["validation_environment"] = {"PYTHONDONTWRITEBYTECODE": "1"}
         return {"status": "ACTION_REQUIRED", "wave_id": self.wave_id, "state": state["lifecycle_state"], "action": "RUN_CAPABILITY", "role": role, "capability": capability, "handoff": handoff}
 
     def begin_operation(self, operation_id: str | None = None, child_task_name: str | None = None) -> dict[str, Any]:

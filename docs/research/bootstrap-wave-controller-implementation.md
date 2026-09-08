@@ -47,7 +47,7 @@ Schema-v1 envelopes bind operation/scope/role/attempt, input and output identiti
 
 ## Handoff metadata
 
-`next` returns role, capability, Skill reference, authoritative references, checkout identity, validation/output facts, operation metadata on acquisition, and model/effort policy. Reviewer and Wave Reviewer handoffs always use `fork_turns: none` and contain no developer/fixer rationale or suggested verdict.
+`next` returns role, capability, Skill reference, authoritative references, checkout identity, validation/output facts, operation metadata on acquisition, and model/effort policy. Reviewer and Wave Reviewer handoffs always use `fork_turns: none` and contain no developer/fixer rationale or suggested verdict. Their validation environment explicitly sets `PYTHONDONTWRITEBYTECODE=1`; the Host applies it to Python validation so review validation does not create bytecode/cache mutations in the checkout. This prevents transient drift and does not alter the Controller's exact review-artifact-only allowance.
 
 ## Reconciliation
 

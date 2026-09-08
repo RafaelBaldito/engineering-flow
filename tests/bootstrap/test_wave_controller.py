@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -78,10 +79,29 @@ class WaveControllerTests(unittest.TestCase):
         self.save(lifecycle_state="TASK_REVIEW_REQUIRED", current_task_id="TASK-001", human_gate={"status": "NOT_APPLICABLE", "reason": "", "evidence": []})
         handoff = self.controller.next()["handoff"]
         self.assertEqual("none", handoff["fork_turns"])
+        self.assertEqual({"PYTHONDONTWRITEBYTECODE": "1"}, handoff["validation_environment"])
         self.assertNotIn("rationale", str(handoff).lower()); self.assertNotIn("suggested", str(handoff).lower())
         self.save(lifecycle_state="WAVE_REVIEW_REQUIRED")
         wave_handoff = self.controller.next()["handoff"]
         self.assertEqual("none", wave_handoff["fork_turns"])
+        self.assertEqual({"PYTHONDONTWRITEBYTECODE": "1"}, wave_handoff["validation_environment"])
+
+    def test_review_validation_environment_prevents_python_bytecode(self):
+        self.save(lifecycle_state="TASK_REVIEW_REQUIRED", current_task_id="TASK-001")
+        environment = self.controller.next()["handoff"]["validation_environment"]
+        validation_root = self.root / "validation-fixture"
+        tests_root = validation_root / "tests"
+        tests_root.mkdir(parents=True)
+        (tests_root / "test_sample.py").write_text(
+            "import unittest\n\nclass SampleTest(unittest.TestCase):\n    def test_ok(self):\n        self.assertTrue(True)\n"
+        )
+        result = subprocess.run(
+            [sys.executable, "-m", "unittest", "discover", "-s", "tests", "-q"],
+            cwd=validation_root, env=os.environ | environment, capture_output=True, text=True,
+        )
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertFalse(list(validation_root.rglob("__pycache__")))
+        self.assertFalse(list(validation_root.rglob("*.pyc")))
 
     def test_reconciliation_does_not_cross_missing_human_gate(self):
         self.save(lifecycle_state="AWAITING_TECHSPEC_APPROVAL", human_gate={"status": "OPEN", "reason": "approval", "evidence": []})
@@ -138,6 +158,15 @@ class WaveControllerTests(unittest.TestCase):
                 target = self.root / path; target.parent.mkdir(parents=True, exist_ok=True); target.write_text("unauthorized\n")
                 envelope["output_checkout_identity"] = capture(self.root)
                 self.assertEqual("HUMAN_ATTENTION", self.controller.complete_operation(envelope)["status"])
+
+    def test_reviewer_rejects_bytecode_alongside_exact_review_artifact(self):
+        self.save(lifecycle_state="TASK_REVIEW_REQUIRED", current_task_id="TASK-A", tasks=[{"id":"TASK-A", "status":"PENDING", "dependencies":[]}])
+        self.controller.begin_operation("review-bytecode")
+        envelope = self.envelope("Reviewer", "review-bytecode", "FIX_REQUIRED")
+        bytecode = self.root / "__pycache__" / "validation.cpython-313.pyc"
+        bytecode.parent.mkdir(); bytecode.write_bytes(b"transient bytecode")
+        envelope["output_checkout_identity"] = capture(self.root)
+        self.assertEqual("HUMAN_ATTENTION", self.controller.complete_operation(envelope)["status"])
 
     def test_reviewer_requires_authorized_artifact_and_preserves_stale_protection(self):
         self.save(lifecycle_state="TASK_REVIEW_REQUIRED", current_task_id="TASK-A", tasks=[{"id":"TASK-A", "status":"PENDING", "dependencies":[]}])
