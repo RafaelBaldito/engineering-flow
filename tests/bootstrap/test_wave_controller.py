@@ -57,6 +57,31 @@ class WaveControllerTests(unittest.TestCase):
                   human_gate={"status": "SATISFIED", "reason": "TASK_PLAN_APPROVAL", "evidence": [evidence]})
         return evidence
 
+    def prepare_wave_review(self):
+        """Create a registered plan with Controller-validated PASS receipts."""
+        self.controller.save(self.controller.initial("fixture", "Fixture"))
+        self.ready_for_registration()
+        self.assertEqual("REGISTERED", self.controller.register_tasks()["status"])
+        state = self.controller.load()
+        for task in state["tasks"]:
+            path = self.root / "tasks" / "fixture" / "reviews" / f"{task['id']}-REVIEW.md"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("## Task Review Result\n\nPASS\n")
+            task["status"] = "PASS"
+            task["accepted_review"] = {
+                "task_id": task["id"], "operation_id": f"accepted-{task['id']}",
+                "role": "Reviewer", "review_decision": "PASS",
+                "authoritative_artifacts": [{"path": path.relative_to(self.root).as_posix(),
+                                                "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                                                "purpose": "review"}],
+                "recorded_at": "2026-01-01T00:00:00Z",
+            }
+        state.update(lifecycle_state="WAVE_REVIEW_REQUIRED", current_task_id=None,
+                     active_operation=None,
+                     blocker={"classification": None, "reason": "", "required_human_action": None})
+        self.controller.save(state)
+        return state
+
     def test_valid_state_parsing_and_invalid_rejection(self):
         self.assertEqual("WAVE_AUTHORIZED", self.controller.load()["lifecycle_state"])
         self.controller.path.write_text("# bad\n```yaml\n[]\n```\n")
@@ -101,7 +126,7 @@ class WaveControllerTests(unittest.TestCase):
         self.assertEqual("none", handoff["fork_turns"])
         self.assertEqual({"PYTHONDONTWRITEBYTECODE": "1"}, handoff["validation_environment"])
         self.assertNotIn("rationale", str(handoff).lower()); self.assertNotIn("suggested", str(handoff).lower())
-        self.save(lifecycle_state="WAVE_REVIEW_REQUIRED")
+        self.prepare_wave_review()
         wave_handoff = self.controller.next()["handoff"]
         self.assertEqual("none", wave_handoff["fork_turns"])
         self.assertEqual({"PYTHONDONTWRITEBYTECODE": "1"}, wave_handoff["validation_environment"])
@@ -261,20 +286,19 @@ class WaveControllerTests(unittest.TestCase):
         missing = self.envelope("Reviewer", "review-missing", "PASS")
         missing["authoritative_artifacts"] = []
         self.assertEqual("HUMAN_ATTENTION", self.controller.complete_operation(missing)["status"])
-        self.save(lifecycle_state="WAVE_REVIEW_REQUIRED", current_task_id=None, active_operation=None,
-                  tasks=[{"id":"TASK-A", "status":"PASS", "dependencies":[]}], blocker={"classification":None,"reason":"","required_human_action":None})
+        self.prepare_wave_review()
         self.controller.begin_operation("wave-stale")
         stale = self.envelope("Wave Reviewer", "wave-stale", "PASS")
         stale["output_checkout_identity"] = self.controller.load()["active_operation"]["input_identity"]
         self.assertEqual("HUMAN_ATTENTION", self.controller.complete_operation(stale)["status"])
 
     def test_wave_reviewer_allows_only_exact_wave_review_artifact(self):
-        self.save(lifecycle_state="WAVE_REVIEW_REQUIRED", tasks=[{"id":"TASK-A", "status":"PASS", "dependencies":[]}])
+        self.prepare_wave_review()
         self.controller.begin_operation("wave-ok")
         self.assertEqual("WAVE_ACCEPTED", self.controller.complete_operation(self.envelope("Wave Reviewer", "wave-ok", "PASS"))["state"])
         # A new review lease rejects material implementation drift even when
         # the aggregate output fingerprint supplied by the Host matches.
-        self.save(lifecycle_state="WAVE_REVIEW_REQUIRED", active_operation=None, blocker={"classification":None,"reason":"","required_human_action":None})
+        self.prepare_wave_review()
         self.controller.begin_operation("wave-source")
         bad = self.envelope("Wave Reviewer", "wave-source", "PASS")
         (self.root / "tracked.txt").write_text("unauthorized\n")
@@ -383,7 +407,7 @@ class WaveControllerTests(unittest.TestCase):
             {"id":"TASK-002", "status":"PENDING", "dependencies":["TASK-001"]},
         ])
         self.assertEqual("TASK-002", self.controller.next()["handoff"]["task_id"])
-        self.save(lifecycle_state="WAVE_REVIEW_REQUIRED", current_task_id=None, tasks=[{"id":"TASK-001","status":"PASS","dependencies":[]}])
+        self.prepare_wave_review()
         self.controller.begin_operation("wave")
         self.assertEqual("WAVE_ACCEPTED", self.controller.complete_operation(self.envelope("Wave Reviewer", "wave", "PASS"))["state"])
         self.assertEqual("WAVE_ACCEPTED", self.controller.next()["status"])
@@ -454,3 +478,40 @@ class WaveControllerTests(unittest.TestCase):
         result = self.controller.reconcile()
         self.assertEqual("HUMAN_ATTENTION", result["status"])
         self.assertEqual("HUMAN_ATTENTION", self.controller.load()["lifecycle_state"])
+
+    def test_wave_review_handoff_distinguishes_plan_status_from_runtime_acceptance(self):
+        self.prepare_wave_review()
+        plan = (self.root / "tasks" / "fixture" / "TASKS.md").read_text()
+        self.assertIn("| TASK-A | First task | — | PENDING |", plan)
+        handoff = self.controller.next()["handoff"]
+        evidence = handoff["task_acceptance_evidence"]
+        self.assertEqual(["TASK-A", "TASK-B"], [item["task_id"] for item in evidence])
+        self.assertEqual([1, 2], [item["task_plan_position"] for item in evidence])
+        self.assertEqual(["accepted", "accepted"], [item["controller_runtime_status"] for item in evidence])
+        self.assertEqual(["PASS", "PASS"], [item["authoritative_review_decision"] for item in evidence])
+        self.assertEqual("tasks/fixture/TASKS.md", evidence[0]["task_plan_source"]["path"])
+        self.assertNotIn("suggested", str(handoff).lower())
+
+    def test_wave_review_handoff_rejects_runtime_review_evidence_contradictions(self):
+        cases = {
+            "accepted_fix_required": lambda state: state["tasks"][0]["accepted_review"].update(review_decision="FIX_REQUIRED"),
+            "pending_pass": lambda state: state["tasks"][0].update(status="PENDING"),
+            "missing_review": lambda state: state["tasks"][0].pop("accepted_review"),
+            "wrong_review_identity": lambda state: state["tasks"][0]["accepted_review"].update(
+                authoritative_artifacts=state["tasks"][1]["accepted_review"]["authoritative_artifacts"]),
+            "wrong_plan_order": lambda state: state["tasks"].reverse(),
+        }
+        for name, corrupt in cases.items():
+            with self.subTest(name=name):
+                self.controller.save(self.controller.initial("fixture", "Fixture"))
+                state = self.prepare_wave_review()
+                corrupt(state)
+                self.controller.save(state)
+                result = Controller(self.root, "fixture").next()
+                self.assertEqual("HUMAN_ATTENTION", result["status"])
+
+    def test_wave_review_handoff_is_fresh_host_stable(self):
+        self.prepare_wave_review()
+        first = self.controller.next()["handoff"]["task_acceptance_evidence"]
+        fresh = Controller(self.root, "fixture")
+        self.assertEqual(first, fresh.next()["handoff"]["task_acceptance_evidence"])

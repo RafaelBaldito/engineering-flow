@@ -92,3 +92,14 @@ On a valid Reviewer `PASS`, `complete_operation` now writes the selected task's 
 ## Recommendation
 
 READY_FOR_INTEGRATED_DRY_RUN
+
+## Wave Review task-authority contract correction
+
+The Wave Reviewer handoff now includes a Controller-validated factual manifest
+for each approved-plan task: plan position/source, `accepted` runtime status,
+the exact authoritative review artifact, and `PASS` review decision. The
+immutable `TASKS.md` remains the approved planning artifact and its required
+registration-time `PENDING` cells are not runtime acceptance status. The
+Wave Review Skill now applies that authority boundary while retaining rejection
+for missing, wrong-identity, non-PASS, or Controller/runtime-inconsistent task
+review evidence. This adds no lifecycle state or transition.

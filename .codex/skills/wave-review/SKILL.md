@@ -112,7 +112,7 @@ Before beginning Wave acceptance, verify:
 - [ ] the target Wave is explicit;
 - [ ] the approved Wave boundary can be identified;
 - [ ] the approved Wave TECHSPEC is available;
-- [ ] all tasks expected for the Wave have a known status;
+- [ ] all tasks expected for the Wave have a known runtime status;
 - [ ] required task-review evidence exists;
 - [ ] repository state represents the Wave being reviewed;
 - [ ] no intentionally incomplete work is being presented as complete.
@@ -163,7 +163,16 @@ Flag broken links such as:
 
 ### 3. Verify task completion and review evidence
 
-Inspect the Wave task index and task-review artifacts.
+Inspect the approved Wave task plan and task-review artifacts. The approved
+`TASKS.md` task plan is authoritative for included task identity, order, scope,
+decomposition, and planning metadata. Its registration-time status markers are
+not runtime acceptance authority after Controller registration.
+
+When a Controller handoff supplies task-acceptance evidence, use its
+per-task Controller runtime status/receipt and named authoritative review
+artifact to assess acceptance. Require those facts and the review artifact to
+agree. Do not reject a task solely because the immutable approved plan retains
+its required planning-time `PENDING` marker.
 
 Every required task must be:
 
@@ -173,8 +182,9 @@ Every required task must be:
 
 Do not infer task acceptance from `TASKS.md` alone.
 
-When the task index and the latest persisted task-review artifact disagree,
-report a finding with ownership `TASK_REVIEW_REQUIRED`.
+When Controller runtime status and the latest persisted task-review artifact
+disagree, report a finding with ownership `TASK_REVIEW_REQUIRED`. A task-plan
+identity/order/scope disagreement remains a task-plan consistency finding.
 
 Do not perform the missing independent task review yourself.
 

@@ -215,6 +215,55 @@ class Controller:
                 raise ControllerError(f"ambiguous task status for accepted review: {task.get('id')}")
         return repaired
 
+    def _wave_review_task_evidence(self, state: dict[str, Any]) -> list[dict[str, Any]]:
+        """Return the factual task-acceptance manifest for a Wave Reviewer.
+
+        TASKS.md is the immutable approved plan.  The Controller receipt and
+        task record are the runtime acceptance authority, so a planning-time
+        PENDING cell cannot be interpreted as a current task status.
+        """
+        task_plan = state.get("task_plan")
+        if not isinstance(task_plan, dict) or not isinstance(task_plan.get("path"), str):
+            raise ControllerError("Wave Review lacks registered approved task plan")
+        plan_path = _inside(self.root, task_plan["path"])
+        if not plan_path.is_file() or _hash(plan_path) != task_plan.get("sha256"):
+            raise ControllerError("registered approved task plan hash mismatch")
+        planned_tasks = self._parse_task_plan(plan_path)
+        runtime_tasks = state.get("tasks", [])
+        if (len(planned_tasks) != len(runtime_tasks)
+                or any(plan.get("id") != runtime.get("id")
+                       or plan.get("dependencies") != runtime.get("dependencies")
+                       for plan, runtime in zip(planned_tasks, runtime_tasks))):
+            raise ControllerError("approved task plan and Controller task index disagree")
+        evidence = []
+        for position, task in enumerate(runtime_tasks, start=1):
+            task_id = task["id"]
+            receipt = task.get("accepted_review")
+            expected = f"tasks/{self.wave_id}/reviews/{task_id}-REVIEW.md"
+            if task.get("status") != "PASS":
+                raise ControllerError(f"Controller runtime status is not accepted for {task_id}")
+            if (not isinstance(receipt, dict) or receipt.get("task_id") != task_id
+                    or not isinstance(receipt.get("operation_id"), str)
+                    or receipt.get("role") != "Reviewer" or receipt.get("review_decision") != "PASS"
+                    or not isinstance(receipt.get("recorded_at"), str)):
+                raise ControllerError(f"authoritative task review is missing or inconsistent for {task_id}")
+            artifacts = receipt.get("authoritative_artifacts")
+            if not isinstance(artifacts, list):
+                raise ControllerError(f"authoritative task review is missing or inconsistent for {task_id}")
+            self._validate_refs(artifacts)
+            artifact = next((ref for ref in artifacts if ref.get("path") == expected), None)
+            if artifact is None:
+                raise ControllerError(f"authoritative task review has wrong identity for {task_id}")
+            evidence.append({
+                "task_id": task_id,
+                "task_plan_position": position,
+                "task_plan_source": {"path": task_plan["path"], "sha256": task_plan["sha256"]},
+                "controller_runtime_status": "accepted",
+                "authoritative_review_artifact": artifact,
+                "authoritative_review_decision": "PASS",
+            })
+        return evidence
+
     def _open_gate(self, state: dict[str, Any]) -> str | None:
         if state["lifecycle_state"] == "WAVE_AUTHORIZED":
             return "WAVE_START_AUTHORIZATION"
@@ -387,6 +436,11 @@ class Controller:
             # the authoritative review artifact. The Host applies this only
             # to Python validation for these read-mostly roles.
             handoff["validation_environment"] = {"PYTHONDONTWRITEBYTECODE": "1"}
+        if role == "Wave Reviewer":
+            try:
+                handoff["task_acceptance_evidence"] = self._wave_review_task_evidence(state)
+            except ControllerError as exc:
+                return self._attention(state, str(exc))
         return {"status": "ACTION_REQUIRED", "wave_id": self.wave_id, "state": state["lifecycle_state"], "action": "RUN_CAPABILITY", "role": role, "capability": capability, "handoff": handoff}
 
     def begin_operation(self, operation_id: str | None = None, child_task_name: str | None = None) -> dict[str, Any]:
