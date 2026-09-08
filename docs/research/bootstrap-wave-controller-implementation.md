@@ -85,6 +85,10 @@ The explicit `register-tasks` operation closes the task-plan-to-task-lifecycle b
 
 The operation parses only the canonical `## Execution Order` Markdown table: the exact `Task | Title | Depends On | Status` header, its separator, and contiguous rows through the next heading or EOF. Each row requires a unique `TASK-...` identifier, non-empty title, `PENDING` initial status, and either `—` or comma-separated known unique task-ID dependencies. Empty, malformed, duplicate, unknown, or self-dependent entries reject explicitly. It persists ordered task IDs/dependencies as Controller-owned `PENDING` task records plus the approved plan path/hash. Repeating against that exact unchanged plan is idempotent; artifact hash mismatch or any conflicting persisted registration rejects without changing registered tasks. A fresh Controller reads the same state and its normal `next` selection picks the first dependency-ready registered task.
 
+## Task-status reconciliation correction
+
+On a valid Reviewer `PASS`, `complete_operation` now writes the selected task's `PASS` status and a per-task accepted-review receipt in the same atomic control-record replacement. The receipt retains the Controller-validated operation ID, task scope, Reviewer/PASS decision, exact hashed review artifact reference, and timestamp. Reconciliation validates that receipt and restores only a missing `PASS` status for that task. A review file alone, a textual verdict, developer/fixer completion, or an invalid/missing receipt cannot accept a task. Malformed or unverifiable receipt/status combinations route to `HUMAN_ATTENTION`; existing approved `TASKS.md` hashing and registration conflict behavior remain unchanged. No lifecycle state was added.
+
 ## Recommendation
 
 READY_FOR_INTEGRATED_DRY_RUN

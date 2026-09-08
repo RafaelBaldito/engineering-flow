@@ -365,7 +365,10 @@ class WaveControllerTests(unittest.TestCase):
         self.controller.begin_operation("review")
         outcome = self.controller.complete_operation(self.envelope("Reviewer", "review", "PASS"))
         self.assertEqual("COMPLETED", outcome["status"])
-        self.assertEqual("TASK_EXECUTION_REQUIRED", self.controller.load()["lifecycle_state"])
+        state = self.controller.load()
+        self.assertEqual("TASK_EXECUTION_REQUIRED", state["lifecycle_state"])
+        self.assertEqual("PASS", state["tasks"][0]["status"])
+        self.assertEqual("PASS", state["tasks"][0]["accepted_review"]["review_decision"])
 
     def test_state_role_pairing_and_satisfied_gate_evidence_are_strict(self):
         state = self.controller.load()
@@ -395,3 +398,59 @@ class WaveControllerTests(unittest.TestCase):
         bad = self.envelope("Reviewer", "bad-review", "PASS")
         bad["authoritative_artifacts"] = [{"path":"missing.md", "sha256":"0" * 64, "purpose":"review"}]
         self.assertEqual("HUMAN_ATTENTION", self.controller.complete_operation(bad)["status"])
+
+    def test_task_status_reconciliation_uses_only_controller_accepted_review_passes(self):
+        self.ready_for_registration()
+        self.assertEqual("REGISTERED", self.controller.register_tasks()["status"])
+        self.assertEqual(["PENDING", "PENDING"], [task["status"] for task in self.controller.load()["tasks"]])
+
+        self.controller.begin_operation("developer-a")
+        self.assertEqual("COMPLETED", self.controller.complete_operation(self.envelope("Developer", "developer-a"))["status"])
+        self.assertEqual(["PENDING", "PENDING"], [task["status"] for task in self.controller.load()["tasks"]])
+
+        self.controller.begin_operation("review-a-fix")
+        self.assertEqual("TASK_FIX_REQUIRED", self.controller.complete_operation(self.envelope("Reviewer", "review-a-fix", "FIX_REQUIRED"))["state"])
+        self.assertEqual(["PENDING", "PENDING"], [task["status"] for task in self.controller.load()["tasks"]])
+        self.controller.begin_operation("fixer-a")
+        self.assertEqual("TASK_REVIEW_REQUIRED", self.controller.complete_operation(self.envelope("Fixer", "fixer-a"))["state"])
+        self.assertEqual(["PENDING", "PENDING"], [task["status"] for task in self.controller.load()["tasks"]])
+
+        self.controller.begin_operation("review-a-pass")
+        self.assertEqual("COMPLETED", self.controller.complete_operation(self.envelope("Reviewer", "review-a-pass", "PASS"))["status"])
+        state = self.controller.load()
+        self.assertEqual(["PASS", "PENDING"], [task["status"] for task in state["tasks"]])
+        self.assertEqual("review-a-pass", state["tasks"][0]["accepted_review"]["operation_id"])
+
+        # Model an interrupted write that retained the authoritative receipt but
+        # lost the corresponding index status.  A new host restores only TASK-A.
+        state["tasks"][0]["status"] = "PENDING"
+        self.controller.save(state)
+        fresh = Controller(self.root, "fixture")
+        action = fresh.reconcile()
+        self.assertEqual("TASK-B", action["handoff"]["task_id"])
+        repaired = fresh.load()
+        self.assertEqual(["TASK-A", "TASK-B"], [task["id"] for task in repaired["tasks"]])
+        self.assertEqual(["PASS", "PENDING"], [task["status"] for task in repaired["tasks"]])
+        self.assertEqual("TASK-B", repaired["current_task_id"])
+        before = json.dumps(repaired["tasks"], sort_keys=True)
+        self.assertEqual("TASK-B", Controller(self.root, "fixture").reconcile()["handoff"]["task_id"])
+        self.assertEqual(before, json.dumps(self.controller.load()["tasks"], sort_keys=True))
+
+        self.controller.begin_operation("developer-b")
+        self.assertEqual("COMPLETED", self.controller.complete_operation(self.envelope("Developer", "developer-b"))["status"])
+        self.controller.begin_operation("review-b-pass")
+        self.assertEqual("COMPLETED", self.controller.complete_operation(self.envelope("Reviewer", "review-b-pass", "PASS"))["status"])
+        wave = Controller(self.root, "fixture").next()
+        self.assertEqual("Wave Reviewer", wave["role"])
+        self.assertEqual("WAVE_REVIEW_REQUIRED", self.controller.load()["lifecycle_state"])
+        self.assertEqual("TASKS_READY_FOR_WAVE_REVIEW->WAVE_REVIEW_REQUIRED", self.controller.load()["last_completed_transition"])
+
+    def test_reconcile_rejects_ambiguous_accepted_review_receipt(self):
+        self.save(lifecycle_state="TASK_EXECUTION_REQUIRED", tasks=[{
+            "id": "TASK-A", "status": "PENDING", "dependencies": [],
+            "accepted_review": {"task_id": "TASK-A", "operation_id": "unknown", "role": "Reviewer",
+                                "review_decision": "FIX_REQUIRED", "authoritative_artifacts": [], "recorded_at": "now"},
+        }])
+        result = self.controller.reconcile()
+        self.assertEqual("HUMAN_ATTENTION", result["status"])
+        self.assertEqual("HUMAN_ATTENTION", self.controller.load()["lifecycle_state"])

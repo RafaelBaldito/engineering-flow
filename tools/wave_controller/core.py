@@ -159,6 +159,12 @@ class Controller:
     def reconcile(self) -> dict[str, Any]:
         try: state = self.load()
         except ControllerError as exc: return {"status": "HUMAN_ATTENTION", "reason": str(exc)}
+        try:
+            repaired = self._reconcile_task_statuses(state)
+        except ControllerError as exc:
+            return self._attention(state, str(exc))
+        if repaired:
+            self._persist(state, "RECONCILE_TASK_STATUS")
         active = state["active_operation"]
         if active and active.get("role") not in ROLES:
             return self._attention(state, "unknown or unresolved active writer")
@@ -168,6 +174,46 @@ class Controller:
         if active:
             return {"status": "BLOCKED", "wave_id": self.wave_id, "reason": "active operation requires resolved result"}
         return self.next()
+
+    def _accepted_review_receipt(self, task_id: str, envelope: dict[str, Any]) -> dict[str, Any]:
+        """Retain only Controller-validated facts needed to recover a task PASS."""
+        return {
+            "task_id": task_id, "operation_id": envelope["operation_id"],
+            "role": envelope["role"], "review_decision": envelope["review_decision"],
+            "authoritative_artifacts": envelope["authoritative_artifacts"],
+            "recorded_at": envelope["recorded_at"],
+        }
+
+    def _reconcile_task_statuses(self, state: dict[str, Any]) -> bool:
+        """Restore only status lost after a Controller-accepted task review PASS.
+
+        A review file by itself is deliberately insufficient: the receipt is
+        created solely after ``_validate_envelope`` accepted the matching
+        Reviewer PASS against its active lease.
+        """
+        repaired = False
+        for task in state.get("tasks", []):
+            receipt = task.get("accepted_review")
+            if receipt is None:
+                continue
+            expected = f"tasks/{self.wave_id}/reviews/{task.get('id')}-REVIEW.md"
+            if (not isinstance(receipt, dict) or receipt.get("task_id") != task.get("id")
+                    or not isinstance(receipt.get("operation_id"), str)
+                    or receipt.get("role") != "Reviewer" or receipt.get("review_decision") != "PASS"
+                    or not isinstance(receipt.get("recorded_at"), str)):
+                raise ControllerError(f"ambiguous accepted review receipt for {task.get('id')}")
+            artifacts = receipt.get("authoritative_artifacts")
+            if not isinstance(artifacts, list):
+                raise ControllerError(f"ambiguous accepted review receipt for {task.get('id')}")
+            self._validate_refs(artifacts)
+            if expected not in {ref.get("path") for ref in artifacts}:
+                raise ControllerError(f"accepted review receipt lacks required artifact for {task.get('id')}")
+            if task.get("status") == "PENDING":
+                task["status"] = "PASS"
+                repaired = True
+            elif task.get("status") != "PASS":
+                raise ControllerError(f"ambiguous task status for accepted review: {task.get('id')}")
+        return repaired
 
     def _open_gate(self, state: dict[str, Any]) -> str | None:
         if state["lifecycle_state"] == "WAVE_AUTHORIZED":
@@ -410,7 +456,9 @@ class Controller:
             state["attempt"]["task_review"] += 1
             if envelope["review_decision"] == "PASS":
                 for task in state.get("tasks", []):
-                    if task.get("id") == state.get("current_task_id"): task["status"] = "PASS"
+                    if task.get("id") == state.get("current_task_id"):
+                        task["status"] = "PASS"
+                        task["accepted_review"] = self._accepted_review_receipt(task["id"], envelope)
                 state["current_task_id"] = None
                 state["lifecycle_state"] = "TASK_EXECUTION_REQUIRED"
             elif envelope["review_decision"] == "FIX_REQUIRED": state["lifecycle_state"] = "TASK_FIX_REQUIRED"
