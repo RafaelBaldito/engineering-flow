@@ -37,6 +37,26 @@ class WaveControllerTests(unittest.TestCase):
         path = self.root / "authority.md"; path.write_text("approved")
         return {"path": "authority.md", "sha256": hashlib.sha256(path.read_bytes()).hexdigest(), "purpose": "human authority"}
 
+    def approved_task_plan(self, contents=None):
+        path = self.root / "tasks" / "fixture" / "TASKS.md"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(contents or """# Tasks — Fixture
+
+## Execution Order
+
+| Task | Title | Depends On | Status |
+|------|-------|------------|--------|
+| TASK-A | First task | — | PENDING |
+| TASK-B | Second task | TASK-A | PENDING |
+""")
+        return {"path": "tasks/fixture/TASKS.md", "sha256": hashlib.sha256(path.read_bytes()).hexdigest(), "purpose": "approved task plan"}
+
+    def ready_for_registration(self, contents=None):
+        evidence = self.approved_task_plan(contents)
+        self.save(lifecycle_state="TASK_EXECUTION_REQUIRED",
+                  human_gate={"status": "SATISFIED", "reason": "TASK_PLAN_APPROVAL", "evidence": [evidence]})
+        return evidence
+
     def test_valid_state_parsing_and_invalid_rejection(self):
         self.assertEqual("WAVE_AUTHORIZED", self.controller.load()["lifecycle_state"])
         self.controller.path.write_text("# bad\n```yaml\n[]\n```\n")
@@ -108,6 +128,73 @@ class WaveControllerTests(unittest.TestCase):
         result = self.controller.reconcile()
         self.assertEqual("HUMAN_ACTION", result["status"])
         self.assertEqual("AWAITING_TECHSPEC_APPROVAL", self.controller.load()["lifecycle_state"])
+
+    def test_register_tasks_rejects_missing_task_plan_approval(self):
+        self.approved_task_plan()
+        self.save(lifecycle_state="TASK_EXECUTION_REQUIRED",
+                  human_gate={"status": "NOT_APPLICABLE", "reason": "", "evidence": []})
+        with self.assertRaisesRegex(ControllerError, "approved task plan authority"):
+            self.controller.register_tasks()
+        self.assertEqual([], self.controller.load()["tasks"])
+
+    def test_register_tasks_persists_authoritative_order_and_cli_is_public(self):
+        self.ready_for_registration()
+        result = subprocess.run([
+            sys.executable, "-m", "tools.wave_controller.cli", "--root", str(self.root), "--wave", "fixture", "register-tasks",
+        ], cwd=Path(__file__).parents[2], check=True, capture_output=True, text=True)
+        self.assertEqual("REGISTERED", json.loads(result.stdout)["status"])
+        state = self.controller.load()
+        self.assertEqual(["TASK-A", "TASK-B"], [task["id"] for task in state["tasks"]])
+        self.assertEqual([[], ["TASK-A"]], [task["dependencies"] for task in state["tasks"]])
+        self.assertEqual("tasks/fixture/TASKS.md", state["task_plan"]["path"])
+
+    def test_register_tasks_rejects_duplicate_malformed_and_empty_plans(self):
+        cases = {
+            "duplicate": """## Execution Order
+| Task | Title | Depends On | Status |
+|------|-------|------------|--------|
+| TASK-A | First | — | PENDING |
+| TASK-A | Again | — | PENDING |
+""",
+            "malformed": """## Execution Order
+| Task | Title | Depends On | Status |
+|------|-------|------------|--------|
+| not-a-task | First | — | PENDING |
+""",
+            "empty": """## Execution Order
+| Task | Title | Depends On | Status |
+|------|-------|------------|--------|
+""",
+        }
+        for name, contents in cases.items():
+            with self.subTest(name=name):
+                self.controller.save(self.controller.initial("fixture", "Fixture"))
+                self.ready_for_registration(contents)
+                with self.assertRaises(ControllerError):
+                    self.controller.register_tasks()
+                self.assertEqual([], self.controller.load()["tasks"])
+
+    def test_register_tasks_is_idempotent_and_rejects_changed_plan(self):
+        self.ready_for_registration()
+        self.assertEqual("REGISTERED", self.controller.register_tasks()["status"])
+        attempts = dict(self.controller.load()["attempt"])
+        self.assertEqual("IDEMPOTENT", self.controller.register_tasks()["status"])
+        self.assertEqual(attempts, self.controller.load()["attempt"])
+        (self.root / "tasks" / "fixture" / "TASKS.md").write_text("changed")
+        with self.assertRaisesRegex(ControllerError, "hash mismatch"):
+            self.controller.register_tasks()
+        text = self.controller.path.read_text(encoding="utf-8")
+        persisted = json.loads(text[text.index("```yaml") + len("```yaml"):text.index("```", text.index("```yaml") + len("```yaml"))])
+        self.assertEqual(["TASK-A", "TASK-B"], [task["id"] for task in persisted["tasks"]])
+
+    def test_registered_tasks_recover_fresh_and_next_selects_first(self):
+        self.ready_for_registration()
+        self.controller.register_tasks()
+        fresh = Controller(self.root, "fixture")
+        self.assertEqual(["TASK-A", "TASK-B"], [task["id"] for task in fresh.load()["tasks"]])
+        action = fresh.next()
+        self.assertEqual("ACTION_REQUIRED", action["status"])
+        self.assertEqual("TASK-A", action["handoff"]["task_id"])
 
     def envelope(self, role, operation_id, decision=None):
         state = self.controller.load(); active = state["active_operation"]

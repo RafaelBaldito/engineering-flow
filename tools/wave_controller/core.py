@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import tempfile
 import uuid
 from datetime import UTC, datetime
@@ -33,6 +34,7 @@ DISPATCH = {
 }
 GATES = {"AWAITING_TECHSPEC_APPROVAL": "TECHSPEC_APPROVAL", "AWAITING_TASK_PLAN_APPROVAL": "TASK_PLAN_APPROVAL"}
 EXECUTION_ROLES = {"TECHSPEC_EXECUTION": "Architect", "TASK_PLAN_EXECUTION": "Planner", "TASK_IMPLEMENTATION": "Developer", "TASK_REVIEW": "Reviewer", "TASK_FIX": "Fixer", "WAVE_REVIEW": "Wave Reviewer", "WAVE_REMEDIATION": "Wave Remediator"}
+TASK_ID = re.compile(r"TASK-[A-Za-z0-9][A-Za-z0-9_-]*$")
 
 
 class ControllerError(ValueError):
@@ -199,6 +201,82 @@ class Controller:
         state["human_gate"] = proposed
         self._persist(state, f"AUTHORITY:{gate}")
         return {"status": "RECORDED", "wave_id": self.wave_id, "gate": gate}
+
+    def _task_plan_path(self) -> str:
+        return f"tasks/{self.wave_id}/TASKS.md"
+
+    def _parse_task_plan(self, path: Path) -> list[dict[str, Any]]:
+        """Parse only the canonical TASKS.md Execution Order table."""
+        lines = path.read_text(encoding="utf-8").splitlines()
+        try:
+            start = next(index for index, line in enumerate(lines) if line.strip() == "## Execution Order")
+        except StopIteration as exc:
+            raise ControllerError("TASKS.md has no Execution Order section") from exc
+        index = start + 1
+        while index < len(lines) and not lines[index].strip():
+            index += 1
+        if index >= len(lines) or [part.strip() for part in lines[index].strip().strip("|").split("|")] != ["Task", "Title", "Depends On", "Status"]:
+            raise ControllerError("TASKS.md Execution Order header is invalid")
+        index += 1
+        if index >= len(lines) or not re.fullmatch(r"\s*\|\s*:?-{3,}:?\s*\|\s*:?-{3,}:?\s*\|\s*:?-{3,}:?\s*\|\s*:?-{3,}:?\s*\|\s*", lines[index]):
+            raise ControllerError("TASKS.md Execution Order separator is invalid")
+        index += 1
+        tasks: list[dict[str, Any]] = []
+        while index < len(lines) and lines[index].strip().startswith("|"):
+            fields = [part.strip() for part in lines[index].strip().strip("|").split("|")]
+            if len(fields) != 4:
+                raise ControllerError("TASKS.md Execution Order row is malformed")
+            task_id, title, dependencies, status = fields
+            if not TASK_ID.fullmatch(task_id) or not title or status != "PENDING":
+                raise ControllerError("TASKS.md task identifier, title, or initial status is invalid")
+            dependency_ids = [] if dependencies == "—" else [item.strip() for item in dependencies.split(",")]
+            if (not all(TASK_ID.fullmatch(item) for item in dependency_ids)
+                    or len(dependency_ids) != len(set(dependency_ids))):
+                raise ControllerError("TASKS.md task dependencies are invalid")
+            tasks.append({"id": task_id, "status": "PENDING", "dependencies": dependency_ids})
+            index += 1
+        while index < len(lines) and not lines[index].strip():
+            index += 1
+        if index < len(lines) and not lines[index].startswith("#"):
+            raise ControllerError("TASKS.md Execution Order rows are malformed")
+        if not tasks:
+            raise ControllerError("TASKS.md Execution Order is empty")
+        identifiers = [task["id"] for task in tasks]
+        if len(identifiers) != len(set(identifiers)):
+            raise ControllerError("TASKS.md has duplicate task identifiers")
+        known = set(identifiers)
+        if any(task["id"] in task["dependencies"] or not set(task["dependencies"]) <= known for task in tasks):
+            raise ControllerError("TASKS.md has unknown or self-referential dependencies")
+        return tasks
+
+    def register_tasks(self) -> dict[str, Any]:
+        """Explicitly register the exact approved TASKS.md task identity/order."""
+        state = self.load()
+        if state["lifecycle_state"] != "TASK_EXECUTION_REQUIRED" or state.get("active_operation"):
+            raise ControllerError("task registration is not permitted in the current lifecycle state")
+        gate = state["human_gate"]
+        if gate.get("status") != "SATISFIED" or gate.get("reason") != "TASK_PLAN_APPROVAL":
+            raise ControllerError("approved task plan authority is required before registration")
+        relative_path = self._task_plan_path()
+        plan = _inside(self.root, relative_path)
+        if not plan.is_file():
+            raise ControllerError("approved TASKS.md is missing")
+        digest = _hash(plan)
+        if not any(ref.get("path") == relative_path and ref.get("sha256") == digest for ref in gate["evidence"]):
+            raise ControllerError("TASKS.md does not match approved task plan authority")
+        tasks = self._parse_task_plan(plan)
+        registration = {"path": relative_path, "sha256": digest}
+        existing = state.get("task_plan")
+        if existing:
+            if existing == registration and state.get("tasks") == tasks:
+                return {"status": "IDEMPOTENT", "wave_id": self.wave_id, "task_count": len(tasks)}
+            raise ControllerError("conflicting task-set registration")
+        if state.get("tasks"):
+            raise ControllerError("task-set registration already has conflicting persisted tasks")
+        state["tasks"] = tasks
+        state["task_plan"] = registration
+        self._persist(state, "REGISTER_TASKS")
+        return {"status": "REGISTERED", "wave_id": self.wave_id, "task_count": len(tasks)}
 
     def _task_to_run(self, state: dict[str, Any]) -> str | None:
         current = state.get("current_task_id")

@@ -23,7 +23,7 @@ Schema-v1 state parsing/validation, explicit lifecycle transitions, human gates,
 
 ## CLI surface
 
-`python -m tools.wave_controller.cli --root <repo> --wave <id> status|reconcile|next|begin-operation|complete-operation` emits one JSON result. `begin-operation` accepts optional `--operation-id` and `--child-task-name`; `complete-operation --envelope <json-file>` validates and completes a host-supplied envelope.
+`python -m tools.wave_controller.cli --root <repo> --wave <id> status|reconcile|next|register-tasks|begin-operation|complete-operation` emits one JSON result. `register-tasks` explicitly imports the exact approved task-plan index into Controller state; it never records approval. `begin-operation` accepts optional `--operation-id` and `--child-task-name`; `complete-operation --envelope <json-file>` validates and completes a host-supplied envelope.
 
 ## State representation
 
@@ -78,6 +78,12 @@ The original implementation was correctly recorded as `READY_FOR_INTEGRATED_DRY_
 - The JSON CLI now exposes `record-authority --gate --decision APPROVE --actor --evidence <json-list> --authority-wave <wave>`. It persists a hashed evidence reference, gate, decision, actor, and timestamp. Wrong/open-state gates, wrong Waves, unsupported decisions, missing actors/evidence, and conflicting replay are rejected; an identical replay is idempotent.
 
 Focused regression coverage is in `tests/bootstrap/test_wave_controller.py`; it covers durable selection/restart, review artifact-only paths and drift, stale checks, writer lease behavior, and explicit authority persistence. Validation for this correction is recorded in `bootstrap-wave-controller-dry-run-fixes.md`.
+
+## Task-registration correction
+
+The explicit `register-tasks` operation closes the task-plan-to-task-lifecycle boundary without adding a lifecycle state. It is permitted only in `TASK_EXECUTION_REQUIRED`, with no active operation and a persisted satisfied `TASK_PLAN_APPROVAL`. That approval must include the exact current hash of `tasks/<wave-id>/TASKS.md`.
+
+The operation parses only the canonical `## Execution Order` Markdown table: the exact `Task | Title | Depends On | Status` header, its separator, and contiguous rows through the next heading or EOF. Each row requires a unique `TASK-...` identifier, non-empty title, `PENDING` initial status, and either `—` or comma-separated known unique task-ID dependencies. Empty, malformed, duplicate, unknown, or self-dependent entries reject explicitly. It persists ordered task IDs/dependencies as Controller-owned `PENDING` task records plus the approved plan path/hash. Repeating against that exact unchanged plan is idempotent; artifact hash mismatch or any conflicting persisted registration rejects without changing registered tasks. A fresh Controller reads the same state and its normal `next` selection picks the first dependency-ready registered task.
 
 ## Recommendation
 
