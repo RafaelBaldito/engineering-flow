@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -89,13 +91,112 @@ class WaveControllerTests(unittest.TestCase):
 
     def envelope(self, role, operation_id, decision=None):
         state = self.controller.load(); active = state["active_operation"]
+        artifacts = []
+        if role in {"Reviewer", "Wave Reviewer"}:
+            path = active["allowed_output_paths"][0]
+            artifact = self.root / path
+            artifact.parent.mkdir(parents=True, exist_ok=True)
+            artifact.write_text(f"{role} {decision}\n")
+            artifacts = [{"path": path, "sha256": hashlib.sha256(artifact.read_bytes()).hexdigest(), "purpose": "review"}]
         identity = capture(self.root)
         return {"envelope_version": 1, "operation_id": operation_id,
                 "scope": {"wave_id": "fixture", "task_id": active.get("task_id")}, "role": role,
                 "attempt": 0, "child_task_name": "child", "input_checkout_identity": active["input_identity"],
                 "output_checkout_identity": identity, "terminal_status": decision or "COMPLETED",
-                "authoritative_artifacts": [], "validation": [], "review_decision": decision,
+                "authoritative_artifacts": artifacts, "validation": [], "review_decision": decision,
                 "recorded_at": "2026-01-01T00:00:00Z"}
+
+    def test_selected_task_is_durable_across_restart_and_operation(self):
+        self.save(lifecycle_state="TASK_EXECUTION_REQUIRED", tasks=[
+            {"id": "TASK-A", "status": "PENDING", "dependencies": []},
+            {"id": "TASK-B", "status": "PENDING", "dependencies": []},
+        ])
+        first = self.controller.next()
+        self.assertEqual("TASK-A", first["handoff"]["task_id"])
+        self.assertEqual("TASK-A", self.controller.load()["current_task_id"])
+        fresh = Controller(self.root, "fixture")
+        self.assertEqual("TASK-A", fresh.next()["handoff"]["task_id"])
+        self.assertEqual("TASK-A", fresh.status() and fresh.load()["current_task_id"])
+        acquired = fresh.begin_operation("task-a")
+        self.assertEqual("TASK-A", acquired["handoff"]["task_id"])
+        self.assertEqual("TASK-A", fresh.load()["active_operation"]["task_id"])
+        self.assertEqual("COMPLETED", fresh.complete_operation(self.envelope("Developer", "task-a"))["status"])
+
+    def test_reviewer_allows_only_exact_task_review_artifact(self):
+        self.save(lifecycle_state="TASK_REVIEW_REQUIRED", current_task_id="TASK-A", tasks=[{"id":"TASK-A", "status":"PENDING", "dependencies":[]}])
+        self.controller.begin_operation("review-ok")
+        self.assertEqual("COMPLETED", self.controller.complete_operation(self.envelope("Reviewer", "review-ok", "PASS"))["status"])
+
+    def test_reviewer_rejects_source_test_and_wrong_review_artifacts(self):
+        for name, path in (("source", "tracked.txt"), ("test", "tests/test_x.py"), ("wrong", "tasks/fixture/reviews/TASK-B-REVIEW.md")):
+            with self.subTest(name=name):
+                self.save(lifecycle_state="TASK_REVIEW_REQUIRED", current_task_id="TASK-A", active_operation=None,
+                          tasks=[{"id":"TASK-A", "status":"PENDING", "dependencies":[]}],
+                          blocker={"classification":None,"reason":"","required_human_action":None})
+                self.controller.begin_operation(f"review-{name}")
+                envelope = self.envelope("Reviewer", f"review-{name}", "PASS")
+                target = self.root / path; target.parent.mkdir(parents=True, exist_ok=True); target.write_text("unauthorized\n")
+                envelope["output_checkout_identity"] = capture(self.root)
+                self.assertEqual("HUMAN_ATTENTION", self.controller.complete_operation(envelope)["status"])
+
+    def test_reviewer_requires_authorized_artifact_and_preserves_stale_protection(self):
+        self.save(lifecycle_state="TASK_REVIEW_REQUIRED", current_task_id="TASK-A", tasks=[{"id":"TASK-A", "status":"PENDING", "dependencies":[]}])
+        self.controller.begin_operation("review-missing")
+        missing = self.envelope("Reviewer", "review-missing", "PASS")
+        missing["authoritative_artifacts"] = []
+        self.assertEqual("HUMAN_ATTENTION", self.controller.complete_operation(missing)["status"])
+        self.save(lifecycle_state="WAVE_REVIEW_REQUIRED", current_task_id=None, active_operation=None,
+                  tasks=[{"id":"TASK-A", "status":"PASS", "dependencies":[]}], blocker={"classification":None,"reason":"","required_human_action":None})
+        self.controller.begin_operation("wave-stale")
+        stale = self.envelope("Wave Reviewer", "wave-stale", "PASS")
+        stale["output_checkout_identity"] = self.controller.load()["active_operation"]["input_identity"]
+        self.assertEqual("HUMAN_ATTENTION", self.controller.complete_operation(stale)["status"])
+
+    def test_wave_reviewer_allows_only_exact_wave_review_artifact(self):
+        self.save(lifecycle_state="WAVE_REVIEW_REQUIRED", tasks=[{"id":"TASK-A", "status":"PASS", "dependencies":[]}])
+        self.controller.begin_operation("wave-ok")
+        self.assertEqual("WAVE_ACCEPTED", self.controller.complete_operation(self.envelope("Wave Reviewer", "wave-ok", "PASS"))["state"])
+        # A new review lease rejects material implementation drift even when
+        # the aggregate output fingerprint supplied by the Host matches.
+        self.save(lifecycle_state="WAVE_REVIEW_REQUIRED", active_operation=None, blocker={"classification":None,"reason":"","required_human_action":None})
+        self.controller.begin_operation("wave-source")
+        bad = self.envelope("Wave Reviewer", "wave-source", "PASS")
+        (self.root / "tracked.txt").write_text("unauthorized\n")
+        bad["output_checkout_identity"] = capture(self.root)
+        self.assertEqual("HUMAN_ATTENTION", self.controller.complete_operation(bad)["status"])
+
+    def test_explicit_human_authority_is_persisted_and_strict(self):
+        gate = self.controller.next()
+        self.assertEqual("HUMAN_ACTION", gate["status"])
+        evidence = [self.authority()]
+        self.assertEqual("RECORDED", self.controller.record_authority("WAVE_START_AUTHORIZATION", "APPROVE", "human@example", evidence, "fixture")["status"])
+        fresh = Controller(self.root, "fixture")
+        self.assertEqual("SATISFIED", fresh.load()["human_gate"]["status"])
+        self.assertEqual("ACTION_REQUIRED", fresh.next()["status"])
+        self.assertEqual("IDEMPOTENT", fresh.record_authority("WAVE_START_AUTHORIZATION", "APPROVE", "human@example", evidence, "fixture")["status"])
+
+    def test_explicit_human_authority_rejects_invalid_and_never_infers(self):
+        self.assertEqual("HUMAN_ACTION", self.controller.reconcile()["status"])
+        evidence = [self.authority()]
+        with self.assertRaisesRegex(ControllerError, "gate"):
+            self.controller.record_authority("TASK_PLAN_APPROVAL", "APPROVE", "human", evidence, "fixture")
+        with self.assertRaisesRegex(ControllerError, "wave"):
+            self.controller.record_authority("WAVE_START_AUTHORIZATION", "APPROVE", "human", evidence, "other")
+        with self.assertRaisesRegex(ControllerError, "actor"):
+            self.controller.record_authority("WAVE_START_AUTHORIZATION", "APPROVE", "", evidence, "fixture")
+        with self.assertRaisesRegex(ControllerError, "decision"):
+            self.controller.record_authority("WAVE_START_AUTHORIZATION", "please approve this conversational text", "human", evidence, "fixture")
+
+    def test_record_authority_cli_persists_explicit_human_input(self):
+        evidence_path = self.root / "evidence.json"
+        evidence_path.write_text(json.dumps([self.authority()]))
+        result = subprocess.run([
+            sys.executable, "-m", "tools.wave_controller.cli", "--root", str(self.root), "--wave", "fixture",
+            "record-authority", "--gate", "WAVE_START_AUTHORIZATION", "--decision", "APPROVE",
+            "--actor", "human@example", "--evidence", str(evidence_path), "--authority-wave", "fixture",
+        ], cwd=Path(__file__).parents[2], check=True, capture_output=True, text=True)
+        self.assertEqual("RECORDED", json.loads(result.stdout)["status"])
+        self.assertEqual("SATISFIED", Controller(self.root, "fixture").load()["human_gate"]["status"])
 
     def test_stale_and_invalid_envelopes_do_not_advance(self):
         self.save(lifecycle_state="TASK_EXECUTION_REQUIRED", tasks=[{"id": "TASK-001", "status": "PENDING", "dependencies": []}])

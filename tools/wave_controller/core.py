@@ -167,7 +167,47 @@ class Controller:
             return {"status": "BLOCKED", "wave_id": self.wave_id, "reason": "active operation requires resolved result"}
         return self.next()
 
+    def _open_gate(self, state: dict[str, Any]) -> str | None:
+        if state["lifecycle_state"] == "WAVE_AUTHORIZED":
+            return "WAVE_START_AUTHORIZATION"
+        return GATES.get(state["lifecycle_state"])
+
+    def record_authority(self, gate: str, decision: str, actor: str,
+                         evidence: list[dict[str, Any]], authority_wave_id: str | None = None) -> dict[str, Any]:
+        """Persist one exact human decision; this never advances a lifecycle itself."""
+        state = self.load()
+        if authority_wave_id != self.wave_id:
+            raise ControllerError("authority wave does not match controller wave")
+        if decision != "APPROVE":
+            raise ControllerError("authority decision is unsupported")
+        if not isinstance(actor, str) or not actor.strip():
+            raise ControllerError("authority actor is required")
+        if not isinstance(evidence, list) or not evidence:
+            raise ControllerError("authority evidence is required")
+        self._validate_refs(evidence)
+        proposed = {"status": "SATISFIED", "reason": gate, "decision": decision,
+                    "actor": actor, "recorded_at": _now(), "evidence": evidence}
+        existing = state["human_gate"]
+        if existing.get("status") == "SATISFIED":
+            comparable = ("reason", "decision", "actor", "evidence")
+            if all(existing.get(key) == proposed.get(key) for key in comparable):
+                return {"status": "IDEMPOTENT", "wave_id": self.wave_id, "gate": gate}
+            raise ControllerError("conflicting authority replay")
+        expected_gate = self._open_gate(state)
+        if expected_gate != gate:
+            raise ControllerError("authority gate is not currently open")
+        state["human_gate"] = proposed
+        self._persist(state, f"AUTHORITY:{gate}")
+        return {"status": "RECORDED", "wave_id": self.wave_id, "gate": gate}
+
     def _task_to_run(self, state: dict[str, Any]) -> str | None:
+        current = state.get("current_task_id")
+        if current:
+            for task in state.get("tasks", []):
+                if task.get("id") == current and task.get("status", "PENDING") == "PENDING":
+                    passed = {t["id"] for t in state.get("tasks", []) if t.get("status") == "PASS"}
+                    if set(task.get("dependencies", [])) <= passed:
+                        return current
         passed = {t["id"] for t in state.get("tasks", []) if t.get("status") == "PASS"}
         for task in state.get("tasks", []):
             if task.get("status", "PENDING") == "PENDING" and set(task.get("dependencies", [])) <= passed:
@@ -194,7 +234,10 @@ class Controller:
                 if state.get("tasks") and all(t.get("status") == "PASS" for t in state["tasks"]):
                     state["lifecycle_state"] = "TASKS_READY_FOR_WAVE_REVIEW"; self._persist(state, "TASK_EXECUTION_REQUIRED->TASKS_READY_FOR_WAVE_REVIEW"); return self.next()
                 return {"status": "HUMAN_ATTENTION", "reason": "no dependency-ready task"}
-            state["current_task_id"] = task
+            if state.get("current_task_id") != task:
+                state["current_task_id"] = task
+                # Selection is a deterministic workflow fact, not Host memory.
+                self._persist(state, f"SELECT_TASK:{task}")
             return self._action(state, "Developer", "task-implementation", "execute-task", "TASK_IMPLEMENTATION")
         if lifecycle == "TASKS_READY_FOR_WAVE_REVIEW":
             state["lifecycle_state"] = "WAVE_REVIEW_REQUIRED"; self._persist(state, "TASKS_READY_FOR_WAVE_REVIEW->WAVE_REVIEW_REQUIRED"); return self.next()
@@ -214,6 +257,8 @@ class Controller:
             "required_capability": capability, "skill": skill, "authoritative_inputs": refs,
             "checkout_identity": identity, "required_validation": [], "expected_authoritative_output_path": output,
             "fork_turns": "none", "intended_model": "Terra", "intended_reasoning_tier": "high" if role in {"Architect", "Planner", "Reviewer", "Wave Reviewer"} else "medium"}
+        if role in {"Reviewer", "Wave Reviewer"}:
+            handoff["allowed_output_paths"] = [output]
         return {"status": "ACTION_REQUIRED", "wave_id": self.wave_id, "state": state["lifecycle_state"], "action": "RUN_CAPABILITY", "role": role, "capability": capability, "handoff": handoff}
 
     def begin_operation(self, operation_id: str | None = None, child_task_name: str | None = None) -> dict[str, Any]:
@@ -226,7 +271,8 @@ class Controller:
         op_id = operation_id or str(uuid.uuid4())
         state["checkout_identity"] = action["handoff"]["checkout_identity"]
         state["active_operation"] = {"id": op_id, "role": action["role"], "child_task_name": child_task_name,
-            "task_id": state.get("current_task_id"), "input_identity": state["checkout_identity"], "dispatched_at": _now()}
+            "task_id": action["handoff"].get("task_id"), "input_identity": state["checkout_identity"], "dispatched_at": _now(),
+            "allowed_output_paths": action["handoff"].get("allowed_output_paths", [])}
         state["lifecycle_state"] = DISPATCH.get(state["lifecycle_state"], (None, None, None, state["lifecycle_state"]))[3]
         self._persist(state, f"BEGIN:{op_id}")
         action["handoff"]["operation_id"] = op_id
@@ -244,6 +290,23 @@ class Controller:
         except ControllerError as exc: return str(exc)
         if active["role"] in {"Reviewer", "Wave Reviewer"} and envelope["review_decision"] not in {"PASS", "FIX_REQUIRED", "SPEC_CHANGE_REQUIRED", "BLOCKED"}: return "review decision is invalid"
         if active["role"] in {"Reviewer", "Wave Reviewer"} and envelope["terminal_status"] != envelope["review_decision"]: return "review terminal status does not match decision"
+        if active["role"] in {"Reviewer", "Wave Reviewer"}:
+            allowed = set(active.get("allowed_output_paths", []))
+            if len(allowed) != 1:
+                return "review operation has no exact allowed artifact path"
+            # The Controller's own control record changes when it obtains the
+            # lease.  It is not a child mutation and is excluded exactly.
+            ignored = {self.path.relative_to(self.root).as_posix()}
+            before = active["input_identity"].get("path_hashes")
+            after = envelope["output_checkout_identity"].get("path_hashes")
+            if not isinstance(before, dict) or not isinstance(after, dict):
+                return "review checkout identity lacks path snapshots"
+            changed = {path for path in set(before) | set(after) if before.get(path) != after.get(path)}
+            if changed - allowed - ignored:
+                return "review operation changed unauthorized paths"
+            artifact_paths = {ref.get("path") for ref in envelope["authoritative_artifacts"]}
+            if not allowed <= artifact_paths:
+                return "required review artifact is missing"
         if active["role"] not in {"Reviewer", "Wave Reviewer"} and envelope["terminal_status"] != "COMPLETED": return "writer terminal status must be COMPLETED"
         return None
 
@@ -266,6 +329,7 @@ class Controller:
             if envelope["review_decision"] == "PASS":
                 for task in state.get("tasks", []):
                     if task.get("id") == state.get("current_task_id"): task["status"] = "PASS"
+                state["current_task_id"] = None
                 state["lifecycle_state"] = "TASK_EXECUTION_REQUIRED"
             elif envelope["review_decision"] == "FIX_REQUIRED": state["lifecycle_state"] = "TASK_FIX_REQUIRED"
             else: return self._attention(state, "review requires human attention")

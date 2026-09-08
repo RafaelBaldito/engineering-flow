@@ -32,6 +32,18 @@ def capture(root: Path) -> dict[str, str]:
     changed = set(p for p in _git(root, "diff", "--name-only", "-z", "HEAD").split(b"\0") if p)
     changed.update(untracked)
     changed_manifest = b"".join(path + b"\0" for path in sorted(changed))
+    # The aggregate remains the spike's five-component identity.  This
+    # additional map is deliberately retained for operation-local output
+    # validation: aggregate hashes alone cannot say which file changed.
+    tracked = [p for p in _git(root, "ls-files", "-z").split(b"\0") if p]
+    paths = sorted(set(tracked) | set(untracked))
+    path_hashes = {
+        path.decode("utf-8", "surrogateescape"): _sha(
+            (root / path.decode("utf-8", "surrogateescape")).read_bytes()
+        )
+        for path in paths
+        if (root / path.decode("utf-8", "surrogateescape")).is_file()
+    }
     identity = {
         "head": head,
         "status_hash": _sha(status),
@@ -40,4 +52,5 @@ def capture(root: Path) -> dict[str, str]:
         "changed_paths_hash": _sha(changed_manifest),
     }
     identity["fingerprint"] = _sha(json.dumps(identity, sort_keys=True, separators=(",", ":")).encode())
+    identity["path_hashes"] = path_hashes
     return identity

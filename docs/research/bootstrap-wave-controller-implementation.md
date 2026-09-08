@@ -69,6 +69,16 @@ Focused command: `.venv/bin/python3 -m unittest tests.bootstrap.test_wave_contro
 - Git edge cases remain bounded by the spike assumptions.
 - Dispatch-time model/reasoning availability is not yet validated.
 
+## Post-integrated-dry-run corrections
+
+The original implementation was correctly recorded as `READY_FOR_INTEGRATED_DRY_RUN` at that time. The subsequent integrated dry-run exposed three deterministic Controller gaps, corrected without changing the 19-state lifecycle.
+
+- `next` now atomically persists the selected dependency-ready task before returning its Developer handoff. The persisted identity is reused by a fresh Controller invocation and by `begin-operation`; a completed accepted task clears the selection before the next task is selected.
+- Checkout identities now retain deterministic path/content snapshots in addition to the spike's aggregate identity. Reviewer and Wave Reviewer leases persist one exact allowed output path. Completion requires the corresponding authoritative review artifact and rejects every other child-caused path mutation, while retaining aggregate stale-result and artifact-hash checks.
+- The JSON CLI now exposes `record-authority --gate --decision APPROVE --actor --evidence <json-list> --authority-wave <wave>`. It persists a hashed evidence reference, gate, decision, actor, and timestamp. Wrong/open-state gates, wrong Waves, unsupported decisions, missing actors/evidence, and conflicting replay are rejected; an identical replay is idempotent.
+
+Focused regression coverage is in `tests/bootstrap/test_wave_controller.py`; it covers durable selection/restart, review artifact-only paths and drift, stale checks, writer lease behavior, and explicit authority persistence. Validation for this correction is recorded in `bootstrap-wave-controller-dry-run-fixes.md`.
+
 ## Recommendation
 
 READY_FOR_INTEGRATED_DRY_RUN

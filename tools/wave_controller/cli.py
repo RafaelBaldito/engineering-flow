@@ -13,13 +13,19 @@ def main() -> int:
     sub.add_parser("status"); sub.add_parser("reconcile"); sub.add_parser("next")
     begin = sub.add_parser("begin-operation"); begin.add_argument("--operation-id"); begin.add_argument("--child-task-name")
     complete = sub.add_parser("complete-operation"); complete.add_argument("--envelope", required=True, help="path to JSON envelope")
+    authority = sub.add_parser("record-authority")
+    authority.add_argument("--gate", required=True); authority.add_argument("--decision", required=True)
+    authority.add_argument("--actor", required=True); authority.add_argument("--evidence", required=True, help="path to JSON evidence list")
+    authority.add_argument("--authority-wave", required=True)
     args = parser.parse_args(); controller = Controller(Path(args.root), args.wave)
     try:
         if args.command == "status": result = controller.status()
         elif args.command == "reconcile": result = controller.reconcile()
         elif args.command == "next": result = controller.next()
         elif args.command == "begin-operation": result = controller.begin_operation(args.operation_id, args.child_task_name)
-        else: result = controller.complete_operation(json.loads(Path(args.envelope).read_text(encoding="utf-8")))
+        elif args.command == "complete-operation": result = controller.complete_operation(json.loads(Path(args.envelope).read_text(encoding="utf-8")))
+        else: result = controller.record_authority(args.gate, args.decision, args.actor,
+                                                    json.loads(Path(args.evidence).read_text(encoding="utf-8")), args.authority_wave)
     except (ControllerError, OSError, json.JSONDecodeError) as exc: result = {"status": "INVALID", "reason": str(exc)}
     print(json.dumps(result, sort_keys=True)); return 0
 
