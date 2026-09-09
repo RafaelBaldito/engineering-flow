@@ -1,4 +1,4 @@
-"""JSON CLI for a Codex Wave Host; it never spawns or manages children."""
+"""JSON CLI for the bounded Codex Wave Host."""
 
 from __future__ import annotations
 import argparse
@@ -12,6 +12,8 @@ def main() -> int:
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("status"); sub.add_parser("reconcile"); sub.add_parser("next")
     sub.add_parser("register-tasks")
+    run = sub.add_parser("run-tasks")
+    run.add_argument("--timeout", type=float, default=900.0)
     begin = sub.add_parser("begin-operation"); begin.add_argument("--operation-id"); begin.add_argument("--child-task-name")
     complete = sub.add_parser("complete-operation"); complete.add_argument("--envelope", required=True, help="path to JSON envelope")
     authority = sub.add_parser("record-authority")
@@ -31,6 +33,9 @@ def main() -> int:
         elif args.command == "reconcile": result = controller.reconcile()
         elif args.command == "next": result = controller.next()
         elif args.command == "register-tasks": result = controller.register_tasks()
+        elif args.command == "run-tasks":
+            from .host import run_task_loop
+            result = run_task_loop(controller, timeout=args.timeout)
         elif args.command == "begin-operation": result = controller.begin_operation(args.operation_id, args.child_task_name)
         elif args.command == "complete-operation": result = controller.complete_operation(json.loads(Path(args.envelope).read_text(encoding="utf-8")))
         elif args.command == "record-authority": result = controller.record_authority(args.gate, args.decision, args.actor,

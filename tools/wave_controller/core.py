@@ -547,7 +547,10 @@ class Controller:
                 self._persist(state, f"SELECT_TASK:{task}")
             return self._action(state, "Developer", "task-implementation", "execute-task", "TASK_IMPLEMENTATION")
         if lifecycle == "TASKS_READY_FOR_WAVE_REVIEW":
-            state["lifecycle_state"] = "WAVE_REVIEW_REQUIRED"; self._persist(state, "TASKS_READY_FOR_WAVE_REVIEW->WAVE_REVIEW_REQUIRED"); return self.next()
+            # The Codex host owns only the post-task-plan loop.  Wave Review
+            # remains a separately invoked, manual lifecycle action.
+            return {"status": "TASKS_READY_FOR_WAVE_REVIEW", "wave_id": self.wave_id,
+                    "state": lifecycle}
         if lifecycle in DISPATCH:
             role, capability, skill, target = DISPATCH[lifecycle]
             return self._action(state, role, capability, skill, target)

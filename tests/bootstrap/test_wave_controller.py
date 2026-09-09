@@ -560,9 +560,8 @@ class WaveControllerTests(unittest.TestCase):
         self.controller.begin_operation("review-b-pass")
         self.assertEqual("COMPLETED", self.controller.complete_operation(self.envelope("Reviewer", "review-b-pass", "PASS"))["status"])
         wave = Controller(self.root, "fixture").next()
-        self.assertEqual("Wave Reviewer", wave["role"])
-        self.assertEqual("WAVE_REVIEW_REQUIRED", self.controller.load()["lifecycle_state"])
-        self.assertEqual("TASKS_READY_FOR_WAVE_REVIEW->WAVE_REVIEW_REQUIRED", self.controller.load()["last_completed_transition"])
+        self.assertEqual("TASKS_READY_FOR_WAVE_REVIEW", wave["status"])
+        self.assertEqual("TASKS_READY_FOR_WAVE_REVIEW", self.controller.load()["lifecycle_state"])
 
     def test_reconcile_rejects_ambiguous_accepted_review_receipt(self):
         self.save(lifecycle_state="TASK_EXECUTION_REQUIRED", tasks=[{
