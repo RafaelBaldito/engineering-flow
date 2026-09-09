@@ -28,7 +28,7 @@ execution models.
 
 Use this skill when:
 
--   an approved task plan exists;
+-   an active exact-revision approved task plan exists;
 -   one specific task has been selected;
 -   the selected task is ready according to its declared dependencies;
 -   implementation of that task is the requested next action;
@@ -38,7 +38,7 @@ Use this skill when:
 Do not use this skill when:
 
 -   task decomposition is still awaiting approval;
--   no approved task plan exists;
+-   no active exact-revision approved task plan exists;
 -   no specific task has been selected;
 -   prerequisite tasks are incomplete;
 -   the request is primarily to review an implementation;
@@ -49,7 +49,8 @@ Do not use this skill when:
 
 ### Required
 
--   one selected approved `TASK-XXX.md` from an approved task plan.
+-   one selected approved `TASK-XXX.md` from an active exact-revision approved
+    task plan.
 
 ### Optional
 
@@ -92,7 +93,9 @@ choose a side silently. Report `SPEC_CHANGE_REQUIRED`.
 Before changing the repository:
 
 -   [ ] exactly one task is selected;
--   [ ] the task belongs to an approved task plan;
+-   [ ] the task belongs to an active exact-revision approved task plan whose
+    approval is bound to the current task-plan path and SHA-256 and is neither
+    revoked nor superseded;
 -   [ ] all declared blocking dependencies are satisfied by authoritative
     `review-task` `PASS` evidence;
 -   [ ] required task context is available;
@@ -126,11 +129,14 @@ Identify:
 Do not begin implementation before understanding the complete task
 contract.
 
-Treat approved planning artifacts and the normative content of the selected
-task as immutable execution inputs. Execution authorization does not authorize
-editing requirements, acceptance criteria, validation commands, TECHSPECs,
-architecture decisions, or other approved contracts. If one of those inputs
-must change, report `SPEC_CHANGE_REQUIRED` instead of rewriting it.
+The active exact-revision task-plan approval is the normal authority for this
+canonical execution entry. It permits the bounded execute/review/fix loop for
+that plan; no separate execution authorization is required. Treat approved
+planning artifacts and the normative content of the selected task as immutable
+execution inputs. Task-plan approval does not authorize editing requirements,
+acceptance criteria, validation commands, TECHSPECs, architecture decisions,
+or other approved contracts. If one of those inputs must change, report
+`SPEC_CHANGE_REQUIRED` instead of rewriting it.
 
 ### 2. Load the minimum required context
 
@@ -532,6 +538,8 @@ Provide the concise result format defined above and stop.
 Return `BLOCKED` when:
 
 -   a declared prerequisite task is incomplete;
+-   the task-plan approval is missing, stale, revoked, superseded, or does not
+    bind the current task-plan path and SHA-256;
 -   mandatory Required Context is unavailable;
 -   required infrastructure or dependency prevents implementation or
     validation;

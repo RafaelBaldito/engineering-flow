@@ -64,8 +64,8 @@ This design must not pre-implement either boundary.
 The existing Skill contracts are binding:
 
 - `create-techspec` creates one approval-ready TECHSPEC and stops.
-- `create-tasks` requires the separately valid task-planning authorization,
-  creates a task set, and stops for approval.
+- `create-tasks` requires the active exact-revision TECHSPEC approval,
+  creates its canonical task set, and stops for task-plan approval.
 - `execute-task` leaves a task `IMPLEMENTED`/ready for review, never accepted.
 - `review-task` alone supplies task-level `PASS`; a `FIX_REQUIRED` record is
   the fixer handoff, and a later PASS supersedes it.
@@ -156,7 +156,7 @@ An LLM must not infer transitions independently.
 | `TECHSPEC_REQUIRED` | Dispatch technical-design capability. |
 | `TECHSPEC_EXECUTION` | Reconcile or await Architect result; no other dispatch. |
 | `AWAITING_TECHSPEC_APPROVAL` | Stop for explicit human approval of the exact TECHSPEC revision. |
-| `TASK_PLAN_REQUIRED` | Validate separate task-planning authorization, then dispatch task decomposition. |
+| `TASK_PLAN_REQUIRED` | Validate active exact-revision TECHSPEC approval, then dispatch canonical task decomposition. |
 | `TASK_PLAN_EXECUTION` | Reconcile or await Planner result. |
 | `AWAITING_TASK_PLAN_APPROVAL` | Stop for explicit human approval of the exact task set. |
 | `TASK_EXECUTION_REQUIRED` | Select exactly one dependency-ready unaccepted task. |
@@ -186,11 +186,11 @@ out of `HUMAN_ATTENTION`; it cannot be inferred from chat.  There is no
 | `TECHSPEC_EXECUTION` | Envelope is completed, target identity matches, TECHSPEC exists and is scoped; no escalation | Persist result pointer | `AWAITING_TECHSPEC_APPROVAL` |
 | `TECHSPEC_EXECUTION` | `BLOCKED` or `SPEC_CHANGE_REQUIRED`, missing/conflicting/stale evidence, interruption | Record blocker; do not retry blindly | `HUMAN_ATTENTION` |
 | `AWAITING_TECHSPEC_APPROVAL` | Exact approved revision and approval evidence authenticated by the human process | Record only the evidence reference/hash | `TASK_PLAN_REQUIRED` |
-| `TASK_PLAN_REQUIRED` | Exact active task-planning authorization and approved TECHSPEC binding validate | Planner / task-decomposition capability | `TASK_PLAN_EXECUTION` |
+| `TASK_PLAN_REQUIRED` | Exact active TECHSPEC approval is stage-correct and binds the selected Wave, current TECHSPEC path, and hash | Planner / task-decomposition capability | `TASK_PLAN_EXECUTION` |
 | `TASK_PLAN_EXECUTION` | Completed matching envelope, task index and definitions exist, no escalation | Persist result pointer | `AWAITING_TASK_PLAN_APPROVAL` |
 | `TASK_PLAN_EXECUTION` | Blocked/spec change/missing/conflicting/stale evidence | Stop with reason | `HUMAN_ATTENTION` |
 | `AWAITING_TASK_PLAN_APPROVAL` | Exact approved task-set evidence | Record evidence reference/hash | `TASK_EXECUTION_REQUIRED` |
-| `TASK_EXECUTION_REQUIRED` | Select first ordered PENDING/eligible task whose every declared dependency has current authoritative PASS | Developer / task-implementation capability | `TASK_IMPLEMENTATION` |
+| `TASK_EXECUTION_REQUIRED` | Exact active task-plan approval binds the current task-plan path and hash; select first ordered PENDING/eligible task whose every declared dependency has current authoritative PASS | Developer / task-implementation capability | `TASK_IMPLEMENTATION` |
 | `TASK_IMPLEMENTATION` | Completed matching envelope, task is IMPLEMENTED or equivalent ready-for-review evidence, required validation is recorded | Persist envelope | `TASK_REVIEW_REQUIRED` |
 | `TASK_IMPLEMENTATION` | Blocked/spec change, missing/stale result, or writer conflict | Stop | `HUMAN_ATTENTION` |
 | `TASK_REVIEW_REQUIRED` | Current task implementation identity is stable; no other writer; task has ready-for-review evidence | Fresh Reviewer / independent task-review capability | `TASK_REVIEW` |
@@ -221,21 +221,24 @@ The Controller stops and requires explicit persisted human authority at:
 
 1. Wave start: before `WAVE_AUTHORIZED`/TECHSPEC dispatch.
 2. TECHSPEC approval: after technical design, for that exact artifact revision.
-3. Task-planning authorization: before task planning, separately from Wave
-   start and bound to the approved TECHSPEC hash.
-4. Task-plan approval: after task planning, for that exact task set.
-5. Any `SPEC_CHANGE_REQUIRED`, including an unapproved scope expansion or
+3. Task-plan approval: after task planning, for that exact task set; it
+   permits its canonical bounded execute/review/fix successor.
+4. Any `SPEC_CHANGE_REQUIRED`, including an unapproved scope expansion or
    `NEW_TASK_REQUIRED` route without separately supplied authority.
-6. Review-cycle-limit intervention, conflicting/missing/stale evidence,
+5. Review-cycle-limit intervention, conflicting/missing/stale evidence,
    interrupted/unknown operation, manual validation requiring user action,
    environment blockage, or any unrecoverable ambiguity.
-7. The next Wave: always after `WAVE_ACCEPTED`; this Controller has no
+6. The next Wave: always after `WAVE_ACCEPTED`; this Controller has no
    authority or transition to consume it.
 
-Engineering completion means a role completed its bounded work.  Task
-acceptance means current independent `review-task` PASS.  Wave acceptance means
-current independent `wave-review` PASS.  An authorization is a human decision
-to begin a bounded future action; it is not acceptance.  None implies another.
+Engineering completion means a role completed its bounded work. Task
+acceptance means current independent `review-task` PASS. Wave acceptance means
+current independent `wave-review` PASS. An approval accepts the exact active
+hash-bound result and permits only its defined canonical successor. An
+authorization is a human decision to begin new scope, non-canonical work, an
+external side effect, or another policy-defined high-risk action; it is not
+acceptance. Neither permits a later Wave or delivery without its separately
+required authorization.
 
 ## Flat subagent topology and role policy
 
@@ -245,7 +248,7 @@ Controller handoff; children must not spawn or supervise agents.
 | Role | Fresh child / fork policy | Minimum bounded handoff | Authority and expected evidence | Checkout access | Model / effort |
 | --- | --- | --- | --- | --- | --- |
 | Architect | Fresh per TECHSPEC; `fork_turns="none"` | Wave ID, approved sources/paths, exact authorized scope, target TECHSPEC path | Writes only TECHSPEC under `create-techspec`; reports `AWAITING_HUMAN_APPROVAL`, BLOCKED, or spec change | Writer, serialized | DEEP: Terra high |
-| Planner | Fresh per task plan; `none` | Wave ID, approved TECHSPEC path+hash, exact task-planning authorization, scope/path | Writes only task plan under `create-tasks`; reports approval-ready result or escalation | Writer, serialized | DEEP: Terra high |
+| Planner | Fresh per task plan; `none` | Wave ID, active approved TECHSPEC path+hash and approval evidence, scope/path | Writes only task plan under `create-tasks`; reports approval-ready result or escalation | Writer, serialized | DEEP: Terra high |
 | Developer | Fresh per task implementation attempt; `none` | Wave/task IDs, approved task path, required context, dependency PASS references, input identity, validation contract | Writes task-scoped implementation/tests/status only under `execute-task`; returns completed/escalation | Writer, serialized | STANDARD: Terra medium |
 | Reviewer | Fresh for every review and re-review; `none` | Explicit reviewer handoff below | Writes only authoritative task review/status permitted by `review-task`; returns decision | Read-only behavior to the extent supported; no code/test edits | DEEP: Terra high |
 | Fixer | Fresh per applicable FIX_REQUIRED; `none` | Task ID/path, latest review path+hash/findings, input identity, validation contract | Writes minimal task fix/tests/status under `fix-task`; never PASS | Writer, serialized | STANDARD: Terra medium |

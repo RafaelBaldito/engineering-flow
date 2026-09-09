@@ -87,8 +87,8 @@ Provider, role, skill, session, and execution are distinct concepts. A skill is 
 ### Approval and intervention
 
 - **FR-006:** The product must support approval policies of required, automatic, and conditional at applicable workflow stages.
-- **FR-007:** In the initial V1 policy, the PRD, delivery plan, required architecture overview, each current-scope TECHSPEC, and each task plan require human approval before the next planning stage proceeds. After an approved task plan, task execution and its bounded review/fix loop may proceed automatically within the approved scope.
-- **FR-008:** The product must allow an identifiable authorized actor to approve, reject, authorize, revoke, or supersede applicable workflow decisions and must persist the decision, scope, timestamp, authoritative evidence references, and relationship to any affected decision. The product does not require a concrete external identity technology in V1 architecture planning.
+- **FR-007:** In the initial V1 policy, the PRD, delivery plan, required architecture overview, each current-scope TECHSPEC, and each task plan require human approval. `APPROVE` accepts the exact active, stage-correct, hash-bound authoritative artifact as that stage result and permits its defined canonical successor under existing policy. Therefore TECHSPEC approval permits canonical task-plan creation, and task-plan approval permits task registration and the bounded autonomous sequential execute/review/fix loop within the approved scope. Neither transition requires a separate task-planning or task-execution authorization.
+- **FR-008:** The product must allow an identifiable authorized actor to approve, reject, authorize, revoke, or supersede applicable workflow decisions and must persist the decision, scope, timestamp, authoritative evidence references, and relationship to any affected decision. `AUTHORIZE` permits a new scope, non-canonical transition, external side effect, or other action not implied by acceptance of the canonical predecessor. It remains required for Wave starts (including later Waves), delivery, scope/spec changes, exceptional intervention or remediation, and policy-defined high-risk boundaries. The product does not require a concrete external identity technology in V1 architecture planning.
 - **FR-009:** The product must require human intervention when the configured maximum review/fix cycles is reached. A maximum review-cycle limit is mandatory.
 - **FR-010:** Merge must remain human-gated and outside autonomous V1 completion.
 
@@ -162,8 +162,8 @@ Feature request
   -> plan-delivery -> approval
   -> create-architecture-overview when the approved delivery plan requires it -> approval
   -> Wave-start authorization -> per-Wave create-techspec -> approval
-  -> create-tasks -> approval
-  -> execute-task -> tests -> review-task
+  -> create-tasks (permitted by exact TECHSPEC approval) -> approval
+  -> task registration and execute-task (permitted by exact task-plan approval) -> tests -> review-task
        -> FIX_REQUIRED: fix-task -> tests -> review-task (within configured limit)
   -> authoritative wave-review PASS / remediation routing -> Wave acceptance
   -> explicit persisted authorization before a later Wave starts

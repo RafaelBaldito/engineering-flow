@@ -35,6 +35,11 @@ autonomous merge.
 - Lifecycle transitions, approval, acceptance, authorization, and routing are
   deterministic, policy-controlled, persisted orchestrator decisions. Provider
   output is evidence, never a transition instruction.
+- `APPROVE` accepts the exact active, stage-correct, hash-bound authoritative
+  artifact as the stage result and permits its defined canonical successor under
+  existing policy. `AUTHORIZE` permits new scope, a non-canonical transition,
+  an external side effect, or another action not implied by canonical
+  predecessor acceptance.
 - Task acceptance, Wave acceptance, release acceptance, next-Wave
   authorization, delivery authorization, and final completion are distinct,
   durable facts.
@@ -52,7 +57,8 @@ The target lifecycle is:
 feature -> PRD -> approval -> delivery planning -> approval
 -> conditional architecture overview -> approval when required
 -> Wave start authorization -> per-Wave TECHSPEC -> approval
--> task planning -> approval -> task execute/review/fix loops
+-> task planning (permitted by exact TECHSPEC approval) -> approval
+-> task registration and task execute/review/fix loops (permitted by exact task-plan approval)
 -> Wave review/remediation routing -> Wave acceptance
 -> explicit next-Wave authorization -> subsequent Wave(s)
 -> after all included Waves are accepted: release final-review/remediation
@@ -70,6 +76,14 @@ auditable record with identifiable actor, scope, timestamp, evidence references,
 status, and applicable revocation/supersession relationship. This is an
 actor/audit boundary, not a decision to adopt a particular authentication or
 identity technology.
+
+TECHSPEC approval is the sole normal prerequisite for canonical task planning;
+task-plan approval is the sole normal prerequisite for task registration and
+the bounded autonomous execute/review/fix loop. A separate task-planning or
+task-execution authorization is not a normal human gate. Wave starts and later
+Wave starts remain explicit authorizations, as do external delivery,
+scope/spec changes, exceptional/non-canonical intervention or remediation, and
+policy-defined high-risk boundaries.
 
 ## 5. Capability, Role, and Provider Boundaries
 

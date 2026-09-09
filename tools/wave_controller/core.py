@@ -33,6 +33,7 @@ DISPATCH = {
     "WAVE_REMEDIATION": ("Wave Remediator", "wave-local-remediation", "fix-wave-review", "WAVE_REMEDIATION"),
 }
 GATES = {"AWAITING_TECHSPEC_APPROVAL": "TECHSPEC_APPROVAL", "AWAITING_TASK_PLAN_APPROVAL": "TASK_PLAN_APPROVAL"}
+APPROVAL_GATES = frozenset({"TECHSPEC_APPROVAL", "TASK_PLAN_APPROVAL"})
 EXECUTION_ROLES = {"TECHSPEC_EXECUTION": "Architect", "TASK_PLAN_EXECUTION": "Planner", "TASK_IMPLEMENTATION": "Developer", "TASK_REVIEW": "Reviewer", "TASK_FIX": "Fixer", "WAVE_REVIEW": "Wave Reviewer", "WAVE_REMEDIATION": "Wave Remediator"}
 TASK_ID = re.compile(r"TASK-[A-Za-z0-9][A-Za-z0-9_-]*$")
 
@@ -75,6 +76,9 @@ class Controller:
             "authoritative_refs": [], "checkout_identity": None, "active_operation": None,
             "last_result_envelope": None, "blocker": {"classification": None, "reason": "", "required_human_action": None},
             "updated_at": _now(), "updated_by": "python-wave-controller", "tasks": [],
+            # Append-only bootstrap governance evidence.  Old schema-v1 records
+            # without this field are interpreted through their human_gate below.
+            "governance_decisions": [],
         }
 
     def load(self) -> dict[str, Any]:
@@ -110,6 +114,64 @@ class Controller:
             if not gate.get("evidence"):
                 raise ControllerError("satisfied human gate has no persisted authority")
             self._validate_refs(gate["evidence"])
+        decisions = state.get("governance_decisions", [])
+        if not isinstance(decisions, list) or any(not isinstance(item, dict) for item in decisions):
+            raise ControllerError("governance decision history is invalid")
+
+    def _approval_target(self, gate: str) -> str:
+        if gate == "TECHSPEC_APPROVAL":
+            return f"docs/waves/{self.wave_id}/TECHSPEC.md"
+        if gate == "TASK_PLAN_APPROVAL":
+            return self._task_plan_path()
+        raise ControllerError("approval gate is invalid")
+
+    def _decision_id(self, operation: str, gate: str, actor: str, evidence: list[dict[str, Any]], target: str | None) -> str:
+        payload = json.dumps({"operation": operation, "gate": gate, "wave_id": self.wave_id,
+                              "actor": actor, "evidence": evidence, "target": target}, sort_keys=True,
+                             separators=(",", ":"))
+        return hashlib.sha256(payload.encode()).hexdigest()
+
+    def _active_approval(self, state: dict[str, Any], gate: str) -> dict[str, Any]:
+        """Resolve exactly one current, exact-revision approval or fail closed."""
+        if gate not in APPROVAL_GATES:
+            raise ControllerError("approval gate is invalid")
+        target = self._approval_target(gate)
+        decisions = state.get("governance_decisions", [])
+        # Legacy v1 state is read-compatible; it represents one approval fact.
+        if not decisions:
+            legacy = state.get("human_gate", {})
+            if legacy.get("status") == "SATISFIED" and legacy.get("reason") == gate and legacy.get("decision", "APPROVE") == "APPROVE":
+                decisions = [{"id": "legacy-human-gate", "operation": "APPROVE", "gate": gate,
+                              "wave_id": self.wave_id, "evidence": legacy.get("evidence", [])}]
+        by_id = {item.get("id"): item for item in decisions if item.get("id")}
+        candidates = [item for item in decisions if item.get("operation") == "APPROVE"
+                      and item.get("gate") == gate and item.get("wave_id") == self.wave_id]
+        inactive: set[str] = set()
+        for item in decisions:
+            if item.get("operation") == "REVOKE" and item.get("gate") == gate and item.get("target") in by_id:
+                inactive.add(item["target"])
+            if item.get("operation") == "SUPERSEDE" and item.get("gate") == gate and item.get("target") in by_id:
+                replacement = by_id.get(item.get("replacement"))
+                if replacement and replacement.get("operation") == "APPROVE" and replacement.get("gate") == gate:
+                    inactive.add(item["target"])
+                else:
+                    raise ControllerError("ambiguous supersession lineage")
+        active = [item for item in candidates if item.get("id") not in inactive]
+        if len(active) != 1:
+            raise ControllerError("approval lineage is missing or ambiguous")
+        approval = active[0]
+        evidence = approval.get("evidence")
+        if not isinstance(evidence, list):
+            raise ControllerError("approval lineage has invalid evidence")
+        self._validate_refs(evidence)
+        digest = _hash(_inside(self.root, target)) if _inside(self.root, target).is_file() else None
+        matching = [ref for ref in evidence if ref.get("path") == target and ref.get("sha256") == digest]
+        if len(matching) != 1:
+            raise ControllerError("approval does not bind the current authoritative artifact")
+        return approval
+
+    def _require_active_approval(self, state: dict[str, Any], gate: str) -> None:
+        self._active_approval(state, gate)
 
     def _validate_refs(self, refs: list[dict[str, Any]]) -> None:
         seen: dict[str, str] = {}
@@ -269,41 +331,88 @@ class Controller:
             return "WAVE_START_AUTHORIZATION"
         return GATES.get(state["lifecycle_state"])
 
-    def record_authority(self, gate: str, decision: str, actor: str,
-                         evidence: list[dict[str, Any]], authority_wave_id: str | None = None) -> dict[str, Any]:
-        """Persist one exact human decision; this never advances a lifecycle itself."""
+    def _record_decision(self, operation: str, gate: str, actor: str, evidence: list[dict[str, Any]],
+                         authority_wave_id: str | None, target: str | None = None) -> dict[str, Any]:
         state = self.load()
         if authority_wave_id != self.wave_id:
             raise ControllerError("authority wave does not match controller wave")
-        if decision != "APPROVE":
-            raise ControllerError("authority decision is unsupported")
         if not isinstance(actor, str) or not actor.strip():
             raise ControllerError("authority actor is required")
-        if not isinstance(evidence, list) or not evidence:
+        if operation in {"APPROVE", "AUTHORIZE", "SUPERSEDE"} and (not isinstance(evidence, list) or not evidence):
             raise ControllerError("authority evidence is required")
+        evidence = evidence or []
         self._validate_refs(evidence)
-        proposed = {"status": "SATISFIED", "reason": gate, "decision": decision,
-                    "actor": actor, "recorded_at": _now(), "evidence": evidence}
-        existing = state["human_gate"]
-        if existing.get("status") == "SATISFIED":
-            comparable = ("reason", "decision", "actor", "evidence")
-            if all(existing.get(key) == proposed.get(key) for key in comparable):
-                return {"status": "IDEMPOTENT", "wave_id": self.wave_id, "gate": gate}
-            raise ControllerError("conflicting authority replay")
-        expected_gate = self._open_gate(state)
-        if expected_gate != gate:
-            raise ControllerError("authority gate is not currently open")
-        state["human_gate"] = proposed
-        # Task-set registration is the first permitted operation after this
-        # gate.  Advance the existing gate transition here so the public
-        # record-authority -> register-tasks sequence needs neither a task
-        # selection attempt nor a manual reconciliation step.
-        if gate == "TASK_PLAN_APPROVAL":
-            state["lifecycle_state"] = "TASK_EXECUTION_REQUIRED"
-            self._persist(state, "AWAITING_TASK_PLAN_APPROVAL->TASK_EXECUTION_REQUIRED")
+        prior = [item for item in state.get("governance_decisions", [])
+                 if item.get("operation") == operation and item.get("gate") == gate
+                 and item.get("actor") == actor and item.get("evidence") == evidence and item.get("target") == target]
+        if prior:
+            return {"status": "IDEMPOTENT", "wave_id": self.wave_id, "gate": gate, "decision_id": prior[0]["id"]}
+        if operation == "AUTHORIZE":
+            if gate != "WAVE_START_AUTHORIZATION" or self._open_gate(state) != gate:
+                raise ControllerError("authorization gate is not currently open")
+        elif operation == "APPROVE":
+            if gate not in APPROVAL_GATES or self._open_gate(state) != gate:
+                raise ControllerError("approval gate is not currently open")
+            expected = self._approval_target(gate)
+            if not any(ref.get("path") == expected for ref in evidence):
+                raise ControllerError("approval evidence has wrong authoritative artifact path")
+        elif operation in {"REVOKE", "SUPERSEDE"}:
+            if gate not in APPROVAL_GATES or not target:
+                raise ControllerError("revocation or supersession target is required")
+            old = next((item for item in state.get("governance_decisions", []) if item.get("id") == target), None)
+            if not old or old.get("operation") != "APPROVE" or old.get("gate") != gate:
+                raise ControllerError("governance target is invalid")
+            if operation == "SUPERSEDE":
+                expected = self._approval_target(gate)
+                if not any(ref.get("path") == expected for ref in evidence):
+                    raise ControllerError("superseding approval has wrong authoritative artifact path")
         else:
-            self._persist(state, f"AUTHORITY:{gate}")
-        return {"status": "RECORDED", "wave_id": self.wave_id, "gate": gate}
+            raise ControllerError("governance operation is unsupported")
+        identifier = self._decision_id(operation, gate, actor, evidence, target)
+        history = state.setdefault("governance_decisions", [])
+        existing = next((item for item in history if item.get("id") == identifier), None)
+        if existing:
+            return {"status": "IDEMPOTENT", "wave_id": self.wave_id, "gate": gate, "decision_id": identifier}
+        record = {"id": identifier, "operation": operation, "gate": gate, "wave_id": self.wave_id,
+                  "actor": actor, "evidence": evidence, "target": target, "recorded_at": _now()}
+        if operation == "SUPERSEDE":
+            replacement_id = self._decision_id("APPROVE", gate, actor, evidence, identifier)
+            record["replacement"] = replacement_id
+            history.append({"id": replacement_id, "operation": "APPROVE", "gate": gate, "wave_id": self.wave_id,
+                            "actor": actor, "evidence": evidence, "supersedes": target, "recorded_at": _now()})
+        history.append(record)
+        if operation in {"AUTHORIZE", "APPROVE"}:
+            state["human_gate"] = {"status": "SATISFIED", "reason": gate, "decision": operation,
+                                   "actor": actor, "recorded_at": _now(), "evidence": evidence}
+            if gate == "TASK_PLAN_APPROVAL":
+                state["lifecycle_state"] = "TASK_EXECUTION_REQUIRED"
+        elif operation == "REVOKE":
+            state["human_gate"] = {"status": "NOT_APPLICABLE", "reason": "", "evidence": []}
+        self._persist(state, f"GOVERNANCE:{operation}:{gate}")
+        return {"status": "RECORDED", "wave_id": self.wave_id, "gate": gate, "decision_id": identifier}
+
+    def approve(self, gate: str, actor: str, evidence: list[dict[str, Any]], authority_wave_id: str | None = None) -> dict[str, Any]:
+        return self._record_decision("APPROVE", gate, actor, evidence, authority_wave_id)
+
+    def authorize(self, gate: str, actor: str, evidence: list[dict[str, Any]], authority_wave_id: str | None = None) -> dict[str, Any]:
+        return self._record_decision("AUTHORIZE", gate, actor, evidence, authority_wave_id)
+
+    def revoke(self, gate: str, actor: str, target: str, authority_wave_id: str | None = None) -> dict[str, Any]:
+        return self._record_decision("REVOKE", gate, actor, [], authority_wave_id, target)
+
+    def supersede(self, gate: str, actor: str, evidence: list[dict[str, Any]], target: str,
+                  authority_wave_id: str | None = None) -> dict[str, Any]:
+        return self._record_decision("SUPERSEDE", gate, actor, evidence, authority_wave_id, target)
+
+    def record_authority(self, gate: str, decision: str, actor: str, evidence: list[dict[str, Any]], authority_wave_id: str | None = None) -> dict[str, Any]:
+        """Compatibility shim; typed public operations are the semantic API."""
+        if decision == "APPROVE":
+            if gate == "WAVE_START_AUTHORIZATION":
+                return self.authorize(gate, actor, evidence, authority_wave_id)
+            return self.approve(gate, actor, evidence, authority_wave_id)
+        if decision == "AUTHORIZE":
+            return self.authorize(gate, actor, evidence, authority_wave_id)
+        raise ControllerError("authority decision is unsupported; use typed governance operation")
 
     def _task_plan_path(self) -> str:
         return f"tasks/{self.wave_id}/TASKS.md"
@@ -357,16 +466,15 @@ class Controller:
         state = self.load()
         if state["lifecycle_state"] != "TASK_EXECUTION_REQUIRED" or state.get("active_operation"):
             raise ControllerError("task registration is not permitted in the current lifecycle state")
-        gate = state["human_gate"]
-        if gate.get("status") != "SATISFIED" or gate.get("reason") != "TASK_PLAN_APPROVAL":
-            raise ControllerError("approved task plan authority is required before registration")
+        try:
+            self._require_active_approval(state, "TASK_PLAN_APPROVAL")
+        except ControllerError as exc:
+            raise ControllerError(f"approved task plan authority is required before registration: {exc}") from exc
         relative_path = self._task_plan_path()
         plan = _inside(self.root, relative_path)
         if not plan.is_file():
             raise ControllerError("approved TASKS.md is missing")
         digest = _hash(plan)
-        if not any(ref.get("path") == relative_path and ref.get("sha256") == digest for ref in gate["evidence"]):
-            raise ControllerError("TASKS.md does not match approved task plan authority")
         tasks = self._parse_task_plan(plan)
         registration = {"path": relative_path, "sha256": digest}
         existing = state.get("task_plan")
@@ -403,13 +511,31 @@ class Controller:
             return {"status": "BLOCKED", "wave_id": self.wave_id, "reason": "operation is active"}
         lifecycle = state["lifecycle_state"]
         if lifecycle == "WAVE_AUTHORIZED":
-            if state["human_gate"]["status"] != "SATISFIED": return {"status": "HUMAN_ACTION", "gate": "WAVE_START_AUTHORIZATION"}
+            authorizations = [item for item in state.get("governance_decisions", [])
+                              if item.get("operation") == "AUTHORIZE" and item.get("gate") == "WAVE_START_AUTHORIZATION"
+                              and item.get("wave_id") == self.wave_id]
+            legacy = state["human_gate"]
+            if not authorizations and not (legacy.get("status") == "SATISFIED" and legacy.get("reason") == "WAVE_START_AUTHORIZATION"):
+                return {"status": "HUMAN_ACTION", "gate": "WAVE_START_AUTHORIZATION"}
+            if len(authorizations) > 1:
+                return self._attention(state, "wave-start authorization is ambiguous")
             state["lifecycle_state"] = "TECHSPEC_REQUIRED"; self._persist(state, "WAVE_AUTHORIZED->TECHSPEC_REQUIRED"); lifecycle = "TECHSPEC_REQUIRED"
         if lifecycle in GATES:
-            if state["human_gate"]["status"] != "SATISFIED": return {"status": "HUMAN_ACTION", "gate": GATES[lifecycle], "wave_id": self.wave_id}
+            gate = GATES[lifecycle]
+            try:
+                self._require_active_approval(state, gate)
+            except ControllerError as exc:
+                if state["human_gate"].get("status") != "SATISFIED":
+                    return {"status": "HUMAN_ACTION", "gate": gate, "wave_id": self.wave_id}
+                return self._attention(state, str(exc))
             target = "TASK_PLAN_REQUIRED" if lifecycle == "AWAITING_TECHSPEC_APPROVAL" else "TASK_EXECUTION_REQUIRED"
             state["lifecycle_state"] = target; self._persist(state, f"{lifecycle}->{target}"); return self.next()
+        if lifecycle == "TASK_PLAN_REQUIRED":
+            try: self._require_active_approval(state, "TECHSPEC_APPROVAL")
+            except ControllerError as exc: return self._attention(state, str(exc))
         if lifecycle == "TASK_EXECUTION_REQUIRED":
+            try: self._require_active_approval(state, "TASK_PLAN_APPROVAL")
+            except ControllerError as exc: return self._attention(state, str(exc))
             task = self._task_to_run(state)
             if task is None:
                 if state.get("tasks") and all(t.get("status") == "PASS" for t in state["tasks"]):
@@ -458,6 +584,13 @@ class Controller:
         action = self.next()
         if action["status"] != "ACTION_REQUIRED": return action
         state = self.load()
+        # Recheck the proposition after next() and immediately before the
+        # writer lease is persisted; a prior handoff is never authority.
+        try:
+            if action["role"] == "Planner": self._require_active_approval(state, "TECHSPEC_APPROVAL")
+            if action["role"] == "Developer": self._require_active_approval(state, "TASK_PLAN_APPROVAL")
+        except ControllerError as exc:
+            return self._attention(state, str(exc))
         op_id = operation_id or str(uuid.uuid4())
         state["checkout_identity"] = action["handoff"]["checkout_identity"]
         state["active_operation"] = {"id": op_id, "role": action["role"], "child_task_name": child_task_name,

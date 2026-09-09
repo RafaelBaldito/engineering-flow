@@ -89,8 +89,8 @@ feature
 -> conditional architecture overview -> approval when required
 -> Wave start authorization
 -> per-Wave TECHSPEC -> approval
--> task planning -> approval
--> task execute/review/fix loops
+-> task planning (permitted by exact TECHSPEC approval) -> approval
+-> task registration and task execute/review/fix loops (permitted by exact task-plan approval)
 -> Wave review/remediation routing -> Wave acceptance
 -> explicit next-Wave authorization -> subsequent Wave(s)
 -> after all included Waves are accepted: release final-review/remediation
@@ -103,6 +103,22 @@ Task acceptance, Wave acceptance, release acceptance, next-Wave authorization,
 delivery authorization, and final workflow completion are separate facts.
 Runtime/product final validation is a quality capability and is not
 release-level `final-review` or release acceptance.
+
+### 3.1 Approval and authorization semantics
+
+`APPROVE` accepts the exact active, stage-correct, hash-bound authoritative
+artifact as a stage result and permits its defined canonical successor under
+existing policy. In particular, TECHSPEC approval permits canonical task-plan
+creation, and task-plan approval permits task registration and the bounded
+autonomous execute/review/fix loop. Neither requires a separate task-planning
+or task-execution authorization.
+
+`AUTHORIZE` permits a new scope, non-canonical transition, external side effect,
+or other action not implied by canonical predecessor acceptance. It remains
+required to start each independently bounded Wave, including every later Wave;
+for delivery after release acceptance; for scope/spec changes; for exceptional
+intervention or remediation; and at policy-defined high-risk boundaries. A
+Wave-review PASS accepts that Wave but does not authorize the next Wave.
 
 ## 4. Consequences and Protected Evidence
 
@@ -137,6 +153,9 @@ release-level `final-review` or release acceptance.
   review, remediation cycles, and task acceptance mechanics.
 - A Wave PASS does not authorize another Wave; release PASS does not authorize
   external delivery; delivery authorization does not itself create release PASS.
+- TECHSPEC approval permits canonical task planning, and task-plan approval
+  permits task registration and the bounded autonomous task loop. No separate
+  task-planning or task-execution authorization is a normal human gate.
 - Wave 4 performs no delivery side effect without active, exact, persisted
   release acceptance and delivery authorization, and never merges.
 - Historical artifacts remain readable and valid only for their recorded

@@ -57,6 +57,12 @@ class WaveControllerTests(unittest.TestCase):
                   human_gate={"status": "SATISFIED", "reason": "TASK_PLAN_APPROVAL", "evidence": [evidence]})
         return evidence
 
+    def active_task_plan_approval(self):
+        """Supply a legacy-compatible exact approval for mechanics-only states."""
+        evidence = self.approved_task_plan()
+        self.save(human_gate={"status": "SATISFIED", "reason": "TASK_PLAN_APPROVAL", "evidence": [evidence]})
+        return evidence
+
     def prepare_wave_review(self):
         """Create a registered plan with Controller-validated PASS receipts."""
         self.controller.save(self.controller.initial("fixture", "Fixture"))
@@ -88,7 +94,7 @@ class WaveControllerTests(unittest.TestCase):
         with self.assertRaises(ControllerError): self.controller.load()
 
     def test_allowed_and_invalid_lifecycle_transition(self):
-        self.save(human_gate={"status": "SATISFIED", "reason": "", "evidence": [self.authority()]})
+        self.save(human_gate={"status": "SATISFIED", "reason": "WAVE_START_AUTHORIZATION", "evidence": [self.authority()]})
         self.assertEqual("ACTION_REQUIRED", self.controller.next()["status"])
         self.assertEqual("TECHSPEC_REQUIRED", self.controller.load()["lifecycle_state"])
         state = self.controller.load(); state["lifecycle_state"] = "NOPE"
@@ -106,6 +112,7 @@ class WaveControllerTests(unittest.TestCase):
         self.controller.save(changed); self.assertEqual("TECHSPEC_REQUIRED", self.controller.load()["lifecycle_state"])
 
     def test_writer_lease_acquire_reject_unknown_and_valid_release(self):
+        self.active_task_plan_approval()
         self.save(lifecycle_state="TASK_EXECUTION_REQUIRED", tasks=[{"id": "TASK-001", "status": "PENDING", "dependencies": []}])
         acquired = self.controller.begin_operation("op-1")
         self.assertEqual("ACQUIRED", acquired["status"])
@@ -273,6 +280,7 @@ class WaveControllerTests(unittest.TestCase):
                 "recorded_at": "2026-01-01T00:00:00Z"}
 
     def test_selected_task_is_durable_across_restart_and_operation(self):
+        self.active_task_plan_approval()
         self.save(lifecycle_state="TASK_EXECUTION_REQUIRED", tasks=[
             {"id": "TASK-A", "status": "PENDING", "dependencies": []},
             {"id": "TASK-B", "status": "PENDING", "dependencies": []},
@@ -373,6 +381,7 @@ class WaveControllerTests(unittest.TestCase):
         self.assertEqual("SATISFIED", Controller(self.root, "fixture").load()["human_gate"]["status"])
 
     def test_stale_and_invalid_envelopes_do_not_advance(self):
+        self.active_task_plan_approval()
         self.save(lifecycle_state="TASK_EXECUTION_REQUIRED", tasks=[{"id": "TASK-001", "status": "PENDING", "dependencies": []}])
         self.controller.begin_operation("old")
         old_identity = self.controller.load()["active_operation"]["input_identity"]
@@ -396,6 +405,7 @@ class WaveControllerTests(unittest.TestCase):
         self.assertEqual("HUMAN_ATTENTION", self.controller.complete_operation(result)["status"])
 
     def test_reconcile_completed_evidence_and_ambiguous_writer(self):
+        self.active_task_plan_approval()
         self.save(lifecycle_state="TASK_EXECUTION_REQUIRED", tasks=[{"id": "TASK-001", "status": "PENDING", "dependencies": []}])
         self.controller.begin_operation("recover")
         state = self.controller.load(); state["last_result_envelope"] = self.envelope("Developer", "recover"); self.controller.save(state)
@@ -418,6 +428,56 @@ class WaveControllerTests(unittest.TestCase):
         self.controller.save(state); artifact.write_text("two")
         self.assertEqual("HUMAN_ATTENTION", self.controller.reconcile()["status"])
 
+    def techspec_awaiting_approval(self):
+        path = self.root / "docs" / "waves" / "fixture" / "TECHSPEC.md"
+        path.parent.mkdir(parents=True, exist_ok=True); path.write_text("# Fixture techspec\n")
+        evidence = {"path": "docs/waves/fixture/TECHSPEC.md", "sha256": hashlib.sha256(path.read_bytes()).hexdigest(), "purpose": "techspec"}
+        self.save(lifecycle_state="AWAITING_TECHSPEC_APPROVAL",
+                  human_gate={"status": "OPEN", "reason": "TECHSPEC_APPROVAL", "evidence": []})
+        return path, evidence
+
+    def test_techspec_lineage_guards_and_supersession(self):
+        path, evidence = self.techspec_awaiting_approval()
+        first = self.controller.approve("TECHSPEC_APPROVAL", "human", [evidence], "fixture")
+        self.assertEqual("IDEMPOTENT", self.controller.approve("TECHSPEC_APPROVAL", "human", [evidence], "fixture")["status"])
+        self.assertEqual("Planner", self.controller.next()["role"])  # no planning authorization
+        supersession = self.controller.supersede("TECHSPEC_APPROVAL", "human", [evidence], first["decision_id"], "fixture")
+        self.assertEqual("RECORDED", supersession["status"])
+        self.assertEqual("Planner", Controller(self.root, "fixture").next()["role"])
+        replacement = next(item["replacement"] for item in self.controller.load()["governance_decisions"] if item["id"] == supersession["decision_id"])
+        self.assertEqual("RECORDED", self.controller.revoke("TECHSPEC_APPROVAL", "human", replacement, "fixture")["status"])
+        self.assertEqual("HUMAN_ATTENTION", self.controller.next()["status"])
+        # Exact bytes are rechecked, not only the persisted evidence record.
+        self.controller.save(self.controller.initial("fixture", "Fixture", "TASK_PLAN_REQUIRED"))
+        self.controller.save({**self.controller.load(), "governance_decisions": [{"id": "one", "operation": "APPROVE", "gate": "TECHSPEC_APPROVAL", "wave_id": "fixture", "actor": "human", "evidence": [evidence]}]})
+        path.write_text("changed\n")
+        self.assertEqual("HUMAN_ATTENTION", self.controller.next()["status"])
+
+    def test_techspec_missing_wrong_path_scope_and_race_block_acquisition(self):
+        _, evidence = self.techspec_awaiting_approval()
+        self.assertEqual("HUMAN_ACTION", self.controller.next()["status"])
+        wrong = self.authority()
+        with self.assertRaisesRegex(ControllerError, "path"):
+            self.controller.approve("TECHSPEC_APPROVAL", "human", [wrong], "fixture")
+        with self.assertRaisesRegex(ControllerError, "wave"):
+            self.controller.approve("TECHSPEC_APPROVAL", "human", [evidence], "other")
+        decision = self.controller.approve("TECHSPEC_APPROVAL", "human", [evidence], "fixture")
+        self.assertEqual("Planner", self.controller.next()["role"])
+        self.controller.revoke("TECHSPEC_APPROVAL", "human", decision["decision_id"], "fixture")
+        self.assertEqual("HUMAN_ATTENTION", self.controller.begin_operation("race")["status"])
+        self.assertIsNone(self.controller.load()["active_operation"])
+
+    def test_task_plan_lineage_guards_dispatch_recovery_and_revocation(self):
+        evidence = self.approved_task_plan()
+        self.save(lifecycle_state="AWAITING_TASK_PLAN_APPROVAL",
+                  human_gate={"status": "OPEN", "reason": "TASK_PLAN_APPROVAL", "evidence": []})
+        approval = self.controller.approve("TASK_PLAN_APPROVAL", "human", [evidence], "fixture")
+        self.assertEqual("REGISTERED", self.controller.register_tasks()["status"])
+        self.assertEqual("Developer", Controller(self.root, "fixture").next()["role"])
+        self.assertEqual("RECORDED", self.controller.revoke("TASK_PLAN_APPROVAL", "human", approval["decision_id"], "fixture")["status"])
+        self.assertEqual("HUMAN_ATTENTION", Controller(self.root, "fixture").reconcile()["status"])
+        self.assertIsNone(self.controller.load()["active_operation"])
+
     def test_reviewer_pass_routes_next_task_then_wave_review(self):
         self.save(lifecycle_state="TASK_REVIEW_REQUIRED", current_task_id="TASK-001", tasks=[{"id":"TASK-001", "status":"PENDING", "dependencies":[]}])
         self.controller.begin_operation("review")
@@ -436,6 +496,7 @@ class WaveControllerTests(unittest.TestCase):
         with self.assertRaises(ControllerError): self.controller.save(state)
 
     def test_dependency_readiness_and_wave_acceptance(self):
+        self.active_task_plan_approval()
         self.save(lifecycle_state="TASK_EXECUTION_REQUIRED", tasks=[
             {"id":"TASK-001", "status":"PASS", "dependencies":[]},
             {"id":"TASK-002", "status":"PENDING", "dependencies":["TASK-001"]},

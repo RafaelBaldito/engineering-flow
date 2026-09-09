@@ -18,6 +18,13 @@ def main() -> int:
     authority.add_argument("--gate", required=True); authority.add_argument("--decision", required=True)
     authority.add_argument("--actor", required=True); authority.add_argument("--evidence", required=True, help="path to JSON evidence list")
     authority.add_argument("--authority-wave", required=True)
+    for name in ("approve", "authorize", "revoke", "supersede"):
+        command = sub.add_parser(name)
+        command.add_argument("--gate", required=True); command.add_argument("--actor", required=True)
+        command.add_argument("--authority-wave", required=True)
+        if name in {"approve", "supersede"}:
+            command.add_argument("--evidence", required=True, help="path to JSON evidence list")
+        if name in {"revoke", "supersede"}: command.add_argument("--target", required=True)
     args = parser.parse_args(); controller = Controller(Path(args.root), args.wave)
     try:
         if args.command == "status": result = controller.status()
@@ -26,8 +33,12 @@ def main() -> int:
         elif args.command == "register-tasks": result = controller.register_tasks()
         elif args.command == "begin-operation": result = controller.begin_operation(args.operation_id, args.child_task_name)
         elif args.command == "complete-operation": result = controller.complete_operation(json.loads(Path(args.envelope).read_text(encoding="utf-8")))
-        else: result = controller.record_authority(args.gate, args.decision, args.actor,
-                                                    json.loads(Path(args.evidence).read_text(encoding="utf-8")), args.authority_wave)
+        elif args.command == "record-authority": result = controller.record_authority(args.gate, args.decision, args.actor,
+                                                                                         json.loads(Path(args.evidence).read_text(encoding="utf-8")), args.authority_wave)
+        elif args.command == "approve": result = controller.approve(args.gate, args.actor, json.loads(Path(args.evidence).read_text(encoding="utf-8")), args.authority_wave)
+        elif args.command == "authorize": result = controller.authorize(args.gate, args.actor, json.loads(Path(args.evidence).read_text(encoding="utf-8")), args.authority_wave)
+        elif args.command == "revoke": result = controller.revoke(args.gate, args.actor, args.target, args.authority_wave)
+        else: result = controller.supersede(args.gate, args.actor, json.loads(Path(args.evidence).read_text(encoding="utf-8")), args.target, args.authority_wave)
     except (ControllerError, OSError, json.JSONDecodeError) as exc: result = {"status": "INVALID", "reason": str(exc)}
     print(json.dumps(result, sort_keys=True)); return 0
 
