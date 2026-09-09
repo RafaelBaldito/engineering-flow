@@ -203,6 +203,65 @@ class WaveControllerTests(unittest.TestCase):
             self.controller.record_authority("TECHSPEC_APPROVAL", "APPROVE", "human", [evidence], "fixture")
         self.assertEqual("AWAITING_TASK_PLAN_APPROVAL", self.controller.load()["lifecycle_state"])
 
+    def test_pending_techspec_approval_derives_evidence_and_never_dispatches_planner(self):
+        path, _ = self.techspec_awaiting_approval()
+        outcome = self.controller.approve_pending_human_gate("human@example")
+        self.assertEqual("RECORDED", outcome["status"])
+        self.assertEqual("TASK_PLAN_REQUIRED", outcome["successor_state"])
+        state = self.controller.load()
+        decision = state["governance_decisions"][-1]
+        self.assertEqual("TECHSPEC_APPROVAL", decision["gate"])
+        self.assertEqual([{"path": "docs/waves/fixture/TECHSPEC.md",
+                           "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                           "purpose": "human-approved TECHSPEC_APPROVAL"}], decision["evidence"])
+        self.assertIsNone(state["active_operation"])
+        self.assertEqual([], state["tasks"])
+        self.assertEqual("IDEMPOTENT", self.controller.approve_pending_human_gate("human@example")["status"])
+
+    def test_pending_task_plan_approval_registers_without_selecting_or_dispatching(self):
+        plan = self.approved_task_plan()
+        self.save(lifecycle_state="AWAITING_TASK_PLAN_APPROVAL",
+                  human_gate={"status": "OPEN", "reason": "TASK_PLAN_APPROVAL", "evidence": []})
+        outcome = self.controller.approve_pending_human_gate("human@example")
+        self.assertEqual("RECORDED", outcome["status"])
+        self.assertEqual("REGISTERED", outcome["registration"]["status"])
+        state = self.controller.load()
+        self.assertEqual("TASK_EXECUTION_REQUIRED", state["lifecycle_state"])
+        self.assertIsNone(state["active_operation"])
+        self.assertIsNone(state["current_task_id"])
+        self.assertEqual(["TASK-A", "TASK-B"], [task["id"] for task in state["tasks"]])
+        evidence = state["governance_decisions"][-1]["evidence"]
+        self.assertEqual("tasks/fixture/TASKS.md", evidence[0]["path"])
+        self.assertEqual(plan["sha256"], evidence[0]["sha256"])
+        replay = self.controller.approve_pending_human_gate("human@example")
+        self.assertEqual("IDEMPOTENT", replay["status"])
+        self.assertEqual("IDEMPOTENT", replay["registration"]["status"])
+
+    def test_pending_approval_cli_is_narrow_and_generic_cli_remains_compatible(self):
+        self.techspec_awaiting_approval()
+        command = [sys.executable, "-m", "tools.wave_controller.cli", "--root", str(self.root), "--wave", "fixture",
+                   "approve-pending", "--actor", "human@example"]
+        result = subprocess.run(command, cwd=Path(__file__).parents[2], check=True, capture_output=True, text=True)
+        self.assertEqual("RECORDED", json.loads(result.stdout)["status"])
+        rejected = subprocess.run(command + ["--gate", "TASK_PLAN_APPROVAL"], cwd=Path(__file__).parents[2], capture_output=True, text=True)
+        self.assertNotEqual(0, rejected.returncode)
+
+    def test_pending_task_plan_recovery_drift_and_invalid_states_fail_closed(self):
+        self.approved_task_plan()
+        self.save(lifecycle_state="AWAITING_TASK_PLAN_APPROVAL",
+                  human_gate={"status": "OPEN", "reason": "TASK_PLAN_APPROVAL", "evidence": []})
+        with patch.object(self.controller, "register_tasks", side_effect=InterruptedError("between writes")):
+            with self.assertRaises(InterruptedError):
+                self.controller.approve_pending_human_gate("human@example")
+        self.assertEqual("TASK_EXECUTION_REQUIRED", self.controller.load()["lifecycle_state"])
+        self.assertEqual("REGISTERED", self.controller.approve_pending_human_gate("human@example")["registration"]["status"])
+        (self.root / "tasks" / "fixture" / "TASKS.md").write_text("changed\n")
+        with self.assertRaisesRegex(ControllerError, "hash mismatch"):
+            self.controller.approve_pending_human_gate("human@example")
+        self.controller.save(self.controller.initial("fixture", "Fixture"))
+        with self.assertRaisesRegex(ControllerError, "no supported"):
+            self.controller.approve_pending_human_gate("human@example")
+
     def test_register_tasks_persists_authoritative_order_and_cli_is_public(self):
         self.ready_for_registration()
         result = subprocess.run([

@@ -9,7 +9,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from tools.wave_controller.core import Controller
-from tools.wave_controller.host import ROLE_POLICIES, build_command, build_prompt, run_codex, run_task_loop
+from tools.wave_controller.host import ROLE_POLICIES, approve_confirmed_human_gate, build_command, build_prompt, run_codex, run_task_loop
 
 
 class _Process:
@@ -101,3 +101,8 @@ class HostTests(unittest.TestCase):
         self.controller.save({**self.controller.load(), "lifecycle_state":"HUMAN_ATTENTION"})
         self.assertEqual("HUMAN_ATTENTION", run_task_loop(self.controller, runner=lambda *_: self.fail("run"))["status"])
 
+    def test_confirmed_human_adapter_only_forwards_the_explicit_signal_and_never_runs_tasks(self):
+        with patch.object(self.controller, "approve_pending_human_gate", return_value={"status": "RECORDED"}) as approve:
+            self.assertEqual("RECORDED", approve_confirmed_human_gate(self.controller, "human@example")["status"])
+        approve.assert_called_once_with("human@example")
+        self.assertIsNone(self.controller.load()["active_operation"])

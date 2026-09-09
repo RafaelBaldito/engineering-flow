@@ -12,6 +12,8 @@ def main() -> int:
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("status"); sub.add_parser("reconcile"); sub.add_parser("next")
     sub.add_parser("register-tasks")
+    pending = sub.add_parser("approve-pending")
+    pending.add_argument("--actor", required=True)
     run = sub.add_parser("run-tasks")
     run.add_argument("--timeout", type=float, default=900.0)
     begin = sub.add_parser("begin-operation"); begin.add_argument("--operation-id"); begin.add_argument("--child-task-name")
@@ -33,6 +35,7 @@ def main() -> int:
         elif args.command == "reconcile": result = controller.reconcile()
         elif args.command == "next": result = controller.next()
         elif args.command == "register-tasks": result = controller.register_tasks()
+        elif args.command == "approve-pending": result = controller.approve_pending_human_gate(args.actor)
         elif args.command == "run-tasks":
             from .host import run_task_loop
             result = run_task_loop(controller, timeout=args.timeout)

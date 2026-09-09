@@ -31,6 +31,17 @@ ROLE_POLICIES = {
 }
 
 
+def approve_confirmed_human_gate(controller: Controller, actor: str) -> dict[str, Any]:
+    """Adapt an already-confirmed human approval to the Controller handoff.
+
+    The conversational Host calls this only after it has presented one known
+    pending gate and received an unambiguous affirmative response.  No prose
+    is interpreted here and no approval state is retained outside the control
+    record.
+    """
+    return controller.approve_pending_human_gate(actor)
+
+
 def _now() -> str:
     return datetime.now(UTC).isoformat().replace("+00:00", "Z")
 

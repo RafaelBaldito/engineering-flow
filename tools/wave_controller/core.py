@@ -394,6 +394,65 @@ class Controller:
     def approve(self, gate: str, actor: str, evidence: list[dict[str, Any]], authority_wave_id: str | None = None) -> dict[str, Any]:
         return self._record_decision("APPROVE", gate, actor, evidence, authority_wave_id)
 
+    def _pending_approval_evidence(self, gate: str) -> list[dict[str, Any]]:
+        """Build the sole permitted evidence for a pending human approval.
+
+        This deliberately has no caller-controlled artifact identity.  The
+        controller resolves the gate's allowlisted target and binds the bytes
+        that exist at the instant an explicit human decision is handed off.
+        """
+        target = self._approval_target(gate)
+        artifact = _inside(self.root, target)
+        if not artifact.is_file():
+            raise ControllerError(f"pending approval artifact is missing or not a file: {target}")
+        return [{"path": target, "sha256": _hash(artifact),
+                 "purpose": f"human-approved {gate}"}]
+
+    def approve_pending_human_gate(self, actor: str) -> dict[str, Any]:
+        """Persist one already-explicit approval for the Controller's open gate.
+
+        This is intentionally not a general governance API: callers provide
+        only the human actor.  It never selects an artifact, gate, digest, or
+        authority wave, and it never acquires or dispatches an operation.
+        """
+        state = self.load()
+        gate = GATES.get(state["lifecycle_state"])
+        if gate:
+            evidence = self._pending_approval_evidence(gate)
+            decision = self.approve(gate, actor, evidence, self.wave_id)
+            if gate == "TECHSPEC_APPROVAL":
+                # ``next`` supplies the established approval transition.  It
+                # may describe Planner work as the next action, but this method
+                # does not acquire it or invoke the Host dispatcher.
+                self.next()
+                return {"status": decision["status"], "wave_id": self.wave_id,
+                        "gate": gate, "decision": decision,
+                        "successor_state": self.load()["lifecycle_state"]}
+            registration = self.register_tasks()
+            return {"status": decision["status"], "wave_id": self.wave_id,
+                    "gate": gate, "decision": decision, "registration": registration,
+                    "successor_state": self.load()["lifecycle_state"]}
+
+        # Recover an interruption after either durable write boundary without
+        # treating a stale, revoked, or superseded decision as approval.
+        if state["lifecycle_state"] == "TASK_PLAN_REQUIRED":
+            approval = self._active_approval(state, "TECHSPEC_APPROVAL")
+            if approval.get("actor") != actor:
+                raise ControllerError("pending approval actor does not match the persisted decision")
+            return {"status": "IDEMPOTENT", "wave_id": self.wave_id,
+                    "gate": "TECHSPEC_APPROVAL", "decision": {"status": "IDEMPOTENT",
+                    "decision_id": approval["id"]}, "successor_state": state["lifecycle_state"]}
+        if state["lifecycle_state"] == "TASK_EXECUTION_REQUIRED":
+            approval = self._active_approval(state, "TASK_PLAN_APPROVAL")
+            if approval.get("actor") != actor:
+                raise ControllerError("pending approval actor does not match the persisted decision")
+            registration = self.register_tasks()
+            return {"status": "IDEMPOTENT", "wave_id": self.wave_id,
+                    "gate": "TASK_PLAN_APPROVAL", "decision": {"status": "IDEMPOTENT",
+                    "decision_id": approval["id"]}, "registration": registration,
+                    "successor_state": self.load()["lifecycle_state"]}
+        raise ControllerError("no supported pending human approval gate is open")
+
     def authorize(self, gate: str, actor: str, evidence: list[dict[str, Any]], authority_wave_id: str | None = None) -> dict[str, Any]:
         return self._record_decision("AUTHORIZE", gate, actor, evidence, authority_wave_id)
 
