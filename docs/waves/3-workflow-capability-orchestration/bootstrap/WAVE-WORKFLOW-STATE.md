@@ -153,20 +153,39 @@ Temporary deterministic bootstrap control record.
     "untracked_hash": "ed4534b0665a79d47ddf6a40e82ede861e7b1e6c427628945788054f97ce5b65"
   },
   "current_task_id": null,
+  "governance_decisions": [
+    {
+      "actor": "Rafael Alves",
+      "evidence": [
+        {
+          "path": "tasks/3-workflow-capability-orchestration/TASKS.md",
+          "purpose": "human-approved TASK_PLAN_APPROVAL",
+          "sha256": "a686ff9aa5bb60d7e6106d8c8579e711c835d12754f76c4e979344b1e68202e8"
+        }
+      ],
+      "gate": "TASK_PLAN_APPROVAL",
+      "id": "ad31d139ba56850243a6e7ca4a26f366cc83f2e08f9e1f2731b8006b051a3e14",
+      "operation": "APPROVE",
+      "recorded_at": "2026-09-10T11:56:50.519785Z",
+      "target": null,
+      "wave_id": "3-workflow-capability-orchestration"
+    }
+  ],
   "human_gate": {
-    "actor": "Human",
+    "actor": "Rafael Alves",
     "decision": "APPROVE",
     "evidence": [
       {
-        "path": "docs/waves/3-workflow-capability-orchestration/TECHSPEC.md",
-        "sha256": "fd8d41e549bfa6a4817492426d8133d31cc5944fee4436ada353c9fea26c655d"
+        "path": "tasks/3-workflow-capability-orchestration/TASKS.md",
+        "purpose": "human-approved TASK_PLAN_APPROVAL",
+        "sha256": "a686ff9aa5bb60d7e6106d8c8579e711c835d12754f76c4e979344b1e68202e8"
       }
     ],
-    "reason": "TECHSPEC_APPROVAL",
-    "recorded_at": "2026-09-08T22:21:27.454017Z",
+    "reason": "TASK_PLAN_APPROVAL",
+    "recorded_at": "2026-09-10T11:56:50.519822Z",
     "status": "SATISFIED"
   },
-  "last_completed_transition": "AWAITING_TECHSPEC_APPROVAL->TASK_PLAN_REQUIRED",
+  "last_completed_transition": "REGISTER_TASKS",
   "last_result_envelope": {
     "attempt": {
       "task_execution": 0,
@@ -468,12 +487,87 @@ Temporary deterministic bootstrap control record.
       }
     ]
   },
-  "lifecycle_state": "TASK_PLAN_REQUIRED",
+  "lifecycle_state": "TASK_EXECUTION_REQUIRED",
   "next_capability": null,
   "required_role": null,
   "schema_version": 1,
-  "tasks": [],
-  "updated_at": "2026-09-08T22:21:27.559744Z",
+  "supervised_completion": {
+    "artifact": {
+      "path": "tasks/3-workflow-capability-orchestration/TASKS.md",
+      "purpose": "supervised Planner completion",
+      "sha256": "a686ff9aa5bb60d7e6106d8c8579e711c835d12754f76c4e979344b1e68202e8"
+    },
+    "capability": "task-decomposition",
+    "recorded_at": "2026-09-10T11:56:09.388524Z",
+    "role": "Planner",
+    "skill": "create-tasks",
+    "state": "TASK_PLAN_REQUIRED"
+  },
+  "task_plan": {
+    "path": "tasks/3-workflow-capability-orchestration/TASKS.md",
+    "sha256": "a686ff9aa5bb60d7e6106d8c8579e711c835d12754f76c4e979344b1e68202e8"
+  },
+  "tasks": [
+    {
+      "dependencies": [],
+      "id": "TASK-001",
+      "status": "PENDING"
+    },
+    {
+      "dependencies": [
+        "TASK-001"
+      ],
+      "id": "TASK-002",
+      "status": "PENDING"
+    },
+    {
+      "dependencies": [
+        "TASK-001"
+      ],
+      "id": "TASK-003",
+      "status": "PENDING"
+    },
+    {
+      "dependencies": [
+        "TASK-001",
+        "TASK-002",
+        "TASK-003"
+      ],
+      "id": "TASK-004",
+      "status": "PENDING"
+    },
+    {
+      "dependencies": [
+        "TASK-003",
+        "TASK-004"
+      ],
+      "id": "TASK-005",
+      "status": "PENDING"
+    },
+    {
+      "dependencies": [
+        "TASK-002",
+        "TASK-003",
+        "TASK-004",
+        "TASK-005"
+      ],
+      "id": "TASK-006",
+      "status": "PENDING"
+    },
+    {
+      "dependencies": [
+        "TASK-001",
+        "TASK-002",
+        "TASK-003",
+        "TASK-004",
+        "TASK-005",
+        "TASK-006"
+      ],
+      "id": "TASK-007",
+      "status": "PENDING"
+    }
+  ],
+  "updated_at": "2026-09-10T11:56:50.526367Z",
   "updated_by": "python-wave-controller",
   "wave_id": "3-workflow-capability-orchestration",
   "wave_name": "Workflow Capability Orchestration",
