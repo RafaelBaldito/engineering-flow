@@ -12,6 +12,7 @@ def main() -> int:
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("status"); sub.add_parser("reconcile"); sub.add_parser("next")
     sub.add_parser("register-tasks")
+    sub.add_parser("report-supervised-completion")
     pending = sub.add_parser("approve-pending")
     pending.add_argument("--actor", required=True)
     run = sub.add_parser("run-tasks")
@@ -35,6 +36,7 @@ def main() -> int:
         elif args.command == "reconcile": result = controller.reconcile()
         elif args.command == "next": result = controller.next()
         elif args.command == "register-tasks": result = controller.register_tasks()
+        elif args.command == "report-supervised-completion": result = controller.report_supervised_capability_completion()
         elif args.command == "approve-pending": result = controller.approve_pending_human_gate(args.actor)
         elif args.command == "run-tasks":
             from .host import run_task_loop

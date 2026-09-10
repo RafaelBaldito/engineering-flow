@@ -117,6 +117,19 @@ class Controller:
         decisions = state.get("governance_decisions", [])
         if not isinstance(decisions, list) or any(not isinstance(item, dict) for item in decisions):
             raise ControllerError("governance decision history is invalid")
+        completion = state.get("supervised_completion")
+        if completion is not None:
+            if (not isinstance(completion, dict)
+                    or completion.get("role") != "Planner"
+                    or completion.get("capability") != "task-decomposition"
+                    or completion.get("skill") != "create-tasks"
+                    or completion.get("state") != "TASK_PLAN_REQUIRED"
+                    or not isinstance(completion.get("artifact"), dict)):
+                raise ControllerError("supervised completion record is invalid")
+            artifact = completion["artifact"]
+            if artifact.get("path") != self._task_plan_path():
+                raise ControllerError("supervised completion artifact identity is invalid")
+            self._validate_refs([artifact])
 
     def _approval_target(self, gate: str) -> str:
         if gate == "TECHSPEC_APPROVAL":
@@ -438,7 +451,7 @@ class Controller:
         if state["lifecycle_state"] == "TASK_PLAN_REQUIRED":
             approval = self._active_approval(state, "TECHSPEC_APPROVAL")
             if approval.get("actor") != actor:
-                raise ControllerError("pending approval actor does not match the persisted decision")
+                raise ControllerError("task-plan completion must be reported before task-plan approval")
             return {"status": "IDEMPOTENT", "wave_id": self.wave_id,
                     "gate": "TECHSPEC_APPROVAL", "decision": {"status": "IDEMPOTENT",
                     "decision_id": approval["id"]}, "successor_state": state["lifecycle_state"]}
@@ -452,6 +465,49 @@ class Controller:
                     "decision_id": approval["id"]}, "registration": registration,
                     "successor_state": self.load()["lifecycle_state"]}
         raise ControllerError("no supported pending human approval gate is open")
+
+    def report_supervised_capability_completion(self) -> dict[str, Any]:
+        """Record the one supported externally-run bootstrap capability.
+
+        This is an operator assertion that a capability already ran under
+        supervision, not an inference from a discovered file.  Its scope is
+        intentionally fixed to the currently required Planner/create-tasks
+        capability and this Wave's canonical task-plan artifact.
+        """
+        state = self.load()
+        expected = DISPATCH["TASK_PLAN_REQUIRED"]
+        if state["lifecycle_state"] == "AWAITING_TASK_PLAN_APPROVAL":
+            completion = state.get("supervised_completion")
+            if completion is None:
+                raise ControllerError("task-plan approval state lacks supervised completion record")
+            # ``load`` has already checked the exact canonical artifact/hash.
+            return {"status": "IDEMPOTENT", "wave_id": self.wave_id,
+                    "state": state["lifecycle_state"], "artifact": completion["artifact"]}
+        if state["lifecycle_state"] != "TASK_PLAN_REQUIRED" or state.get("active_operation"):
+            raise ControllerError("supervised completion is not permitted in the current lifecycle state")
+        try:
+            self._require_active_approval(state, "TECHSPEC_APPROVAL")
+        except ControllerError as exc:
+            raise ControllerError(f"active TECHSPEC approval is required before supervised Planner completion: {exc}") from exc
+        role, capability, skill, _ = expected
+        plan = _inside(self.root, self._task_plan_path())
+        if not plan.is_file():
+            raise ControllerError("supervised Planner completion artifact is missing")
+        # Parsing makes the expected canonical artifact meaningful and rejects
+        # wrong or incomplete Planner output before opening a human gate.
+        self._parse_task_plan(plan)
+        artifact = {"path": self._task_plan_path(), "sha256": _hash(plan),
+                    "purpose": "supervised Planner completion"}
+        state["supervised_completion"] = {
+            "role": role, "capability": capability, "skill": skill,
+            "state": "TASK_PLAN_REQUIRED", "artifact": artifact,
+            "recorded_at": _now(),
+        }
+        state["lifecycle_state"] = "AWAITING_TASK_PLAN_APPROVAL"
+        state["human_gate"] = {"status": "OPEN", "reason": "TASK_PLAN_APPROVAL", "evidence": []}
+        self._persist(state, "SUPERVISED_COMPLETE:Planner:create-tasks")
+        return {"status": "COMPLETED", "wave_id": self.wave_id,
+                "state": state["lifecycle_state"], "artifact": artifact}
 
     def authorize(self, gate: str, actor: str, evidence: list[dict[str, Any]], authority_wave_id: str | None = None) -> dict[str, Any]:
         return self._record_decision("AUTHORIZE", gate, actor, evidence, authority_wave_id)

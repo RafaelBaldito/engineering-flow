@@ -42,6 +42,11 @@ def approve_confirmed_human_gate(controller: Controller, actor: str) -> dict[str
     return controller.approve_pending_human_gate(actor)
 
 
+def report_confirmed_supervised_capability_completion(controller: Controller) -> dict[str, Any]:
+    """Adapt an operator's explicit supervised-completion report to Controller state."""
+    return controller.report_supervised_capability_completion()
+
+
 def _now() -> str:
     return datetime.now(UTC).isoformat().replace("+00:00", "Z")
 

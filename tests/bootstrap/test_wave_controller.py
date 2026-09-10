@@ -218,6 +218,63 @@ class WaveControllerTests(unittest.TestCase):
         self.assertEqual([], state["tasks"])
         self.assertEqual("IDEMPOTENT", self.controller.approve_pending_human_gate("human@example")["status"])
 
+    def test_supervised_planner_completion_requires_explicit_report_and_allows_new_task_plan_approver(self):
+        self.techspec_awaiting_approval()
+        self.controller.approve_pending_human_gate("Human")
+        plan = self.approved_task_plan()
+        # A discovered task plan remains only an artifact; it cannot open the
+        # next human gate or reinterpret a new approval as TECHSPEC recovery.
+        self.assertEqual("TASK_PLAN_REQUIRED", self.controller.load()["lifecycle_state"])
+        self.assertEqual("Planner", self.controller.next()["role"])
+        with self.assertRaisesRegex(ControllerError, "task-plan completion must be reported"):
+            self.controller.approve_pending_human_gate("Rafael Alves")
+        self.assertEqual("TASK_PLAN_REQUIRED", self.controller.load()["lifecycle_state"])
+
+        command = [sys.executable, "-m", "tools.wave_controller.cli", "--root", str(self.root), "--wave", "fixture",
+                   "report-supervised-completion"]
+        reported = json.loads(subprocess.run(command, cwd=Path(__file__).parents[2], check=True,
+                                               capture_output=True, text=True).stdout)
+        self.assertEqual("COMPLETED", reported["status"])
+        self.assertEqual(plan["sha256"], reported["artifact"]["sha256"])
+        self.assertEqual("AWAITING_TASK_PLAN_APPROVAL", self.controller.load()["lifecycle_state"])
+        self.assertEqual("IDEMPOTENT", self.controller.report_supervised_capability_completion()["status"])
+
+        approved = self.controller.approve_pending_human_gate("Rafael Alves")
+        self.assertEqual("RECORDED", approved["status"])
+        self.assertEqual("REGISTERED", approved["registration"]["status"])
+        state = self.controller.load()
+        self.assertEqual("TASK_EXECUTION_REQUIRED", state["lifecycle_state"])
+        self.assertIsNone(state["active_operation"])
+        self.assertIsNone(state["current_task_id"])
+        self.assertEqual("Human", next(item["actor"] for item in state["governance_decisions"] if item["gate"] == "TECHSPEC_APPROVAL"))
+        self.assertEqual("Rafael Alves", next(item["actor"] for item in state["governance_decisions"] if item["gate"] == "TASK_PLAN_APPROVAL"))
+
+    def test_supervised_planner_completion_missing_malformed_and_drifted_artifacts_fail_closed(self):
+        self.techspec_awaiting_approval()
+        self.controller.approve_pending_human_gate("Human")
+        with self.assertRaisesRegex(ControllerError, "artifact is missing"):
+            self.controller.report_supervised_capability_completion()
+        wrong = self.root / "elsewhere" / "TASKS.md"; wrong.parent.mkdir(); wrong.write_text("not canonical")
+        with self.assertRaisesRegex(ControllerError, "artifact is missing"):
+            self.controller.report_supervised_capability_completion()
+        self.approved_task_plan("not a task plan\n")
+        with self.assertRaisesRegex(ControllerError, "Execution Order"):
+            self.controller.report_supervised_capability_completion()
+        self.approved_task_plan()
+        self.controller.report_supervised_capability_completion()
+        (self.root / "tasks" / "fixture" / "TASKS.md").write_text("changed\n")
+        with self.assertRaisesRegex(ControllerError, "hash mismatch"):
+            self.controller.report_supervised_capability_completion()
+
+    def test_automated_planner_completion_path_remains_available(self):
+        self.techspec_awaiting_approval()
+        self.controller.approve_pending_human_gate("Human")
+        acquired = self.controller.begin_operation("planner")
+        self.assertEqual("ACQUIRED", acquired["status"])
+        self.assertEqual("Planner", acquired["handoff"]["required_role"])
+        self.assertEqual("COMPLETED", self.controller.complete_operation(self.envelope("Planner", "planner"))["status"])
+        self.assertEqual("AWAITING_TASK_PLAN_APPROVAL", self.controller.load()["lifecycle_state"])
+
     def test_pending_task_plan_approval_registers_without_selecting_or_dispatching(self):
         plan = self.approved_task_plan()
         self.save(lifecycle_state="AWAITING_TASK_PLAN_APPROVAL",

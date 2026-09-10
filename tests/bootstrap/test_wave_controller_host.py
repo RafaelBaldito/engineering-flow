@@ -9,7 +9,10 @@ from pathlib import Path
 from unittest.mock import patch
 
 from tools.wave_controller.core import Controller
-from tools.wave_controller.host import ROLE_POLICIES, approve_confirmed_human_gate, build_command, build_prompt, run_codex, run_task_loop
+from tools.wave_controller.host import (ROLE_POLICIES, approve_confirmed_human_gate,
+                                        build_command, build_prompt,
+                                        report_confirmed_supervised_capability_completion,
+                                        run_codex, run_task_loop)
 
 
 class _Process:
@@ -105,4 +108,10 @@ class HostTests(unittest.TestCase):
         with patch.object(self.controller, "approve_pending_human_gate", return_value={"status": "RECORDED"}) as approve:
             self.assertEqual("RECORDED", approve_confirmed_human_gate(self.controller, "human@example")["status"])
         approve.assert_called_once_with("human@example")
+        self.assertIsNone(self.controller.load()["active_operation"])
+
+    def test_supervised_completion_adapter_only_forwards_explicit_operator_report(self):
+        with patch.object(self.controller, "report_supervised_capability_completion", return_value={"status": "COMPLETED"}) as report:
+            self.assertEqual("COMPLETED", report_confirmed_supervised_capability_completion(self.controller)["status"])
+        report.assert_called_once_with()
         self.assertIsNone(self.controller.load()["active_operation"])
