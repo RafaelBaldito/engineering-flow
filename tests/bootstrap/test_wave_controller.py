@@ -125,6 +125,41 @@ class WaveControllerTests(unittest.TestCase):
         self.assertEqual("COMPLETED", self.controller.complete_operation(result)["status"])
         self.assertIsNone(self.controller.load()["active_operation"])
 
+    def test_interrupted_developer_recovery_is_exact_pending_and_idempotent(self):
+        self.ready_for_registration(); self.controller.register_tasks()
+        acquired = self.controller.begin_operation("lost-developer")
+        self.assertEqual("ACQUIRED", acquired["status"])
+        candidate = capture(self.root)["fingerprint"]
+        recovered = self.controller.recover_interrupted_developer(
+            "lost-developer", "TASK-A", "REVIEW_CANDIDATE", "operator@example", candidate)
+        self.assertEqual("RECOVERED", recovered["status"])
+        state = self.controller.load()
+        self.assertEqual("TASK_REVIEW_REQUIRED", state["lifecycle_state"])
+        self.assertIsNone(state["active_operation"])
+        self.assertEqual("PENDING", state["tasks"][0]["status"])
+        self.assertEqual(1, len(state["recovery_receipts"]))
+        self.assertEqual("IDEMPOTENT", self.controller.recover_interrupted_developer(
+            "lost-developer", "TASK-A", "REVIEW_CANDIDATE", "operator@example", candidate)["status"])
+        self.assertEqual("Reviewer", self.controller.next()["role"])
+
+    def test_interrupted_developer_recovery_rejects_identity_drift_and_existing_result(self):
+        self.ready_for_registration(); self.controller.register_tasks(); self.controller.begin_operation("lost")
+        candidate = capture(self.root)["fingerprint"]
+        with self.assertRaisesRegex(ControllerError, "does not match"):
+            self.controller.recover_interrupted_developer("other", "TASK-A", "REVIEW_CANDIDATE", "operator", candidate)
+        with self.assertRaisesRegex(ControllerError, "fingerprint"):
+            self.controller.recover_interrupted_developer("lost", "TASK-A", "REVIEW_CANDIDATE", "operator", "wrong")
+        state = self.controller.load(); state["last_result_envelope"] = {"operation_id": "lost"}; self.controller.save(state)
+        with self.assertRaisesRegex(ControllerError, "result envelope"):
+            self.controller.recover_interrupted_developer("lost", "TASK-A", "REVIEW_CANDIDATE", "operator", capture(self.root)["fingerprint"])
+        self.assertIsNotNone(self.controller.load()["active_operation"])
+
+    def test_interrupted_developer_recovery_revalidates_immutable_plan(self):
+        evidence = self.ready_for_registration(); self.controller.register_tasks(); self.controller.begin_operation("lost")
+        plan = self.root / evidence["path"]; plan.write_text(plan.read_text().replace("PENDING", "IMPLEMENTED", 1))
+        with self.assertRaisesRegex(ControllerError, "authoritative artifact hash mismatch"):
+            self.controller.recover_interrupted_developer("lost", "TASK-A", "REVIEW_CANDIDATE", "operator", capture(self.root)["fingerprint"])
+
     def test_next_human_gate_and_reviewer_handoff_isolated(self):
         self.save(lifecycle_state="AWAITING_TASK_PLAN_APPROVAL", human_gate={"status": "OPEN", "reason": "", "evidence": []})
         self.assertEqual("HUMAN_ACTION", self.controller.next()["status"])

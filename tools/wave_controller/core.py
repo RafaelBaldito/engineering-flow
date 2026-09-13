@@ -76,6 +76,9 @@ class Controller:
             "authoritative_refs": [], "checkout_identity": None, "active_operation": None,
             "last_result_envelope": None, "blocker": {"classification": None, "reason": "", "required_human_action": None},
             "updated_at": _now(), "updated_by": "python-wave-controller", "tasks": [],
+            # Explicit operator-directed recovery records.  These are not
+            # execution results and never constitute task acceptance.
+            "recovery_receipts": [],
             # Append-only bootstrap governance evidence.  Old schema-v1 records
             # without this field are interpreted through their human_gate below.
             "governance_decisions": [],
@@ -130,6 +133,9 @@ class Controller:
             if artifact.get("path") != self._task_plan_path():
                 raise ControllerError("supervised completion artifact identity is invalid")
             self._validate_refs([artifact])
+        receipts = state.get("recovery_receipts", [])
+        if not isinstance(receipts, list) or any(not isinstance(item, dict) for item in receipts):
+            raise ControllerError("recovery receipt history is invalid")
 
     def _approval_target(self, gate: str) -> str:
         if gate == "TECHSPEC_APPROVAL":
@@ -603,6 +609,75 @@ class Controller:
         state["task_plan"] = registration
         self._persist(state, "REGISTER_TASKS")
         return {"status": "REGISTERED", "wave_id": self.wave_id, "task_count": len(tasks)}
+
+    def _validate_registered_task_plan(self, state: dict[str, Any]) -> list[dict[str, Any]]:
+        """Revalidate the immutable approved plan before a narrow recovery."""
+        plan = state.get("task_plan")
+        if not isinstance(plan, dict) or plan.get("path") != self._task_plan_path():
+            raise ControllerError("registered approved task plan is missing")
+        self._validate_refs([plan])
+        parsed = self._parse_task_plan(_inside(self.root, plan["path"]))
+        registered = [{"id": task.get("id"), "status": task.get("status"),
+                       "dependencies": task.get("dependencies")} for task in state.get("tasks", [])]
+        if parsed != registered:
+            raise ControllerError("registered task plan identity does not match approved plan")
+        return parsed
+
+    def recover_interrupted_developer(self, operation_id: str, task_id: str, disposition: str,
+                                      actor: str, checkout_fingerprint: str) -> dict[str, Any]:
+        """Route one explicitly selected interrupted Developer candidate to review.
+
+        This is intentionally not a general lease-release or replay mechanism.
+        It records an operator decision only; it never infers execution success
+        from a diff, tests, or the candidate workspace.
+        """
+        if (not isinstance(operation_id, str) or not operation_id or not isinstance(task_id, str) or not TASK_ID.fullmatch(task_id)
+                or disposition != "REVIEW_CANDIDATE" or not isinstance(actor, str) or not actor
+                or not isinstance(checkout_fingerprint, str) or not checkout_fingerprint):
+            raise ControllerError("recovery command arguments are invalid")
+        state = self.load()
+        receipts = state.setdefault("recovery_receipts", [])
+        matching = [item for item in receipts if item.get("operation_id") == operation_id]
+        if matching:
+            receipt = matching[-1]
+            same = (len(matching) == 1 and receipt.get("task_id") == task_id
+                    and receipt.get("disposition") == disposition and receipt.get("actor") == actor
+                    and receipt.get("candidate_identity", {}).get("fingerprint") == checkout_fingerprint)
+            if same:
+                return {"status": "IDEMPOTENT", "wave_id": self.wave_id,
+                        "state": state["lifecycle_state"], "receipt": receipt}
+            raise ControllerError("contradictory prior recovery receipt")
+        candidate = capture(self.root)
+        if candidate.get("fingerprint") != checkout_fingerprint:
+            raise ControllerError("candidate checkout fingerprint does not match")
+        # An outcome for this lease, even an incomplete one, must be resolved by
+        # normal reconciliation rather than reclassified as a recovery candidate.
+        result = state.get("last_result_envelope")
+        if isinstance(result, dict) and result.get("operation_id") == operation_id:
+            raise ControllerError("interrupted operation already has a result envelope")
+        active = state.get("active_operation")
+        if (state.get("lifecycle_state") != "TASK_IMPLEMENTATION" or not isinstance(active, dict)
+                or active.get("id") != operation_id or active.get("role") != "Developer"
+                or active.get("task_id") != task_id):
+            raise ControllerError("recovery does not match the active Developer operation")
+        if active.get("input_identity", {}).get("fingerprint") is None:
+            raise ControllerError("active Developer operation lacks input identity")
+        self._validate_registered_task_plan(state)
+        task = next((item for item in state.get("tasks", []) if item.get("id") == task_id), None)
+        if not task or task.get("status") != "PENDING":
+            raise ControllerError("recovery task is not pending")
+        receipt = {
+            "operation_id": operation_id, "task_id": task_id, "role": "Developer", "actor": actor,
+            "disposition": disposition, "input_identity": active["input_identity"],
+            "candidate_identity": candidate, "recorded_at": _now(),
+        }
+        receipts.append(receipt)
+        state["active_operation"] = None
+        state["lifecycle_state"] = "TASK_REVIEW_REQUIRED"
+        # current_task_id and the runtime PENDING status intentionally remain.
+        self._persist(state, f"RECOVER_INTERRUPTED_DEVELOPER:{operation_id}")
+        return {"status": "RECOVERED", "wave_id": self.wave_id,
+                "state": state["lifecycle_state"], "receipt": receipt}
 
     def _task_to_run(self, state: dict[str, Any]) -> str | None:
         current = state.get("current_task_id")

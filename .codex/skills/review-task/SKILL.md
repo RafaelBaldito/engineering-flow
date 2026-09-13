@@ -340,42 +340,22 @@ or fixed correctly without changing an approved upstream specification.
 Return `BLOCKED` when review cannot be completed because required
 evidence, infrastructure, or context is unavailable.
 
-### 12. Update task status when repository convention requires it
-
-If task status tracking is used:
-
-On `PASS`, recommended status:
-
-`PASS`
-
-On `FIX_REQUIRED`, recommended status:
-
-`FIX_REQUIRED`
-
-On `SPEC_CHANGE_REQUIRED`:
-
-`SPEC_CHANGE_REQUIRED`
-
-On `BLOCKED`:
-
-`BLOCKED`
-
-Do not change unrelated task statuses.
-
-### 13. Persist the authoritative review record
+### 12. Persist the authoritative review record
 
 Every outcome must have one durable, current review record. This evidence is
 required to resolve task dependencies; an index status label alone is not a
 substitute for the latest detailed review decision.
+
+In a Controller-managed execution, `TASKS.md` and every `TASK-*.md` are
+immutable approved planning inputs. Never edit task-plan status cells or task
+index entries: runtime progress and task acceptance are Controller-owned. The
+Reviewer may write only its authorized review artifact.
 
 - Write the complete review-result format from this skill to
   `<selected-task-parent>/reviews/TASK-XXX-REVIEW.md`. For example, a selected
   `tasks/<wave-id>/TASK-XXX.md` produces
   `tasks/<wave-id>/reviews/TASK-XXX-REVIEW.md`; a single-delivery task under
   `tasks/` produces `tasks/reviews/TASK-XXX-REVIEW.md`.
-- Update the selected task's status in the applicable task index, when that
-  index exists, to the outcome selected in step 11. Do not change unrelated
-  task statuses.
 - On a re-review, replace the stable review record with the current result and
   state that it supersedes the prior result. For a `PASS` after
   `FIX_REQUIRED`, include a concise recheck of each prior blocking finding.
@@ -475,9 +455,6 @@ report it when relevant.
 ## Output
 
 Do not create or modify production artifacts.
-
-Update task status metadata only when the repository's task convention
-requires it.
 
 Return:
 

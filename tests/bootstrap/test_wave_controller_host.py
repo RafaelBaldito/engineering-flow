@@ -12,7 +12,7 @@ from tools.wave_controller.core import Controller
 from tools.wave_controller.host import (ROLE_POLICIES, approve_confirmed_human_gate,
                                         build_command, build_prompt,
                                         report_confirmed_supervised_capability_completion,
-                                        run_codex, run_task_loop)
+                                        run_codex, run_task_loop, _stdout_event)
 
 
 class _Process:
@@ -52,6 +52,10 @@ class HostTests(unittest.TestCase):
         self.assertEqual("low", ROLE_POLICIES["Fixer"].reasoning)
         self.assertEqual(str(self.root), dev[dev.index("-C") + 1])
         self.assertIn("Use the repository Skill: review-task.", build_prompt(self.handoff("Reviewer")))
+        for role in ("Developer", "Reviewer", "Fixer"):
+            prompt = build_prompt(self.handoff(role))
+            self.assertIn("TASKS.md and TASK-*.md are immutable", prompt)
+            self.assertIn("must never edit task-plan status cells", prompt)
 
     def test_jsonl_success_and_fail_closed_cases(self):
         task = self.root / "tasks/fixture/TASK-A.md"; task.parent.mkdir(parents=True); task.write_text("task")
@@ -77,6 +81,21 @@ class HostTests(unittest.TestCase):
         self.assertFalse(result["ok"]); self.assertTrue(result["timed_out"]); self.assertEqual("timeout", result["failure"])
         self.assertTrue(killpg.called)
 
+    def test_heartbeat_is_safe_and_stdout_events_flush_immediately(self):
+        task = self.root / "tasks/fixture/TASK-A.md"; task.parent.mkdir(parents=True); task.write_text("task")
+        output = '\n'.join([json.dumps({"type":"thread.started", "thread_id":"fresh"}), json.dumps({"type":"turn.completed"})])
+        events = []
+        def delayed(command, **_):
+            Path(command[command.index("--output-last-message") + 1]).write_text('{"terminal_status":"COMPLETED"}')
+            return _Process(output, timeout=True)
+        with patch("tools.wave_controller.host.time.monotonic", side_effect=[0, 0, 30, 30, 30, 30]):
+            self.assertTrue(run_codex(self.root, self.handoff(), timeout=60, popen=delayed, event_sink=events.append)["ok"])
+        self.assertEqual(["heartbeat"], [event["event"] for event in events])
+        self.assertNotIn(output, json.dumps(events))
+        with patch("builtins.print") as output_print:
+            _stdout_event({"event": "task_started"})
+        self.assertTrue(output_print.call_args.kwargs["flush"])
+
     def _ready(self):
         plan = self.root / "tasks/fixture/TASKS.md"; plan.parent.mkdir(parents=True, exist_ok=True)
         plan.write_text("## Execution Order\n| Task | Title | Depends On | Status |\n|---|---|---|---|\n| TASK-A | A | — | PENDING |\n| TASK-B | B | TASK-A | PENDING |\n")
@@ -87,6 +106,7 @@ class HostTests(unittest.TestCase):
 
     def test_loop_fix_cycle_next_task_terminal_and_no_wave_review(self):
         self._ready(); calls=[]; reviews=0
+        before = (self.root / "tasks/fixture/TASKS.md").read_bytes()
         def fake(repo, handoff, timeout):
             nonlocal reviews
             calls.append(handoff["required_role"])
@@ -94,15 +114,55 @@ class HostTests(unittest.TestCase):
                 reviews += 1; review = repo / handoff["expected_authoritative_output_path"]; review.parent.mkdir(parents=True, exist_ok=True)
                 review.write_text("FIX_REQUIRED\n" if reviews == 2 else "PASS\n")
             return {"ok":True, "failure":None, "exit_code":0, "thread_id":f"fresh-{len(calls)}", "terminal_event":{"type":"turn.completed"}, "usage":{}, "final_message":"{}", "timed_out":False, "stdout":"", "stderr":""}
-        outcome = run_task_loop(self.controller, runner=fake)
+        outcome = run_task_loop(self.controller, runner=fake, event_sink=lambda _: None)
         self.assertEqual("TASKS_READY_FOR_WAVE_REVIEW", outcome["status"])
         self.assertEqual(["Developer", "Reviewer", "Developer", "Reviewer", "Fixer", "Reviewer"], calls)
         self.assertNotIn("Wave Reviewer", calls)
         self.assertEqual("TASKS_READY_FOR_WAVE_REVIEW", self.controller.load()["lifecycle_state"])
+        self.assertEqual(before, (self.root / "tasks/fixture/TASKS.md").read_bytes())
+
+    def test_runner_failures_clear_valid_lease_and_emit_only_safe_events(self):
+        self._ready(); events = []
+        raw = "provider reasoning and stderr secret"
+        def failed(*_):
+            return {"ok": False, "failure": "nonzero exit", "exit_code": 1, "thread_id": "thread",
+                    "terminal_event": None, "timed_out": False, "stdout": raw, "stderr": raw}
+        outcome = run_task_loop(self.controller, runner=failed, event_sink=events.append)
+        self.assertEqual("HUMAN_ATTENTION", outcome["status"])
+        self.assertIsNone(self.controller.load()["active_operation"])
+        rendered = json.dumps(events)
+        self.assertNotIn(raw, rendered)
+        self.assertEqual(["task_started", "role_dispatched", "role_completed", "run_stopped"],
+                         [item["event"] for item in events])
+
+    def test_host_exception_clears_valid_lease_and_safe_output_flushes(self):
+        self._ready(); events = []
+        outcome = run_task_loop(self.controller, runner=lambda *_: (_ for _ in ()).throw(RuntimeError("raw boom")),
+                                event_sink=events.append)
+        self.assertEqual("HUMAN_ATTENTION", outcome["status"])
+        self.assertIsNone(self.controller.load()["active_operation"])
+        self.assertEqual("host exception", outcome["reason"])
+        self.assertNotIn("raw boom", json.dumps(events))
+
+    def test_authoritative_plan_drift_fails_closed_without_envelope_or_redispatch(self):
+        self._ready(); events = []
+        def drift(repo, *_):
+            plan = repo / "tasks/fixture/TASKS.md"
+            plan.write_text(plan.read_text().replace("PENDING", "IMPLEMENTED", 1))
+            return {"ok": True, "failure": None, "exit_code": 0, "thread_id": "thread",
+                    "terminal_event": {"type": "turn.completed"}, "timed_out": False, "stdout": "", "stderr": ""}
+        outcome = run_task_loop(self.controller, runner=drift, event_sink=events.append)
+        self.assertEqual("HUMAN_ATTENTION", outcome["status"])
+        # The invalid authoritative input leaves the lease for the explicit
+        # recovery protocol; it must not invent an interrupted envelope.
+        state_text = self.controller.path.read_text()
+        self.assertIn("TASK_IMPLEMENTATION", state_text)
+        self.assertNotIn('"last_result_envelope": {', state_text)
+        self.assertEqual("AUTHORITATIVE_INPUT_INVALID", events[-1]["reason"])
 
     def test_human_attention_stops_without_runner(self):
         self.controller.save({**self.controller.load(), "lifecycle_state":"HUMAN_ATTENTION"})
-        self.assertEqual("HUMAN_ATTENTION", run_task_loop(self.controller, runner=lambda *_: self.fail("run"))["status"])
+        self.assertEqual("HUMAN_ATTENTION", run_task_loop(self.controller, runner=lambda *_: self.fail("run"), event_sink=lambda _: None)["status"])
 
     def test_confirmed_human_adapter_only_forwards_the_explicit_signal_and_never_runs_tasks(self):
         with patch.object(self.controller, "approve_pending_human_gate", return_value={"status": "RECORDED"}) as approve:

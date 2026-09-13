@@ -319,9 +319,10 @@ Verify:
 -   task acceptance criteria are represented by the implementation.
 
 Compare approved task and upstream planning artifacts with their pre-execution
-state. Their normative content must be unchanged. Only the selected task's
-status metadata or its index entry may change when repository convention
-requires it.
+state. Their content must be unchanged. In a Controller-managed execution,
+`TASKS.md` and every `TASK-*.md` are immutable approved planning inputs;
+never edit task-plan status cells or task-index entries. Runtime progress and
+acceptance are Controller-owned.
 
 Remove accidental changes before completing.
 
@@ -330,21 +331,7 @@ For each criterion, record the implementation evidence, test evidence, and
 executed validation that demonstrate it. A criterion without sufficient
 evidence prevents successful completion.
 
-### 12. Update task status when the repository convention requires it
-
-If the task system uses status tracking, update the selected task/index
-only according to the established convention.
-
-Recommended successful status:
-
-`IMPLEMENTED`
-
-Do not mark the task as `PASS` or fully accepted. Acceptance belongs to
-`review-task`.
-
-Do not change the status of unrelated tasks.
-
-### 13. Report execution result
+### 12. Report execution result
 
 Provide a concise implementation summary and validation evidence.
 
@@ -455,7 +442,6 @@ Typical outputs may include:
 -   configuration;
 -   migrations;
 -   directly affected documentation;
--   task status metadata when the repository uses it.
 
 Do not create a separate implementation report file unless the
 repository explicitly requires one.
@@ -510,8 +496,7 @@ Before reporting completion, verify:
 -   [ ] final changes contain no unrelated edits;
 -   [ ] every acceptance criterion has explicit implementation and validation
       evidence;
--   [ ] approved task and upstream planning content is unchanged, except for
-      explicitly authorized status metadata;
+-   [ ] approved task and upstream planning content is unchanged;
 -   [ ] no secrets or unintended generated files were introduced;
 -   [ ] no upstream specification was silently changed;
 -   [ ] no next task or review stage was started automatically.
@@ -524,8 +509,6 @@ Return `COMPLETED` when:
 -   applicable required validation passes;
 -   no unresolved task-scoped failure remains;
 -   the change is ready for independent `review-task`.
-
-If status tracking is used, mark the task as `IMPLEMENTED`, not `PASS`.
 
 A `COMPLETED` execution means implementation is ready for review. It
 does not mean the task has passed review, accepted the Wave, or authorized any

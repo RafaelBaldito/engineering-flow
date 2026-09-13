@@ -19,6 +19,10 @@ def main() -> int:
     run.add_argument("--timeout", type=float, default=900.0)
     begin = sub.add_parser("begin-operation"); begin.add_argument("--operation-id"); begin.add_argument("--child-task-name")
     complete = sub.add_parser("complete-operation"); complete.add_argument("--envelope", required=True, help="path to JSON envelope")
+    recover = sub.add_parser("recover-interrupted-developer")
+    recover.add_argument("--operation-id", required=True); recover.add_argument("--task", required=True)
+    recover.add_argument("--disposition", required=True, choices=["REVIEW_CANDIDATE"])
+    recover.add_argument("--actor", required=True); recover.add_argument("--checkout-fingerprint", required=True)
     authority = sub.add_parser("record-authority")
     authority.add_argument("--gate", required=True); authority.add_argument("--decision", required=True)
     authority.add_argument("--actor", required=True); authority.add_argument("--evidence", required=True, help="path to JSON evidence list")
@@ -43,6 +47,8 @@ def main() -> int:
             result = run_task_loop(controller, timeout=args.timeout)
         elif args.command == "begin-operation": result = controller.begin_operation(args.operation_id, args.child_task_name)
         elif args.command == "complete-operation": result = controller.complete_operation(json.loads(Path(args.envelope).read_text(encoding="utf-8")))
+        elif args.command == "recover-interrupted-developer": result = controller.recover_interrupted_developer(
+            args.operation_id, args.task, args.disposition, args.actor, args.checkout_fingerprint)
         elif args.command == "record-authority": result = controller.record_authority(args.gate, args.decision, args.actor,
                                                                                          json.loads(Path(args.evidence).read_text(encoding="utf-8")), args.authority_wave)
         elif args.command == "approve": result = controller.approve(args.gate, args.actor, json.loads(Path(args.evidence).read_text(encoding="utf-8")), args.authority_wave)

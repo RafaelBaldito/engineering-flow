@@ -253,8 +253,10 @@ Verify:
 -   test changes do not hide failures.
 
 Compare the selected task and upstream planning artifacts with their pre-fix
-state. Their normative content must be unchanged; only status metadata in the
-applicable task index may change when repository convention requires it.
+state. Their content must be unchanged. In a Controller-managed execution,
+`TASKS.md` and every `TASK-*.md` are immutable approved planning inputs;
+never edit task-plan status cells or task-index entries. Runtime progress and
+acceptance are Controller-owned.
 
 Remove accidental changes.
 
@@ -281,23 +283,6 @@ Resolution cannot continue because required context, infrastructure, or
 dependency is unavailable.
 
 Do not mark the task `PASS`. Only `review-task` can accept the task.
-
-### 11. Update task status when repository convention requires it
-
-If all blocking findings are resolved and the task is ready for
-re-review, recommended status:
-
-`IMPLEMENTED`
-
-If unresolved implementation defects remain:
-
-`FIX_REQUIRED`
-
-If escalation is required:
-
-`SPEC_CHANGE_REQUIRED` or `BLOCKED`
-
-Do not update unrelated tasks.
 
 ### 12. Report remediation result
 
@@ -400,7 +385,6 @@ Typical outputs may include:
 -   regression or corrected tests;
 -   configuration or migration fixes;
 -   directly affected documentation;
--   task status metadata when used by the repository.
 
 Return:
 
@@ -457,8 +441,7 @@ Before completing, verify:
 ## Completion
 
 Always choose from `COMPLETED`, `FIX_REQUIRED`, `SPEC_CHANGE_REQUIRED`, or
-`BLOCKED` according to the evidence. A request that prescribes only
-`IMPLEMENTED` does not override escalation requirements.
+`BLOCKED` according to the evidence.
 
 Return `COMPLETED` when:
 
@@ -466,10 +449,6 @@ Return `COMPLETED` when:
 -   applicable validation passes;
 -   no new unresolved task-scoped defect remains;
 -   the task is ready for independent re-review.
-
-Recommended task status after successful remediation:
-
-`IMPLEMENTED`
 
 `COMPLETED` means "ready for re-review", not "accepted". It cannot be used to
 advance the task, Wave, or release acceptance layer.
