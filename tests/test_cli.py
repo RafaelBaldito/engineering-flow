@@ -149,7 +149,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(logs["intake"]["outcome"], "READY")
         self.assertTrue(any(event["type"] == "intake.completed" for event in logs["events"]))
 
-    def test_resume_progress_uses_tty_stderr_and_json_and_non_tty_stay_quiet(self):
+    def test_resume_progress_uses_tty_stderr_and_json_and_non_tty_is_bounded(self):
         class PlanRuntime(FakeRuntime):
             def verify_planning_capabilities(self, repository):
                 return CapabilityReport("fake", "fake", str(repository), True, {"read_only": True}, True)
@@ -172,8 +172,7 @@ class CliTests(unittest.TestCase):
         stdout, stderr = io.StringIO(), Tty()
         with patch("engineering_flow.cli.CodexCliRuntime", PlanRuntime), contextlib.redirect_stdout(stdout), patch("engineering_flow.cli.sys.stderr", stderr):
             self.assertEqual(main(["resume", "--repo", str(self.repository), "--workflow", workflow_id]), 0, stdout.getvalue())
-        self.assertIn("→ PLAN started", stderr.getvalue())
-        self.assertIn("Codex running... 10s", stderr.getvalue())
+        self.assertNotIn("Codex running", stderr.getvalue())
         self.assertIn("✓ PLAN completed", stderr.getvalue())
         self.assertNotIn("Codex running", stdout.getvalue())
         self.assertIn("AWAITING_APPROVAL", stdout.getvalue())
@@ -211,7 +210,9 @@ class CliTests(unittest.TestCase):
         non_tty_out, non_tty_err = io.StringIO(), io.StringIO()
         with patch("engineering_flow.cli.CodexCliRuntime", PlanRuntime), contextlib.redirect_stdout(non_tty_out), patch("engineering_flow.cli.sys.stderr", non_tty_err):
             self.assertEqual(main(["resume", "--repo", str(self.repository), "--workflow", workflow_id]), 0)
-        self.assertEqual(non_tty_err.getvalue(), "")
+        self.assertIn("PLAN started", non_tty_err.getvalue())
+        self.assertIn("PLAN completed duration=", non_tty_err.getvalue())
+        self.assertNotIn("Codex running", non_tty_err.getvalue())
         self.assertNotIn("Codex running", non_tty_out.getvalue())
 
     def test_v2_approve_reports_durable_stop_without_execution(self):

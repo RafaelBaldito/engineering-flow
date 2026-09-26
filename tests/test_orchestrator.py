@@ -30,6 +30,7 @@ from engineering_flow.orchestrator import CanonicalLifecycleOrchestrator, Intake
 from engineering_flow.runtime import (  # noqa: E402
     CapabilityReport,
     PlanningExecutionResult,
+    RuntimeProgressEvent,
     TerminalState,
 )
 from engineering_flow.store import WorkflowStore  # noqa: E402
@@ -121,6 +122,33 @@ class OrchestratorTests(unittest.TestCase):
         completed = [event for event in self.store.list_events(workflow.id) if event.type == "intake.completed"]
         self.assertEqual(len(completed), 1)
         self.assertEqual(completed[0].payload, {"outcome": "NEEDS_CLARIFICATION", "question_count": 1})
+
+    def test_intake_emits_safe_progress_before_dispatch_and_preserves_result(self):
+        observed = []
+        clock = iter((10.0, 13.4))
+
+        class ProgressRuntime(FakeRuntime):
+            def execute_planning(runtime_self, request):
+                runtime_self.requests.append(request)
+                self.assertIsNotNone(request.progress_sink)
+                execution = self.store.get_execution(request.execution_id)
+                self.assertEqual(execution.lifecycle.value, "running")
+                request.progress_sink(RuntimeProgressEvent("activity", Stage.INTAKE, 1.0, "Agent session started"))
+                request.progress_sink(RuntimeProgressEvent("heartbeat", Stage.INTAKE, 10.0))
+                return PlanningExecutionResult(runtime_self.provider, request.logical_session_id or "s", "thread", "turn",
+                    TerminalState.SUCCEEDED, {"outcome": "READY", "feature": {"id": request.workflow_id,
+                    "goal": "Goal", "requirements": ["Requirement"], "acceptance_criteria": ["Criterion"],
+                    "constraints": [], "out_of_scope": [], "assumptions": [], "open_questions": []}})
+
+        workflow = IntakeOrchestrator(self.store, ProgressRuntime(), monotonic_clock=lambda: next(clock)).run(
+            self.root, "Implement the bounded request.", progress_sink=observed.append,
+        )
+        self.assertEqual(workflow.status, WorkflowStatus.READY)
+        self.assertEqual([(event.kind, event.stage) for event in observed], [
+            ("started", Stage.INTAKE), ("activity", Stage.INTAKE),
+            ("heartbeat", Stage.INTAKE), ("completed", Stage.INTAKE),
+        ])
+        self.assertAlmostEqual(observed[-1].elapsed_seconds, 3.4)
 
 
     def test_required_workflow_is_sequential_and_context_is_scoped(self):

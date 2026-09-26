@@ -33,7 +33,7 @@ from .domain import (
     LifecycleVersion,
 )
 from .orchestrator import IntakeOrchestrator, PlanningOrchestrator, V2PlanOrchestrator
-from .presentation import OutputMode, make_plan_progress_renderer, render_result
+from .presentation import OutputMode, create_progress_renderer, render_result
 from .sanitization import sanitize_payload, sanitize_text
 from .store import WorkflowStore
 
@@ -393,7 +393,13 @@ def _run_command(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
     try:
         if command == "run":
             if args.request is not None:
-                workflow = intake_orchestrator.run(config.repository_path, args.request, provider=config.provider_name, configuration_snapshot=config.snapshot)
+                workflow = intake_orchestrator.run(
+                    config.repository_path, args.request, provider=config.provider_name,
+                    configuration_snapshot=config.snapshot,
+                    progress_sink=(None if args.json_output else create_progress_renderer(
+                        sys.stderr, no_color=args.no_color,
+                    )),
+                )
                 payload = _workflow_payload(store, workflow)
                 return _result_document(command, workflow=workflow, data=payload), EXIT_SUCCESS
             feature_file = _validate_feature_file(args.feature_file)
@@ -422,7 +428,7 @@ def _run_command(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
                     raise ValidationFailure("--regenerate is V1-only")
                 workflow = plan_orchestrator.resume(
                     args.workflow,
-                    progress_sink=(None if args.json_output else make_plan_progress_renderer(
+                    progress_sink=(None if args.json_output else create_progress_renderer(
                         sys.stderr, no_color=args.no_color,
                     )),
                 )

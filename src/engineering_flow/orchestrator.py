@@ -73,11 +73,12 @@ _RETRIABLE_FAILURES = frozenset({
 class IntakeOrchestrator:
     """The bounded V2 Intake lifecycle; it deliberately has no successor stage."""
 
-    def __init__(self, store: WorkflowStore, runtime: AgentRuntime, *, timeout_seconds: float = 1800) -> None:
-        self.store, self.runtime, self.timeout_seconds = store, runtime, timeout_seconds
+    def __init__(self, store: WorkflowStore, runtime: AgentRuntime, *, timeout_seconds: float = 1800,
+                 monotonic_clock: Any = time.monotonic) -> None:
+        self.store, self.runtime, self.timeout_seconds, self._monotonic = store, runtime, timeout_seconds, monotonic_clock
 
     def run(self, repository_path: str | Path, request: str, *, provider: str | None = None,
-            configuration_snapshot: Mapping[str, Any] | None = None) -> Workflow:
+            configuration_snapshot: Mapping[str, Any] | None = None, progress_sink: Any = None) -> Workflow:
         if not isinstance(request, str) or not request.strip():
             raise ValidationFailure("request must be non-empty")
         workflow_id = str(uuid.uuid4())
@@ -85,12 +86,12 @@ class IntakeOrchestrator:
             configuration_snapshot=configuration_snapshot, workflow_id=workflow_id, feature_content=request.encode("utf-8"),
             feature_path=self.store.workspace_path / "workflows" / workflow_id / "input" / "request.txt",
             lifecycle_version=LifecycleVersion.V2, stage=Stage.INTAKE)
-        return self._intake(workflow)
+        return self._intake(workflow, progress_sink=progress_sink)
 
     def status(self, workflow_id: str) -> Workflow:
         return self.store.get_workflow(workflow_id)
 
-    def _intake(self, workflow: Workflow) -> Workflow:
+    def _intake(self, workflow: Workflow, *, progress_sink: Any = None) -> Workflow:
         request_path = Path(workflow.feature_input_path or "")
         raw = request_path.read_bytes()
         request_digest = hashlib.sha256(raw).hexdigest()
@@ -113,17 +114,24 @@ class IntakeOrchestrator:
             self.store.fail_generation(intent.operation.idempotency_key, FailureClassification.PROVIDER, report.failure_detail or "Intake runtime is unavailable")
             return self.store.get_workflow(workflow.id)
         self.store.set_workflow_state(workflow.id, stage=Stage.INTAKE, status=WorkflowStatus.RUNNING, event_type="workflow.running", payload={"execution_id": intent.execution.id})
+        self.store.start_execution(intent.execution.id)
+        started = self._monotonic()
+        _emit_progress(progress_sink, Stage.INTAKE, "started", 0.0)
         root = self.store.workspace_path / "workflows" / workflow.id / "runtime" / intent.execution.id
         runtime_request = PlanningExecutionRequest(workflow_id=workflow.id, execution_id=intent.execution.id, logical_session_id=intent.execution.session_id,
             role=Role.INTAKE, stage=Stage.INTAKE, repository_path=workflow.repository_path,
             authoritative_input_paths=(str(request_path),), authoritative_input_hashes=(request_digest,), instruction=instruction,
             output_schema_path=str(root / "feature-contract.schema.json"), final_output_path=str(root / "final-output.json"), timeout_seconds=self.timeout_seconds,
-            required_capabilities=("read_only",))
+            required_capabilities=("read_only",), progress_sink=progress_sink)
         try:
+            # Keep the public compatibility entry point: it delegates to the
+            # generalized runtime contract and carries the same transient sink.
             result = self.runtime.execute_planning(runtime_request)
         except Exception as exc:
             self.store.mark_operation_unknown(intent.operation.idempotency_key, detail=str(exc))
-            return self.store.set_workflow_state(workflow.id, stage=Stage.INTAKE, status=WorkflowStatus.HUMAN_ATTENTION, event_type="workflow.human_attention", payload={"reason": "provider operation outcome is unknown"})
+            result_workflow = self.store.set_workflow_state(workflow.id, stage=Stage.INTAKE, status=WorkflowStatus.HUMAN_ATTENTION, event_type="workflow.human_attention", payload={"reason": "provider operation outcome is unknown"})
+            _emit_progress(progress_sink, Stage.INTAKE, "failed", self._monotonic() - started)
+            return result_workflow
         self.store.start_execution(intent.execution.id, provider_execution_id=result.provider_execution_id)
         for event in result.events:
             self.store.append_event(workflow.id, f"agent.runtime.{event.type}", stage=Stage.INTAKE,
@@ -131,14 +139,18 @@ class IntakeOrchestrator:
                 "timestamp": event.timestamp, **dict(event.payload)})
         if result.terminal_state is TerminalState.UNKNOWN:
             self.store.mark_operation_unknown(intent.operation.idempotency_key, detail=result.failure_detail or "unknown provider outcome")
-            return self.store.set_workflow_state(workflow.id, stage=Stage.INTAKE, status=WorkflowStatus.HUMAN_ATTENTION, event_type="workflow.human_attention", payload={"reason": "provider operation outcome is unknown"})
+            result_workflow = self.store.set_workflow_state(workflow.id, stage=Stage.INTAKE, status=WorkflowStatus.HUMAN_ATTENTION, event_type="workflow.human_attention", payload={"reason": "provider operation outcome is unknown"})
+            _emit_progress(progress_sink, Stage.INTAKE, "failed", self._monotonic() - started)
+            return result_workflow
         if not result.success or not isinstance(result.final_payload, Mapping):
             self.store.fail_generation(intent.operation.idempotency_key, result.failure_classification or FailureClassification.AGENT_EXECUTION, result.failure_detail or "Intake runtime failed")
+            _emit_progress(progress_sink, Stage.INTAKE, "timed_out" if result.terminal_state is TerminalState.TIMED_OUT else "failed", self._monotonic() - started)
             return self.store.get_workflow(workflow.id)
         try:
             contract = FeatureContract.parse(result.final_payload, workflow_id=workflow.id)
         except ValidationFailure as exc:
             self.store.fail_generation(intent.operation.idempotency_key, FailureClassification.AGENT_EXECUTION, str(exc))
+            _emit_progress(progress_sink, Stage.INTAKE, "failed", self._monotonic() - started)
             return self.store.get_workflow(workflow.id)
         status = {IntakeOutcome.READY: WorkflowStatus.READY, IntakeOutcome.NEEDS_CLARIFICATION: WorkflowStatus.NEEDS_CLARIFICATION, IntakeOutcome.REJECTED: WorkflowStatus.REJECTED}[contract.outcome]
         self.store.complete_generation(intent.operation.idempotency_key, content=json.dumps(contract.as_payload(), ensure_ascii=False, indent=2) + "\n",
@@ -146,13 +158,16 @@ class IntakeOrchestrator:
             terminal_result={"provider": result.provider, "final_payload": contract.as_payload(), "usage": dict(result.usage), "metadata": dict(result.metadata)},
             workflow_stage=Stage.INTAKE, workflow_status=status, approval_state=ApprovalState.NOT_REQUIRED,
             completion_event_type="intake.completed", completion_event_payload={"outcome": contract.outcome.value, "question_count": len(contract.open_questions)})
-        return self.store.get_workflow(workflow.id)
+        result_workflow = self.store.get_workflow(workflow.id)
+        _emit_progress(progress_sink, Stage.INTAKE, "completed", self._monotonic() - started)
+        return result_workflow
 
 
 class V2PlanOrchestrator:
     """The deliberately bounded V2 successor: Plan and stop."""
-    def __init__(self, store: WorkflowStore, runtime: AgentRuntime, *, timeout_seconds: float = 1800) -> None:
-        self.store, self.runtime, self.timeout_seconds = store, runtime, timeout_seconds
+    def __init__(self, store: WorkflowStore, runtime: AgentRuntime, *, timeout_seconds: float = 1800,
+                 monotonic_clock: Any = time.monotonic) -> None:
+        self.store, self.runtime, self.timeout_seconds, self._monotonic = store, runtime, timeout_seconds, monotonic_clock
 
     def resume(self, workflow_id: str, *, progress_sink: Any = None) -> Workflow:
         workflow = self.store.get_workflow(workflow_id)
@@ -190,8 +205,8 @@ class V2PlanOrchestrator:
             return self.store.get_workflow(workflow.id)
         self.store.set_workflow_state(workflow.id, stage=Stage.PLAN, status=WorkflowStatus.RUNNING, event_type="workflow.running", payload={"execution_id": intent.execution.id})
         self.store.start_execution(intent.execution.id)
-        started = time.monotonic()
-        self._progress(progress_sink, "started", 0)
+        started = self._monotonic()
+        _emit_progress(progress_sink, Stage.PLAN, "started", 0)
         root = self.store.workspace_path / "workflows" / workflow.id / "runtime" / intent.execution.id
         request = RuntimeExecutionRequest(workflow_id=workflow.id, execution_id=intent.execution.id, logical_session_id=intent.execution.session_id, role=Role.PLANNER, stage=Stage.PLAN, repository_path=workflow.repository_path, authoritative_input_paths=(feature_artifact.path,), authoritative_input_hashes=(feature_artifact.sha256,), instruction=instruction, output_schema_path=str(root / "plan.schema.json"), final_output_path=str(root / "final-output.json"), timeout_seconds=self.timeout_seconds, required_capabilities=("read_only",), progress_sink=progress_sink)
         try:
@@ -199,27 +214,27 @@ class V2PlanOrchestrator:
         except Exception as exc:
             self.store.mark_operation_unknown(intent.operation.idempotency_key, detail=str(exc))
             result_workflow = self.store.set_workflow_state(workflow.id, stage=Stage.PLAN, status=WorkflowStatus.HUMAN_ATTENTION, event_type="workflow.human_attention", payload={"reason": "provider operation outcome is unknown"})
-            self._progress(progress_sink, "failed", time.monotonic() - started)
+            _emit_progress(progress_sink, Stage.PLAN, "failed", self._monotonic() - started)
             return result_workflow
         for event in result.events:
             self.store.append_event(workflow.id, f"agent.runtime.{event.type}", stage=Stage.PLAN, execution_id=intent.execution.id, payload={"provider_event_id": event.provider_event_id, "timestamp": event.timestamp, **dict(event.payload)})
         if result.terminal_state is TerminalState.UNKNOWN:
             self.store.mark_operation_unknown(intent.operation.idempotency_key, detail=result.failure_detail or "unknown provider outcome")
             result_workflow = self.store.set_workflow_state(workflow.id, stage=Stage.PLAN, status=WorkflowStatus.HUMAN_ATTENTION, event_type="workflow.human_attention", payload={"reason": "provider operation outcome is unknown"})
-            self._progress(progress_sink, "failed", time.monotonic() - started)
+            _emit_progress(progress_sink, Stage.PLAN, "failed", self._monotonic() - started)
             return result_workflow
         if not result.success or not isinstance(result.final_payload, Mapping):
             self.store.fail_generation(intent.operation.idempotency_key, result.failure_classification or FailureClassification.AGENT_EXECUTION, result.failure_detail or "Planner runtime failed")
-            self._progress(progress_sink, "timed_out" if result.terminal_state is TerminalState.TIMED_OUT else "failed", time.monotonic() - started)
+            _emit_progress(progress_sink, Stage.PLAN, "timed_out" if result.terminal_state is TerminalState.TIMED_OUT else "failed", self._monotonic() - started)
             return self.store.get_workflow(workflow.id)
         try:
             plan = Plan.parse(result.final_payload, workflow_id=workflow.id, revision=revision, feature_contract_artifact_id=feature_artifact.id, feature_contract_sha256=feature_artifact.sha256, repository_path=workflow.repository_path)
         except ValidationFailure as exc:
             self.store.fail_generation(intent.operation.idempotency_key, FailureClassification.AGENT_EXECUTION, str(exc))
-            self._progress(progress_sink, "failed", time.monotonic() - started)
+            _emit_progress(progress_sink, Stage.PLAN, "failed", self._monotonic() - started)
             return self.store.get_workflow(workflow.id)
         self.store.complete_generation(intent.operation.idempotency_key, content=json.dumps(plan.as_payload(), ensure_ascii=False, indent=2) + "\n", artifact_path=artifact_path, stage=Stage.PLAN, revision=revision, terminal_result={"provider": result.provider, "final_payload": plan.as_payload(), "usage": dict(result.usage), "metadata": dict(result.metadata)}, workflow_stage=Stage.PLAN, workflow_status=WorkflowStatus.AWAITING_APPROVAL, approval_state=ApprovalState.PENDING, completion_event_type="plan.completed", completion_event_payload={"plan_id": plan.id, "revision": revision, "task_count": len(plan.tasks), "feature_contract_artifact_id": feature_artifact.id})
-        self._progress(progress_sink, "completed", time.monotonic() - started)
+        _emit_progress(progress_sink, Stage.PLAN, "completed", self._monotonic() - started)
         return self.store.get_workflow(workflow.id)
 
     def approve(self, workflow_id: str, artifact_id: str, *, actor: str = "human",
@@ -300,11 +315,14 @@ class V2PlanOrchestrator:
         )
         return workflow, artifact, plan
 
-    @staticmethod
-    def _progress(sink: Any, kind: str, elapsed: float) -> None:
-        if sink:
-            try: sink(RuntimeProgressEvent(kind, Stage.PLAN, elapsed))
-            except Exception: pass
+def _emit_progress(sink: Any, stage: Stage, kind: str, elapsed: float) -> None:
+    """Emit safe transient stage progress without coupling it to lifecycle work."""
+
+    if sink:
+        try:
+            sink(RuntimeProgressEvent(kind, stage, max(0.0, elapsed)))
+        except Exception:
+            pass
 
 
 def _json_mapping(value: Any) -> dict[str, Any]:

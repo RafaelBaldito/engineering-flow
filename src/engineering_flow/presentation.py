@@ -13,6 +13,7 @@ from typing import Any, Callable, Mapping, TextIO
 
 from rich.console import Console
 from rich.json import JSON
+from rich.live import Live
 from rich.table import Table
 from rich.text import Text
 
@@ -253,41 +254,104 @@ def render_result(
         render_human(console, document)
 
 
-def make_plan_progress_renderer(
+class ProgressRenderer:
+    """Render the deliberately small, provider-neutral progress vocabulary.
+
+    The renderer is a best-effort sink: orchestration owns lifecycle state and
+    may safely ignore any presentation failure.  It deliberately accepts only
+    fixed event kinds and stages, never provider payloads.
+    """
+
+    _terminal_kinds = frozenset({"completed", "failed", "timed_out", "interrupted"})
+    _known_kinds = _terminal_kinds | {"started", "activity", "heartbeat"}
+
+    def __init__(
+        self,
+        stream: TextIO,
+        *,
+        no_color: bool = False,
+        environ: Mapping[str, str] | None = None,
+        live_factory: Callable[..., Live] = Live,
+    ) -> None:
+        self._stream = stream
+        self._console = build_console(stream, no_color=no_color, environ=environ)
+        self._interactive = _is_terminal(stream)
+        self._live_factory = live_factory
+        self._live: Live | None = None
+
+    @staticmethod
+    def _stage(event: Any) -> str | None:
+        stage = getattr(event, "stage", None)
+        value = getattr(stage, "value", stage)
+        return str(value).upper() if isinstance(value, str) and value else None
+
+    @staticmethod
+    def _elapsed(event: Any) -> float:
+        value = getattr(event, "elapsed_seconds", 0.0)
+        return value if isinstance(value, (int, float)) and value >= 0 else 0.0
+
+    def _live_text(self, stage: str, event: Any) -> Text:
+        elapsed = self._elapsed(event)
+        message = "Agent running"
+        if getattr(event, "kind", None) == "activity" and getattr(event, "message", None) == "Agent session started":
+            message = "Agent running"
+        return Text(f"⠋ {stage} · {message} · {elapsed:.0f}s", style="cyan")
+
+    def _stop_live(self) -> None:
+        if self._live is not None:
+            self._live.stop()
+            self._live = None
+
+    def __call__(self, event: Any) -> None:
+        try:
+            kind = getattr(event, "kind", None)
+            stage = self._stage(event)
+            if kind not in self._known_kinds or stage is None:
+                return
+            elapsed = self._elapsed(event)
+            if not self._interactive:
+                if kind == "started":
+                    self._console.print(Text(f"{stage} started", style="cyan"))
+                elif kind in self._terminal_kinds:
+                    verb = {"completed": "completed", "failed": "failed", "timed_out": "timed out", "interrupted": "interrupted"}[kind]
+                    style = "green" if kind == "completed" else "red"
+                    self._console.print(Text(f"{stage} {verb} duration={elapsed:.1f}s", style=style))
+                return
+            if kind in {"started", "activity", "heartbeat"}:
+                if self._live is None:
+                    self._live = self._live_factory(
+                        self._live_text(stage, event), console=self._console,
+                        transient=True, redirect_stdout=False, redirect_stderr=False,
+                    )
+                    self._live.start()
+                else:
+                    self._live.update(self._live_text(stage, event), refresh=True)
+                return
+            self._stop_live()
+            verb = {"completed": "completed", "failed": "failed", "timed_out": "timed out", "interrupted": "interrupted"}[kind]
+            style = "green" if kind == "completed" else "red"
+            self._console.print(Text(f"{'✓' if kind == 'completed' else '✗'} {stage} {verb} · {elapsed:.1f}s", style=style))
+        except Exception:
+            # A terminal is not an execution dependency.
+            return
+
+
+def create_progress_renderer(
     stream: TextIO,
     *,
     no_color: bool = False,
     environ: Mapping[str, str] | None = None,
-) -> Callable[[Any], None] | None:
-    """Preserve the existing Plan-only progress contract at the presentation boundary."""
+) -> Callable[[Any], None]:
+    """Create one stage-neutral human progress sink for stderr."""
 
-    if not _is_terminal(stream):
-        return None
-    console = build_console(stream, no_color=no_color, environ=environ)
-
-    def render(event: Any) -> None:
-        if event.kind == "started":
-            text, style = "→ PLAN started", "cyan"
-        elif event.kind == "heartbeat":
-            text, style = f"  Codex running... {event.elapsed_seconds:.0f}s", "cyan"
-        elif event.kind == "activity":
-            text, style = (f"  {event.message}" if event.message else ""), "cyan"
-        elif event.kind == "completed":
-            text, style = f"✓ PLAN completed ({event.elapsed_seconds:.1f}s)", "green"
-        elif event.kind == "timed_out":
-            text, style = f"✗ PLAN timed out ({event.elapsed_seconds:.1f}s)", "red"
-        else:
-            text, style = f"✗ PLAN failed ({event.elapsed_seconds:.1f}s)", "red"
-        if text:
-            console.print(Text(text, style=style))
-
-    return render
+    return ProgressRenderer(stream, no_color=no_color, environ=environ)
 
 
 __all__ = [
     "OutputMode",
     "build_console",
-    "make_plan_progress_renderer",
+    "ProgressRenderer",
+    "create_progress_renderer",
     "render_human",
     "render_plan_summary",
     "render_result",

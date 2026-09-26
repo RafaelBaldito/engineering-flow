@@ -7,7 +7,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 
-from engineering_flow.presentation import OutputMode, render_result  # noqa: E402
+from engineering_flow.domain import Stage  # noqa: E402
+from engineering_flow.presentation import OutputMode, ProgressRenderer, create_progress_renderer, render_result  # noqa: E402
+from engineering_flow.runtime import RuntimeProgressEvent  # noqa: E402
 
 
 ANSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
@@ -84,6 +86,55 @@ class Tty(io.StringIO):
 
 
 class PresentationTests(unittest.TestCase):
+    def test_tty_progress_updates_one_live_renderer_then_finalizes(self):
+        output = Tty()
+        instances = []
+
+        class FakeLive:
+            def __init__(self, renderable, **kwargs):
+                self.renderables, self.started, self.stopped = [renderable], False, False
+                instances.append(self)
+            def start(self): self.started = True
+            def update(self, renderable, **kwargs): self.renderables.append(renderable)
+            def stop(self): self.stopped = True
+
+        progress = ProgressRenderer(output, no_color=True, live_factory=FakeLive)
+        progress(RuntimeProgressEvent("started", Stage.INTAKE, 0.0))
+        progress(RuntimeProgressEvent("heartbeat", Stage.INTAKE, 10.0))
+        progress(RuntimeProgressEvent("activity", Stage.INTAKE, 11.0, "provider prose"))
+        progress(RuntimeProgressEvent("failed", Stage.INTAKE, 12.0))
+        self.assertEqual(len(instances), 1)
+        self.assertTrue(instances[0].started)
+        self.assertTrue(instances[0].stopped)
+        self.assertEqual(len(instances[0].renderables), 3)
+        self.assertIn("INTAKE failed", output.getvalue())
+        self.assertNotIn("provider prose", output.getvalue())
+
+    def test_stage_neutral_progress_uses_bounded_non_tty_lifecycle_lines(self):
+        output = io.StringIO()
+        progress = create_progress_renderer(output, environ={"TERM": "xterm-256color"})
+        for stage in (Stage.INTAKE, Stage.PLAN):
+            progress(RuntimeProgressEvent("started", stage, 0.0))
+            progress(RuntimeProgressEvent("activity", stage, 1.0, "arbitrary provider prose"))
+            progress(RuntimeProgressEvent("heartbeat", stage, 10.0))
+            progress(RuntimeProgressEvent("heartbeat", stage, 20.0))
+            progress(RuntimeProgressEvent("completed", stage, 21.5))
+        text = output.getvalue()
+        self.assertEqual(text.count("started"), 2)
+        self.assertEqual(text.count("completed"), 2)
+        self.assertIn("INTAKE", text)
+        self.assertIn("PLAN", text)
+        self.assertNotIn("arbitrary provider prose", text)
+        self.assertNotRegex(text, r"\x1b\[|\r")
+
+    def test_progress_terminal_failure_and_unknown_event_are_safe(self):
+        output = io.StringIO()
+        progress = create_progress_renderer(output, no_color=True)
+        progress(RuntimeProgressEvent("started", Stage.INTAKE, 0.0))
+        progress(RuntimeProgressEvent("unknown", Stage.INTAKE, 1.0, "secret stderr"))
+        progress(RuntimeProgressEvent("timed_out", Stage.INTAKE, 3.25))
+        self.assertEqual(output.getvalue(), "INTAKE started\nINTAKE timed out duration=3.2s\n")
+
     def test_default_plan_is_concise_and_omits_identity_and_full_contract_noise(self):
         output = io.StringIO()
         render_result(plan_document(), mode=OutputMode.HUMAN, stream=output)
