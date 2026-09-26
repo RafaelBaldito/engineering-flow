@@ -488,6 +488,47 @@ class CliTests(unittest.TestCase):
         self.assertIsNone(store.get_active_clarification(workflow.id).answer)
         store.close()
 
+    def test_interactive_plan_changes_create_revisions_then_approve_latest(self):
+        class Runtime(FakeRuntime):
+            def verify_planning_capabilities(self, repository):
+                return CapabilityReport("fake", "fake", str(repository), True, {"read_only": True}, True)
+
+            def execute(self, request):
+                self.requests.append(request)
+                artifact_id, sha256 = re.search(r"artifact UUID ([^,]+), sha256 ([^)]+)", request.instruction).groups()
+                revision = int(re.search(r"revision=(\d+)", request.instruction).group(1))
+                return PlanningExecutionResult("fake", request.logical_session_id or "s", "thread", "turn", TerminalState.SUCCEEDED,
+                    {"plan": {"id": f"{request.workflow_id}:plan:r{revision}", "workflow_id": request.workflow_id,
+                    "revision": revision, "feature_contract": {"artifact_id": artifact_id, "sha256": sha256},
+                    "strategy": f"Revision {revision}.", "assumptions": [], "verification_strategy": ["tests"],
+                    "tasks": [{"id": "T1", "objective": "Change source.",
+                    "context": {"relevant_files": ["source.py"], "existing_patterns": []}, "requirements": ["Update behavior."],
+                    "acceptance_criteria": ["Works."], "verification": ["tests"], "constraints": [], "depends_on": [],
+                    "complexity": "low", "risk": "low"}]}})
+
+        class Tty(io.StringIO):
+            def isatty(self): return True
+
+        workflow_id = self.ready_v2_workflow()
+        stdout, stderr, stdin = Tty(), Tty(), Tty("n\nUse PascalCase.\nn\nUse a repository layer.\ny\n")
+        with patch("engineering_flow.cli.CodexCliRuntime", Runtime), patch("engineering_flow.cli.sys.stdin", stdin), \
+                patch("engineering_flow.cli.sys.stdout", stdout), patch("engineering_flow.cli.sys.stderr", stderr):
+            self.assertEqual(main(["resume", "--repo", str(self.repository), "--workflow", workflow_id]), 0)
+        store = WorkflowStore(self.repository / ".engineering-flow" / "workflows.sqlite3")
+        workflow = store.get_workflow(workflow_id)
+        plans = store.list_artifacts(workflow_id, Stage.PLAN)
+        changes = store.list_plan_change_requests(workflow_id)
+        self.assertEqual((workflow.stage, workflow.status), (Stage.PLAN, WorkflowStatus.PLAN_APPROVED))
+        self.assertEqual([plan.revision for plan in plans], [1, 2, 3])
+        self.assertEqual([change.feedback for change in changes], ["Use PascalCase.", "Use a repository layer."])
+        self.assertEqual([(change.target_plan_artifact_id, change.replacement_plan_artifact_id) for change in changes],
+                         [(plans[0].id, plans[1].id), (plans[1].id, plans[2].id)])
+        self.assertEqual(store.get_artifact(plans[0].id).approval_state, ApprovalState.CHANGES_REQUESTED)
+        self.assertEqual(store.get_artifact(plans[1].id).approval_state, ApprovalState.CHANGES_REQUESTED)
+        self.assertEqual(store.get_artifact(plans[2].id).approval_state, ApprovalState.APPROVED)
+        self.assertIn("Approve this revised plan? [Y/n]", stdout.getvalue())
+        store.close()
+
     def test_cli_fake_runtime_reaches_wave_two_after_three_exact_approvals(self):
         with patch("engineering_flow.cli.CodexCliRuntime", FakeRuntime):
             _, text = self.invoke(["run", "--repo", str(self.repository), "--feature-file", str(self.feature)])

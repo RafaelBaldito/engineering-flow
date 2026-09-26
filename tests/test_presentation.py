@@ -92,7 +92,7 @@ class PresentationTests(unittest.TestCase):
         self.assertEqual(prompt_for_plan_decision(Tty("wat\nYES\n"), output, no_color=True), ("approve", None))
         self.assertIn("Please enter y or n.", output.getvalue())
         self.assertEqual(prompt_for_plan_decision(Tty("n\nToo broad.\n"), Tty(), no_color=True),
-                         ("reject", "Too broad."))
+                         ("request_changes", "Too broad."))
         self.assertEqual(prompt_for_plan_decision(Tty("\n"), Tty(), no_color=True), ("approve", None))
         self.assertIsNone(prompt_for_plan_decision(Tty(""), Tty(), no_color=True))
 

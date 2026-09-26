@@ -285,17 +285,20 @@ def prompt_for_plan_decision(
     *,
     no_color: bool = False,
     environ: Mapping[str, str] | None = None,
+    revised: bool = False,
+    allow_changes: bool = True,
 ) -> tuple[str, str | None] | None:
     """Read one explicit Plan decision at the presentation boundary.
 
     ``None`` means EOF before a complete decision.  Empty input approves only
-    at the decision prompt; a rejection reason remains subject to the domain's
-    existing optional/required rule.
+    at the decision prompt.  ``n`` requests a non-empty revision instruction;
+    terminal rejection remains an explicit command rather than an interactive
+    shortcut.
     """
 
     console = build_console(output_stream, no_color=no_color, environ=environ)
     while True:
-        console.print("Approve this plan? [Y/n]", end=" ")
+        console.print("Approve this revised plan? [Y/n]" if revised else "Approve this plan? [Y/n]", end=" ")
         answer = input_stream.readline()
         if answer == "":
             return None
@@ -303,11 +306,18 @@ def prompt_for_plan_decision(
         if normalized in {"", "y", "yes"}:
             return "approve", None
         if normalized in {"n", "no"}:
-            console.print("Rejection reason:", end=" ")
-            reason = input_stream.readline()
-            if reason == "":
-                return None
-            return "reject", reason.strip() or None
+            if not allow_changes:
+                return "changes_unavailable", None
+            console.print("What should be changed?")
+            while True:
+                console.print(">", end=" ")
+                feedback = input_stream.readline()
+                if feedback == "":
+                    return None
+                feedback = feedback.strip()
+                if feedback:
+                    return "request_changes", feedback
+                console.print("Please enter non-empty feedback.", style="yellow")
         console.print("Please enter y or n.", style="yellow")
 
 
@@ -343,6 +353,15 @@ def render_recovery_instruction(output_stream: TextIO, *, no_color: bool = False
     console = build_console(output_stream, no_color=no_color, environ=environ)
     console.print("Plan is awaiting approval.", style="yellow")
     console.print("Run `engineering-flow approve --repo .` or `engineering-flow reject --repo . --reason \"...\"`.")
+
+
+def render_plan_revision_limit_instruction(output_stream: TextIO, *, no_color: bool = False,
+                                           environ: Mapping[str, str] | None = None) -> None:
+    """Explain the local Planner-call boundary without changing workflow state."""
+
+    console = build_console(output_stream, no_color=no_color, environ=environ)
+    console.print("Planner-call limit reached; the current Plan remains awaiting approval.", style="yellow")
+    console.print("Approve it now, or run `engineering-flow resume --repo .` to request more changes.")
 
 
 def render_clarification_recovery_instruction(output_stream: TextIO, *, no_color: bool = False,
@@ -475,6 +494,7 @@ __all__ = [
     "prompt_for_clarification",
     "prompt_for_plan_decision",
     "render_plan_decision_result",
+    "render_plan_revision_limit_instruction",
     "render_recovery_instruction",
     "render_clarification_recovery_instruction",
     "render_human",

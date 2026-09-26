@@ -596,3 +596,28 @@ Improving Planner prompt/schema adherence, provider retries, or task-ID reliabil
 `AWAITING_HUMAN_APPROVAL`
 
 There are no blocking open product decisions. Approval of this plan authorizes the explicit choices above: two narrow additive tables, `CHANGES_REQUESTED` workflow/artifact states, revision-aware legacy-compatible filenames, stage-local V2 current-artifact resolution, `resume --answer/--feedback` as minimal explicit inputs, and per-invocation limits of five Intake calls and three Planner calls.
+
+## Step 4 closure
+
+Implemented the interactive Plan revision loop without changing the Step 3
+change-request persistence model. Interactive `n`/`no` now collects one
+non-empty `What should be changed?` response, persists it through the existing
+change-request authority, and replans before presenting the exact persisted
+replacement revision again. Interactive approval always re-resolves the latest
+pending Plan artifact. Explicit `reject --reason` remains terminal.
+
+EOF or Ctrl+C before feedback persistence leaves the current Plan awaiting
+approval. EOF/Ctrl+C during provider work retain the existing recoverable
+change-request/unknown-operation behavior. Plain interactive `resume` retries
+an already-persisted open request without prompting for its feedback, while
+`resume --feedback` remains a single explicit revision attempt. JSON and
+non-TTY modes do not prompt.
+
+The CLI enforces a local maximum of three Planner dispatches per invocation.
+At the boundary, the newest valid Plan can still be approved, but no feedback
+is collected for a fourth dispatch; `resume` starts with a fresh local budget.
+`PLAN_APPROVED` therefore records approval of the exact latest Plan after the
+human had an opportunity to request revisions. No Task Contract execution or
+MDS #3 behavior was added; V1 routing remains unchanged.
+
+Validation: 173 unit tests pass.

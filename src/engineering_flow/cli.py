@@ -37,7 +37,7 @@ from .orchestrator import IntakeOrchestrator, PlanningOrchestrator, V2HappyPathC
 from .presentation import (OutputMode, create_progress_renderer, interactive_prompt_eligible,
                            prompt_for_clarification, prompt_for_plan_decision,
                            render_clarification_recovery_instruction, render_plan_decision_result,
-                           render_recovery_instruction, render_result)
+                           render_plan_revision_limit_instruction, render_recovery_instruction, render_result)
 from .sanitization import sanitize_payload, sanitize_text
 from .store import WorkflowStore
 
@@ -52,6 +52,7 @@ EXIT_PERSISTENCE = 7
 EXIT_HUMAN_ATTENTION = 8
 EXIT_INTERRUPTED = 130
 MAX_INTAKE_CALLS_PER_INVOCATION = 5
+MAX_PLANNER_CALLS_PER_INVOCATION = 3
 
 ERROR_CODES = {
     "usage": "usage",
@@ -434,6 +435,62 @@ def _continue_v2_clarifications(
     return workflow, False
 
 
+def _interactive_v2_plan_loop(
+    workflow: Workflow,
+    *,
+    command: str,
+    store: WorkflowStore,
+    plan: V2PlanOrchestrator,
+    progress_sink: Any,
+    planner_calls: int,
+    verbose: bool,
+    no_color: bool,
+) -> tuple[Workflow, bool]:
+    """Drive only the human Plan boundary using persisted Step 3 authority.
+
+    The caller supplies calls already dispatched in this CLI invocation.  The
+    loop deliberately resolves the pending artifact afresh before *every*
+    prompt, so replacement identity never comes from process-local state.
+    """
+
+    while workflow.stage is Stage.PLAN and workflow.status is WorkflowStatus.AWAITING_APPROVAL:
+        projection = plan.inspect_plan_projection(workflow.id, repair=True)
+        payload = _workflow_payload(store, workflow, plan_projection=projection)
+        document = _result_document(command, workflow=workflow, data=payload)
+        if projection.error:
+            document["recovery_instruction"] = True
+            render_result(document, mode=OutputMode.VERBOSE if verbose else OutputMode.HUMAN,
+                          stream=sys.stdout, no_color=no_color)
+            return workflow, True
+        render_result(document, mode=OutputMode.VERBOSE if verbose else OutputMode.HUMAN,
+                      stream=sys.stdout, no_color=no_color)
+        artifact_id = plan.resolve_current_pending_plan_artifact(workflow.id)
+        decision = prompt_for_plan_decision(
+            sys.stdin, sys.stdout, no_color=no_color,
+            revised=payload.get("plan", {}).get("revision", 1) > 1,
+            allow_changes=planner_calls < MAX_PLANNER_CALLS_PER_INVOCATION,
+        )
+        if decision is None:
+            render_recovery_instruction(sys.stdout, no_color=no_color)
+            return workflow, True
+        action, feedback = decision
+        if action == "approve":
+            workflow = plan.approve(workflow.id, artifact_id)
+            render_plan_decision_result(sys.stdout, "approve", no_color=no_color)
+            return workflow, True
+        # Do not collect input that cannot be dispatched in this invocation.
+        # The choice itself is intentionally non-durable until feedback is
+        # accepted by the Step 3 transaction.
+        if action == "changes_unavailable" or planner_calls >= MAX_PLANNER_CALLS_PER_INVOCATION:
+            render_plan_revision_limit_instruction(sys.stdout, no_color=no_color)
+            return workflow, True
+        workflow = plan.request_changes(workflow.id, feedback or "", progress_sink=progress_sink)
+        planner_calls += 1
+        if workflow.status is not WorkflowStatus.AWAITING_APPROVAL:
+            return workflow, False
+    return workflow, False
+
+
 def _resolve_v2_workflow(store: WorkflowStore, explicit_workflow_id: str | None) -> tuple[Workflow, bool]:
     """Resolve explicit V2 context or the persisted selected V2 workflow.
 
@@ -566,31 +623,17 @@ def _run_command(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
                 if args.json_output or workflow.stage is not Stage.PLAN or workflow.status is not WorkflowStatus.AWAITING_APPROVAL:
                     return document, exit_code
 
-                projection = payload.get("plan", {}).get("projection_error") if isinstance(payload.get("plan"), dict) else None
-                if projection:
-                    document["recovery_instruction"] = True
-                    return document, exit_code
                 if not interactive_prompt_eligible(sys.stdin, sys.stdout, sys.stderr):
                     document["recovery_instruction"] = True
                     return document, exit_code
-
-                # Render the verified review view before reading a decision.
-                # Resolution itself reuses every canonical approval guard.
-                artifact_id = plan_orchestrator.resolve_current_pending_plan_artifact(workflow.id)
-                render_result(document, mode=OutputMode.VERBOSE if args.verbose else OutputMode.HUMAN,
-                              stream=sys.stdout, no_color=args.no_color)
-                decision = prompt_for_plan_decision(sys.stdin, sys.stdout, no_color=args.no_color)
-                if decision is None:
-                    render_recovery_instruction(sys.stdout, no_color=args.no_color)
-                    document["_already_rendered"] = True
-                    return document, exit_code
-                action, reason = decision
-                workflow = (plan_orchestrator.approve(workflow.id, artifact_id)
-                            if action == "approve"
-                            else plan_orchestrator.reject(workflow.id, artifact_id, reason=reason))
+                workflow, rendered = _interactive_v2_plan_loop(
+                    workflow, command=command, store=store, plan=plan_orchestrator,
+                    progress_sink=progress_sink, planner_calls=1, verbose=args.verbose,
+                    no_color=args.no_color,
+                )
                 result = _result_document(command, workflow=workflow, data=_workflow_payload(store, workflow))
-                render_plan_decision_result(sys.stdout, action, no_color=args.no_color)
-                result["_already_rendered"] = True
+                if rendered:
+                    result["_already_rendered"] = True
                 return result, EXIT_SUCCESS
             feature_file = _validate_feature_file(args.feature_file)
             workflow = orchestrator.run(config.repository_path, feature_file=feature_file, provider=config.provider_name, configuration_snapshot=config.snapshot)
@@ -670,28 +713,24 @@ def _run_command(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
         if eof_at_clarification:
             document["_already_rendered"] = True
             return document, exit_code
-        if (command == "resume" and args.feedback is None and existing.status is not WorkflowStatus.CHANGES_REQUESTED and not args.json_output
+        if (command == "resume" and args.feedback is None and not args.json_output
                 and workflow.lifecycle_version is LifecycleVersion.V2
                 and workflow.stage is Stage.PLAN and workflow.status is WorkflowStatus.AWAITING_APPROVAL
                 and interactive_prompt_eligible(sys.stdin, sys.stdout, sys.stderr)):
-            projection = payload.get("plan", {}).get("projection_error") if isinstance(payload, dict) and isinstance(payload.get("plan"), dict) else None
-            if not projection:
-                artifact_id = plan_orchestrator.resolve_current_pending_plan_artifact(workflow.id)
-                render_result(document, mode=OutputMode.VERBOSE if args.verbose else OutputMode.HUMAN,
-                              stream=sys.stdout, no_color=args.no_color)
-                decision = prompt_for_plan_decision(sys.stdin, sys.stdout, no_color=args.no_color)
-                if decision is None:
-                    render_recovery_instruction(sys.stdout, no_color=args.no_color)
-                    document["_already_rendered"] = True
-                    return document, exit_code
-                action, reason = decision
-                workflow = (plan_orchestrator.approve(workflow.id, artifact_id)
-                            if action == "approve"
-                            else plan_orchestrator.reject(workflow.id, artifact_id, reason=reason))
-                result = _result_document(command, workflow=workflow, data=_workflow_payload(store, workflow))
-                render_plan_decision_result(sys.stdout, action, no_color=args.no_color)
+            # A pending change request was retried just above, so its dispatch
+            # consumes this invocation's first local Planner slot.
+            planner_calls = (1 if existing.status is WorkflowStatus.CHANGES_REQUESTED
+                             or (existing.stage is Stage.INTAKE and existing.status is WorkflowStatus.READY)
+                             else 0)
+            workflow, rendered = _interactive_v2_plan_loop(
+                workflow, command=command, store=store, plan=plan_orchestrator,
+                progress_sink=create_progress_renderer(sys.stderr, no_color=args.no_color),
+                planner_calls=planner_calls, verbose=args.verbose, no_color=args.no_color,
+            )
+            result = _result_document(command, workflow=workflow, data=_workflow_payload(store, workflow))
+            if rendered:
                 result["_already_rendered"] = True
-                return result, EXIT_SUCCESS
+            return result, EXIT_SUCCESS
         return document, exit_code
     finally:
         store.close()
