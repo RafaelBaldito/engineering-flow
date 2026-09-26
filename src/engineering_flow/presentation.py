@@ -167,6 +167,14 @@ def render_plan_summary(console: Console, document: Mapping[str, Any], plan: Map
         if plan.get("decision_reason"):
             console.print("Rejection reason recorded.")
 
+    markdown_path = plan.get("plan_markdown_path")
+    if markdown_path:
+        console.print()
+        _heading(console, "Review")
+        console.print(Text(str(markdown_path)))
+    if plan.get("projection_error"):
+        console.print(Text("Plan view could not be regenerated from canonical JSON.", style="yellow"))
+
 
 def _render_legacy_summary(console: Console, document: Mapping[str, Any]) -> None:
     artifacts = document.get("artifacts")

@@ -178,7 +178,7 @@ class CliTests(unittest.TestCase):
         self.assertIn("AWAITING_APPROVAL", stdout.getvalue())
         self.assertIn("T1", stdout.getvalue())
         self.assertIn("low complexity", stdout.getvalue())
-        self.assertNotIn(workflow_id, stdout.getvalue())
+        self.assertIn(f".engineering-flow/workflows/{workflow_id}/artifacts/002-plan.md", stdout.getvalue().replace("\n", ""))
         self.assertNotIn("source.py", stdout.getvalue())
         self.assertNotIn("Update behavior.", stdout.getvalue())
 

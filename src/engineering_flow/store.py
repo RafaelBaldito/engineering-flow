@@ -8,6 +8,7 @@ import os
 import re
 import sqlite3
 import threading
+import tempfile
 import uuid
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
@@ -1909,6 +1910,73 @@ class WorkflowStore:
 
     def _artifact_destination(self, artifact_path: str | os.PathLike[str]) -> Path:
         return self._workspace_file(artifact_path, label="artifact")
+
+    def plan_markdown_path(self, workflow_id: str) -> Path:
+        """Return the fixed, confined derived Plan projection path.
+
+        This is deliberately not an artifact path: callers must not use it in
+        generation transactions or artifact identity checks.
+        """
+
+        destination = self._workspace_file(
+            self.workspace_path / "workflows" / workflow_id / "artifacts" / "002-plan.md",
+            label="Plan projection",
+        )
+        expected_parent = (self.workspace_path / "workflows" / workflow_id / "artifacts").resolve()
+        try:
+            destination.relative_to(expected_parent)
+        except ValueError as exc:
+            raise ValidationFailure("Plan projection destination must be inside its workflow artifacts directory") from exc
+        return destination
+
+    def read_plan_markdown(self, workflow_id: str) -> bytes | None:
+        """Read the derived view only; missing is an expected cache state."""
+
+        path = self.plan_markdown_path(workflow_id)
+        try:
+            return path.read_bytes()
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            raise PersistenceFailure(f"could not read Plan projection: {exc}") from exc
+
+    def write_plan_markdown(self, workflow_id: str, content: str) -> Path:
+        """Atomically replace a derived Plan projection without touching SQLite."""
+
+        destination = self.plan_markdown_path(workflow_id)
+        encoded = content.encode("utf-8")
+        temporary_name: str | None = None
+        try:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            descriptor, temporary_name = tempfile.mkstemp(
+                prefix=".002-plan.", suffix=".tmp", dir=destination.parent
+            )
+            with os.fdopen(descriptor, "wb") as handle:
+                handle.write(encoded)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary_name, destination)
+            temporary_name = None
+            try:
+                directory_descriptor = os.open(destination.parent, os.O_RDONLY)
+                try:
+                    os.fsync(directory_descriptor)
+                finally:
+                    os.close(directory_descriptor)
+            except OSError:
+                # The replacement is already complete. Directory fsync support
+                # varies by filesystem and must not turn this cache write into
+                # a canonical workflow failure.
+                pass
+            return destination
+        except OSError as exc:
+            raise PersistenceFailure(f"could not write Plan projection: {exc}") from exc
+        finally:
+            if temporary_name is not None:
+                try:
+                    Path(temporary_name).unlink(missing_ok=True)
+                except OSError:
+                    pass
 
     def _workspace_file(self, file_path: str | os.PathLike[str], *, label: str) -> Path:
         destination = Path(file_path).expanduser().resolve()

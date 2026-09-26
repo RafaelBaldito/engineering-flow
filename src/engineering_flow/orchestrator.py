@@ -6,7 +6,7 @@ import hashlib
 import json
 import uuid
 import time
-from dataclasses import asdict, is_dataclass
+from dataclasses import asdict, dataclass, is_dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -46,6 +46,7 @@ from .runtime import (
     CapabilityRegistry,
     CapabilityResolutionStatus,
 )
+from .plan_markdown import render_plan_markdown
 from .store import WorkflowStore
 
 
@@ -163,6 +164,15 @@ class IntakeOrchestrator:
         return result_workflow
 
 
+@dataclass(frozen=True, slots=True)
+class PlanProjection:
+    """Observation of the non-authoritative Plan Markdown cache."""
+
+    path: Path
+    state: str
+    error: str | None = None
+
+
 class V2PlanOrchestrator:
     """The deliberately bounded V2 successor: Plan and stop."""
     def __init__(self, store: WorkflowStore, runtime: AgentRuntime, *, timeout_seconds: float = 1800,
@@ -234,8 +244,31 @@ class V2PlanOrchestrator:
             _emit_progress(progress_sink, Stage.PLAN, "failed", self._monotonic() - started)
             return self.store.get_workflow(workflow.id)
         self.store.complete_generation(intent.operation.idempotency_key, content=json.dumps(plan.as_payload(), ensure_ascii=False, indent=2) + "\n", artifact_path=artifact_path, stage=Stage.PLAN, revision=revision, terminal_result={"provider": result.provider, "final_payload": plan.as_payload(), "usage": dict(result.usage), "metadata": dict(result.metadata)}, workflow_stage=Stage.PLAN, workflow_status=WorkflowStatus.AWAITING_APPROVAL, approval_state=ApprovalState.PENDING, completion_event_type="plan.completed", completion_event_payload={"plan_id": plan.id, "revision": revision, "task_count": len(plan.tasks), "feature_contract_artifact_id": feature_artifact.id})
+        # The canonical JSON transaction has committed.  This is deliberately
+        # best-effort: projection failure cannot change Plan validity or state.
+        try:
+            self.inspect_plan_projection(workflow.id, repair=True)
+        except PersistenceFailure:
+            pass
         _emit_progress(progress_sink, Stage.PLAN, "completed", self._monotonic() - started)
         return self.store.get_workflow(workflow.id)
+
+    def inspect_plan_projection(self, workflow_id: str, *, repair: bool = False) -> PlanProjection:
+        """Verify canonical inputs then inspect, and optionally repair, its view."""
+
+        workflow, _artifact, plan = self._verified_plan(workflow_id)
+        expected_markdown = render_plan_markdown(plan)
+        expected = expected_markdown.encode("utf-8")
+        path = self.store.plan_markdown_path(workflow.id)
+        actual = self.store.read_plan_markdown(workflow.id)
+        state = "missing" if actual is None else ("current" if actual == expected else "modified")
+        if repair and state != "current":
+            try:
+                self.store.write_plan_markdown(workflow.id, expected_markdown)
+            except PersistenceFailure as exc:
+                return PlanProjection(path, state, str(exc))
+            return PlanProjection(path, "current")
+        return PlanProjection(path, state)
 
     def approve(self, workflow_id: str, artifact_id: str, *, actor: str = "human",
                 reason: str | None = None) -> Workflow:
@@ -289,6 +322,42 @@ class V2PlanOrchestrator:
 
         # Re-read immutable bytes before the transaction; approval is for the
         # verified Plan, not merely for its database identifier.
+        try:
+            payload = json.loads(self.store.read_artifact(artifact.id))
+        except json.JSONDecodeError as exc:
+            raise ValidationFailure("Plan artifact is not valid JSON") from exc
+        source = self.store.list_artifacts(workflow.id, Stage.INTAKE)
+        if len(source) != 1:
+            raise ValidationFailure("exact READY Feature Contract artifact is required")
+        feature_artifact = source[0]
+        if (feature_artifact.revision != 1
+                or feature_artifact.approval_state is not ApprovalState.NOT_REQUIRED):
+            raise ValidationFailure("Feature Contract artifact is not a READY Intake artifact")
+        try:
+            feature_payload = json.loads(self.store.read_artifact(feature_artifact.id))
+        except json.JSONDecodeError as exc:
+            raise ValidationFailure("Feature Contract artifact is not valid JSON") from exc
+        feature = FeatureContract.parse(feature_payload, workflow_id=workflow.id)
+        if feature.outcome is not IntakeOutcome.READY or feature.open_questions:
+            raise ValidationFailure("Feature Contract must be READY")
+        plan = Plan.parse(
+            payload, workflow_id=workflow.id, revision=artifact.revision,
+            feature_contract_artifact_id=feature_artifact.id,
+            feature_contract_sha256=feature_artifact.sha256,
+            repository_path=workflow.repository_path,
+        )
+        return workflow, artifact, plan
+
+    def _verified_plan(self, workflow_id: str) -> tuple[Workflow, Any, Plan]:
+        """Load a Plan only after hash-verifying its JSON and READY source."""
+
+        workflow = self.store.get_workflow(workflow_id)
+        if workflow.lifecycle_version is not LifecycleVersion.V2 or workflow.stage is not Stage.PLAN:
+            raise ConflictFailure("workflow has no V2 Plan projection")
+        plans = self.store.list_artifacts(workflow.id, Stage.PLAN)
+        if not plans:
+            raise ValidationFailure("Plan artifact is required for projection")
+        artifact = plans[-1]
         try:
             payload = json.loads(self.store.read_artifact(artifact.id))
         except json.JSONDecodeError as exc:

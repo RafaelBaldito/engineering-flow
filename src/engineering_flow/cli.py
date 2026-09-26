@@ -122,7 +122,7 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _workflow_payload(store: WorkflowStore, workflow: Workflow) -> dict[str, Any]:
+def _workflow_payload(store: WorkflowStore, workflow: Workflow, *, plan_projection: Any = None) -> dict[str, Any]:
     artifacts = []
     for artifact in store.list_artifacts(workflow.id):
         # Reading is deliberate: status and logs must detect tampering without
@@ -172,7 +172,7 @@ def _workflow_payload(store: WorkflowStore, workflow: Workflow) -> dict[str, Any
         "active_task": active_task,
         "lifecycle_version": workflow.lifecycle_version.value,
         **(_intake_payload(store, workflow) if workflow.lifecycle_version is LifecycleVersion.V2 else {}),
-        **(_plan_payload(store, workflow) if workflow.lifecycle_version is LifecycleVersion.V2 and workflow.stage is Stage.PLAN else {}),
+        **(_plan_payload(store, workflow, projection=plan_projection) if workflow.lifecycle_version is LifecycleVersion.V2 and workflow.stage is Stage.PLAN else {}),
     }
 
 
@@ -188,13 +188,25 @@ def _intake_payload(store: WorkflowStore, workflow: Workflow) -> dict[str, Any]:
                        "open_questions": feature.get("open_questions", [])}}
 
 
-def _plan_payload(store: WorkflowStore, workflow: Workflow) -> dict[str, Any]:
+def _plan_payload(store: WorkflowStore, workflow: Workflow, *, projection: Any = None) -> dict[str, Any]:
     artifacts = store.list_artifacts(workflow.id, Stage.PLAN)
     if not artifacts:
         return {"plan": None}
     artifact = artifacts[-1]
     plan = json.loads(store.read_artifact(artifact.id))
     approval = store.get_approval_for_artifact(artifact.id)
+    projection_data: dict[str, Any] = {}
+    if projection is not None:
+        path = Path(projection.path)
+        try:
+            display_path = str(path.relative_to(Path(workflow.repository_path).resolve()))
+        except ValueError:
+            display_path = str(path)
+        projection_data = {
+            "plan_markdown_path": display_path,
+            "projection_state": projection.state,
+            "projection_error": projection.error,
+        }
     return {"plan": {"artifact_id": artifact.id, "sha256": artifact.sha256, "revision": artifact.revision,
                       "approval_state": artifact.approval_state.value,
                       "decision_reason": approval.reason if approval else None,
@@ -202,7 +214,7 @@ def _plan_payload(store: WorkflowStore, workflow: Workflow) -> dict[str, Any]:
                                     "actor": approval.actor, "reason": approval.reason,
                                     "created_at": approval.created_at}
                                    if approval else None),
-                      **plan}}
+                      **projection_data, **plan}}
 
 
 def _task_evidence(store: WorkflowStore, artifact_id: str | None, *, kind: str) -> dict[str, Any] | None:
@@ -391,6 +403,17 @@ def _run_command(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
     config = load_config(args.repo)
     store, orchestrator, intake_orchestrator, plan_orchestrator = _services(config)
     try:
+        def payload_for(workflow: Workflow) -> dict[str, Any]:
+            projection = None
+            if (workflow.lifecycle_version is LifecycleVersion.V2 and workflow.stage is Stage.PLAN
+                    and store.list_artifacts(workflow.id, Stage.PLAN)):
+                # JSON is strictly observation-only. Human commands may repair
+                # only this derived cache after canonical JSON is verified.
+                projection = plan_orchestrator.inspect_plan_projection(
+                    workflow.id, repair=not args.json_output
+                )
+            return _workflow_payload(store, workflow, plan_projection=projection)
+
         if command == "run":
             if args.request is not None:
                 workflow = intake_orchestrator.run(
@@ -400,13 +423,13 @@ def _run_command(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
                         sys.stderr, no_color=args.no_color,
                     )),
                 )
-                payload = _workflow_payload(store, workflow)
+                payload = payload_for(workflow)
                 return _result_document(command, workflow=workflow, data=payload), EXIT_SUCCESS
             feature_file = _validate_feature_file(args.feature_file)
             workflow = orchestrator.run(config.repository_path, feature_file=feature_file, provider=config.provider_name, configuration_snapshot=config.snapshot)
         elif command == "status":
             workflow = orchestrator.status(args.workflow)
-            payload = _workflow_payload(store, workflow)
+            payload = payload_for(workflow)
             code, exit_code = _failure_for_workflow(store, workflow)
             return _result_document(command, workflow=workflow, error_code=code, data=payload), exit_code
         elif command == "approve":
@@ -439,16 +462,18 @@ def _run_command(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
             workflow = orchestrator.intervene(args.workflow, args.task, reason=args.reason)
         elif command == "logs":
             workflow = orchestrator.status(args.workflow)
-            payload = _workflow_payload(store, workflow)
+            payload = payload_for(workflow)
             payload["events"] = [_event_payload(event) for event in orchestrator.logs(args.workflow, after=args.after)]
             code, exit_code = _failure_for_workflow(store, workflow)
             return _result_document(command, workflow=workflow, error_code=code, data=payload), exit_code
         else:
             raise ValidationFailure(f"unsupported command: {command}")
         code, exit_code = _failure_for_workflow(store, workflow)
-        payload = (_workflow_payload(store, workflow)
-                   if command in ("resume", "approve", "reject") and workflow.lifecycle_version is LifecycleVersion.V2
-                   else None)
+        payload = (payload_for(workflow)
+                   if command == "resume" and workflow.lifecycle_version is LifecycleVersion.V2
+                   else (_workflow_payload(store, workflow)
+                         if command in ("approve", "reject") and workflow.lifecycle_version is LifecycleVersion.V2
+                         else None))
         return _result_document(command, workflow=workflow, error_code=code, data=payload), exit_code
     finally:
         store.close()
