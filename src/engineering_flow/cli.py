@@ -107,9 +107,9 @@ def build_parser() -> argparse.ArgumentParser:
     run_output.add_argument("--verbose", action="store_true")
     run.add_argument("--no-color", action="store_true")
 
-    for name in ("status", "approve", "reject", "resume", "intervene", "logs"):
+    for name in ("status", "approve", "reject", "resume", "intervene", "logs", "cancel"):
         command = commands.add_parser(name)
-        command.add_argument("--repo", required=True, metavar="PATH")
+        command.add_argument("--repo", default=".", metavar="PATH")
         command.add_argument("--workflow", required=name in ("intervene", "logs"), metavar="ID")
         output = command.add_mutually_exclusive_group()
         output.add_argument("--json", action="store_true", dest="json_output")
@@ -667,9 +667,18 @@ def _run_command(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
                 workflow = orchestrator.reject(existing.id, args.artifact, reason=args.reason)
             if explicit and workflow.lifecycle_version is LifecycleVersion.V2:
                 store.set_selected_workflow_id(workflow.id)
+        elif command == "cancel":
+            existing, explicit = _resolve_v2_workflow(store, args.workflow)
+            if existing.lifecycle_version is not LifecycleVersion.V2:
+                raise ConflictFailure("workflow cancellation is supported only for V2 workflows")
+            workflow = plan_orchestrator.cancel(existing.id)
+            if explicit:
+                store.set_selected_workflow_id(workflow.id)
         elif command == "resume":
             existing, explicit = _resolve_v2_workflow(store, args.workflow)
             if existing.lifecycle_version is LifecycleVersion.V2:
+                if existing.status is WorkflowStatus.CANCELLED:
+                    raise ConflictFailure("workflow is cancelled and cannot be resumed")
                 if args.regenerate:
                     raise ValidationFailure("--regenerate is V1-only")
                 if args.answer is not None:
@@ -707,7 +716,7 @@ def _run_command(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
         payload = (payload_for(workflow)
                    if command == "resume" and workflow.lifecycle_version is LifecycleVersion.V2
                    else (_workflow_payload(store, workflow)
-                         if command in ("approve", "reject") and workflow.lifecycle_version is LifecycleVersion.V2
+                         if command in ("approve", "reject", "cancel") and workflow.lifecycle_version is LifecycleVersion.V2
                          else None))
         document = _result_document(command, workflow=workflow, error_code=code, data=payload)
         if eof_at_clarification:
@@ -745,7 +754,7 @@ def _requested_json_output(argv: list[str]) -> bool:
 def _requested_command(argv: list[str]) -> str:
     """Return the requested stable command without attempting full parsing."""
 
-    commands = {"init", "run", "status", "approve", "reject", "resume", "intervene", "logs"}
+    commands = {"init", "run", "status", "approve", "reject", "resume", "intervene", "logs", "cancel"}
     return next((argument for argument in argv if argument in commands), "unknown")
 
 

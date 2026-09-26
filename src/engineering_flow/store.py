@@ -63,6 +63,7 @@ from .domain import (
     WorkflowScope,
     WorkflowEvent,
     WorkflowStatus,
+    is_terminal_workflow_status,
 )
 from .sanitization import sanitize_configuration_snapshot, sanitize_payload, sanitize_text
 
@@ -743,6 +744,31 @@ class WorkflowStore:
                 event_stage = stage
             if event_type:
                 self._event_unlocked(conn, workflow_id, event_type, stage=event_stage, payload=payload)
+        return self.get_workflow(workflow_id)
+
+    def cancel_v2_workflow(self, workflow_id: str, *, actor: str = "human") -> Workflow:
+        """Durably abandon an active V2 workflow without touching its evidence.
+
+        Repeating an explicit cancellation is intentionally idempotent: no
+        second event is added and no historical artifact is changed.
+        """
+        now = _now()
+        with self._transaction() as conn:
+            row = conn.execute("SELECT stage, status, lifecycle_version FROM workflows WHERE id = ?", (workflow_id,)).fetchone()
+            if row is None:
+                raise NotFoundFailure(f"workflow not found: {workflow_id}")
+            if LifecycleVersion(row["lifecycle_version"]) is not LifecycleVersion.V2:
+                raise ConflictFailure("workflow cancellation is supported only for V2 workflows")
+            status = WorkflowStatus(row["status"])
+            if status is WorkflowStatus.CANCELLED:
+                return self.get_workflow(workflow_id)
+            if is_terminal_workflow_status(status):
+                raise ConflictFailure("workflow is already terminal and cannot be cancelled")
+            stage = Stage(row["stage"])
+            conn.execute("UPDATE workflows SET status = ?, updated_at = ? WHERE id = ?",
+                         (WorkflowStatus.CANCELLED.value, now, workflow_id))
+            self._event_unlocked(conn, workflow_id, "workflow.cancelled", stage=stage,
+                                 payload={"actor": actor})
         return self.get_workflow(workflow_id)
 
     def _create_session_unlocked(self, conn: sqlite3.Connection, workflow_id: str, provider: str,

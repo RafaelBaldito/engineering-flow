@@ -96,6 +96,8 @@ class IntakeOrchestrator:
         workflow = self.store.get_workflow(workflow_id)
         if workflow.lifecycle_version is not LifecycleVersion.V2:
             raise ConflictFailure("workflow is not V2")
+        if workflow.status is WorkflowStatus.CANCELLED:
+            raise ConflictFailure("workflow is cancelled and cannot be resumed")
         if workflow.stage is not Stage.INTAKE or workflow.status not in {
             WorkflowStatus.NEEDS_CLARIFICATION, WorkflowStatus.FAILED, WorkflowStatus.HUMAN_ATTENTION,
         }:
@@ -243,6 +245,8 @@ class V2PlanOrchestrator:
         workflow = self.store.get_workflow(workflow_id)
         if workflow.lifecycle_version is not LifecycleVersion.V2:
             raise ConflictFailure("workflow is not V2")
+        if workflow.status is WorkflowStatus.CANCELLED:
+            raise ConflictFailure("workflow is cancelled and cannot be resumed")
         change_request = self.store.get_open_plan_change_request(workflow.id)
         if workflow.stage is Stage.PLAN and workflow.status is not WorkflowStatus.CHANGES_REQUESTED:
             return workflow
@@ -331,6 +335,9 @@ class V2PlanOrchestrator:
         return self.store.get_workflow(workflow.id)
 
     def request_changes(self, workflow_id: str, feedback: str, *, actor: str = "human", progress_sink: Any = None) -> Workflow:
+        workflow = self.store.get_workflow(workflow_id)
+        if workflow.status is WorkflowStatus.CANCELLED:
+            raise ConflictFailure("workflow is cancelled and cannot accept Plan feedback")
         artifact_id = self.resolve_current_pending_plan_artifact(workflow_id)
         self.store.request_plan_changes(workflow_id, artifact_id, feedback, actor=actor)
         return self.resume(workflow_id, progress_sink=progress_sink)
@@ -376,11 +383,17 @@ class V2PlanOrchestrator:
         )
         return self.store.get_workflow(workflow.id)
 
+    def cancel(self, workflow_id: str, *, actor: str = "human") -> Workflow:
+        """Explicitly abandon an active V2 workflow while retaining all evidence."""
+        return self.store.cancel_v2_workflow(workflow_id, actor=actor)
+
     def resolve_current_pending_plan_artifact(self, workflow_id: str) -> str:
         """Resolve only the exact V2 Plan that the existing gate can decide."""
         workflow = self.store.get_workflow(workflow_id)
         if workflow.lifecycle_version is not LifecycleVersion.V2:
             raise ConflictFailure("workflow is not V2")
+        if workflow.status is WorkflowStatus.CANCELLED:
+            raise ConflictFailure("workflow is cancelled and cannot accept Plan decisions")
         if workflow.stage is not Stage.PLAN or workflow.status is not WorkflowStatus.AWAITING_APPROVAL:
             raise ConflictFailure("workflow is not awaiting Plan approval")
         candidates = [
@@ -401,6 +414,8 @@ class V2PlanOrchestrator:
         workflow = self.store.get_workflow(workflow_id)
         if workflow.lifecycle_version is not LifecycleVersion.V2:
             raise ConflictFailure("workflow is not V2")
+        if workflow.status is WorkflowStatus.CANCELLED:
+            raise ConflictFailure("workflow is cancelled and cannot accept Plan decisions")
         if workflow.stage is not Stage.PLAN or workflow.status is not WorkflowStatus.AWAITING_APPROVAL:
             raise ConflictFailure("workflow is not awaiting Plan approval")
         supplied = self.store.get_artifact(artifact_id)

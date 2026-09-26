@@ -1051,6 +1051,34 @@ class V2PlanApprovalTests(unittest.TestCase):
             "SELECT COUNT(*) FROM task_artifacts WHERE workflow_id = ?", (workflow.id,)
         ).fetchone()[0], 0)
 
+    def test_cancel_preserves_pending_plan_and_blocks_plan_operations(self):
+        workflow, plan, _feature, runtime = self.pending_plan()
+        plan_bytes = Path(plan.path).read_bytes()
+        events_before = len(self.store.list_events(workflow.id))
+        orchestrator = V2PlanOrchestrator(self.store, runtime)
+        cancelled = orchestrator.cancel(workflow.id)
+        self.assertEqual((cancelled.stage, cancelled.status), (Stage.PLAN, WorkflowStatus.CANCELLED))
+        self.assertEqual(Path(plan.path).read_bytes(), plan_bytes)
+        self.assertEqual(self.store.get_artifact(plan.id).sha256, plan.sha256)
+        self.assertEqual(self.store.get_selected_workflow_id(), workflow.id)
+        self.assertEqual(self.store.list_events(workflow.id)[-1].type, "workflow.cancelled")
+        self.assertEqual(orchestrator.cancel(workflow.id).status, WorkflowStatus.CANCELLED)
+        self.assertEqual(len(self.store.list_events(workflow.id)), events_before + 1)
+        with self.assertRaisesRegex(ConflictFailure, "cancelled"):
+            orchestrator.resume(workflow.id)
+        with self.assertRaisesRegex(ConflictFailure, "cancelled"):
+            orchestrator.approve(workflow.id, plan.id)
+        with self.assertRaisesRegex(ConflictFailure, "cancelled"):
+            orchestrator.reject(workflow.id, plan.id, reason="No")
+        self.assertEqual(len(runtime.requests), 1)
+
+    def test_cancel_does_not_rewrite_terminal_v2_workflow(self):
+        workflow, plan, _feature, runtime = self.pending_plan()
+        approved = V2PlanOrchestrator(self.store, runtime).approve(workflow.id, plan.id)
+        with self.assertRaisesRegex(ConflictFailure, "already terminal"):
+            V2PlanOrchestrator(self.store, runtime).cancel(approved.id)
+        self.assertEqual(self.store.get_workflow(workflow.id).status, WorkflowStatus.PLAN_APPROVED)
+
     def test_change_request_persists_before_replan_and_replacement_is_r2(self):
         workflow, plan, feature, runtime = self.pending_plan()
         original = Path(plan.path).read_bytes()

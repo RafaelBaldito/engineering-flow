@@ -1,6 +1,7 @@
 import contextlib
 import io
 import json
+import os
 import re
 import subprocess
 import sys
@@ -481,7 +482,7 @@ class CliTests(unittest.TestCase):
         with patch("engineering_flow.cli.CodexCliRuntime", Runtime), patch("engineering_flow.cli.sys.stdin", stdin), \
                 patch("engineering_flow.cli.sys.stdout", stdout), patch("engineering_flow.cli.sys.stderr", stderr):
             self.assertEqual(main(["run", "--repo", str(self.repository), "--request", "Ambiguous request"]), 0)
-        self.assertIn("resume --repo . --answer", stdout.getvalue())
+        self.assertIn("resume --answer", stdout.getvalue())
         self.assertEqual(len(Runtime.instances[0].requests), 1)
         store = WorkflowStore(self.repository / ".engineering-flow" / "workflows.sqlite3")
         workflow = store.get_workflow(store.get_selected_workflow_id())
@@ -720,6 +721,84 @@ class CliTests(unittest.TestCase):
         self.assertEqual(len(stdout.getvalue().splitlines()), 1)
         document = json.loads(stdout.getvalue())
         self.assertEqual((document["command_result"], document["error_code"]), ("error", "usage"))
+
+    def test_cancel_selected_v2_clarification_preserves_evidence_and_blocks_recovery(self):
+        class AmbiguousRuntime(FakeRuntime):
+            instances = []
+
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.__class__.instances.append(self)
+
+            def verify_planning_capabilities(self, repository):
+                return CapabilityReport("fake", "fake", str(repository), True, {"read_only": True}, True)
+
+            def execute_planning(self, request):
+                self.requests.append(request)
+                return PlanningExecutionResult("fake", request.logical_session_id or "s", "thread", request.execution_id,
+                    TerminalState.SUCCEEDED, {"outcome": "NEEDS_CLARIFICATION", "feature": {
+                        "id": request.workflow_id, "goal": "Goal", "requirements": [], "acceptance_criteria": [],
+                        "constraints": [], "out_of_scope": [], "assumptions": [], "open_questions": ["Which API?"]}})
+
+        with patch("engineering_flow.cli.CodexCliRuntime", AmbiguousRuntime):
+            code, document = self.invoke(["run", "--repo", str(self.repository), "--request", "Ambiguous", "--json"])
+        self.assertEqual((code, document["status"]), (0, "needs_clarification"))
+        workflow_id = document["workflow_id"]
+        store = WorkflowStore(self.repository / ".engineering-flow" / "workflows.sqlite3")
+        feature = store.list_artifacts(workflow_id, Stage.INTAKE)[0]
+        clarification = store.get_active_clarification(workflow_id)
+        feature_bytes = Path(feature.path).read_bytes()
+        store.close()
+
+        # Omitted --repo resolves the selected workflow from the current repo.
+        prior_cwd = Path.cwd()
+        try:
+            os.chdir(self.repository)
+            self.assertEqual(main(["resume"]), 0)
+            out, err = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                self.assertEqual(main(["cancel", "--json"]), 0)
+            self.assertEqual(err.getvalue(), "")
+            self.assertEqual(len(out.getvalue().splitlines()), 1)
+            cancelled = json.loads(out.getvalue())
+        finally:
+            os.chdir(prior_cwd)
+        self.assertEqual((cancelled["workflow_id"], cancelled["status"]), (workflow_id, "cancelled"))
+
+        store = WorkflowStore(self.repository / ".engineering-flow" / "workflows.sqlite3")
+        self.assertEqual(store.get_selected_workflow_id(), workflow_id)
+        self.assertEqual(store.get_workflow(workflow_id).status, WorkflowStatus.CANCELLED)
+        self.assertEqual(Path(feature.path).read_bytes(), feature_bytes)
+        self.assertEqual(store.get_active_clarification(workflow_id).id, clarification.id)
+        event_count = len(store.list_events(workflow_id))
+        store.close()
+
+        for argv in (
+            ["resume", "--repo", str(self.repository)],
+            ["resume", "--repo", str(self.repository), "--answer", "HTTP"],
+            ["cancel", "--repo", str(self.repository)],
+        ):
+            code, text = self.invoke(argv)
+            if argv[0] == "cancel":
+                self.assertEqual(code, 0)
+            else:
+                self.assertEqual(code, 4)
+                self.assertIn("cancelled", text)
+        store = WorkflowStore(self.repository / ".engineering-flow" / "workflows.sqlite3")
+        self.assertEqual(len(store.list_events(workflow_id)), event_count)
+        self.assertEqual(len(AmbiguousRuntime.instances[0].requests), 1)
+        store.close()
+
+        # A new V2 run gets a distinct identity and takes over selection;
+        # cancelling A never reopens or reuses it.
+        with patch("engineering_flow.cli.CodexCliRuntime", AmbiguousRuntime):
+            code, next_workflow = self.invoke(["run", "--repo", str(self.repository), "--request", "New feature", "--json"])
+        self.assertEqual(code, 0)
+        self.assertNotEqual(next_workflow["workflow_id"], workflow_id)
+        store = WorkflowStore(self.repository / ".engineering-flow" / "workflows.sqlite3")
+        self.assertEqual(store.get_selected_workflow_id(), next_workflow["workflow_id"])
+        self.assertEqual(store.get_workflow(workflow_id).status, WorkflowStatus.CANCELLED)
+        store.close()
 
     def test_task_status_logs_and_intervention_are_persisted_projections(self):
         store = WorkflowStore(self.repository / ".engineering-flow" / "workflows.sqlite3")

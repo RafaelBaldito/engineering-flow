@@ -173,6 +173,8 @@ def render_plan_summary(console: Console, document: Mapping[str, Any], plan: Map
         console.print(Text("Plan rejected.", style="red"))
         if plan.get("decision_reason"):
             console.print("Rejection reason recorded.")
+    elif status == "cancelled":
+        console.print(Text("Workflow cancelled.", style="yellow"))
 
     markdown_path = plan.get("plan_markdown_path")
     if markdown_path:
@@ -239,7 +241,7 @@ def render_human(console: Console, document: Mapping[str, Any]) -> None:
     if document.get("recovery_instruction"):
         console.print()
         console.print("Plan is awaiting approval.", style="yellow")
-        console.print("Run `engineering-flow approve --repo .` or `engineering-flow reject --repo . --reason \"...\"`.")
+        console.print("Run `engineering-flow approve` or `engineering-flow reject --reason \"...\"`.")
 
 
 def render_verbose(console: Console, document: Mapping[str, Any]) -> None:
@@ -352,7 +354,7 @@ def render_recovery_instruction(output_stream: TextIO, *, no_color: bool = False
                                 environ: Mapping[str, str] | None = None) -> None:
     console = build_console(output_stream, no_color=no_color, environ=environ)
     console.print("Plan is awaiting approval.", style="yellow")
-    console.print("Run `engineering-flow approve --repo .` or `engineering-flow reject --repo . --reason \"...\"`.")
+    console.print("Run `engineering-flow approve` or `engineering-flow reject --reason \"...\"`.")
 
 
 def render_plan_revision_limit_instruction(output_stream: TextIO, *, no_color: bool = False,
@@ -361,7 +363,7 @@ def render_plan_revision_limit_instruction(output_stream: TextIO, *, no_color: b
 
     console = build_console(output_stream, no_color=no_color, environ=environ)
     console.print("Planner-call limit reached; the current Plan remains awaiting approval.", style="yellow")
-    console.print("Approve it now, or run `engineering-flow resume --repo .` to request more changes.")
+    console.print("Approve it now, or run `engineering-flow resume` to request more changes.")
 
 
 def render_clarification_recovery_instruction(output_stream: TextIO, *, no_color: bool = False,
@@ -370,7 +372,7 @@ def render_clarification_recovery_instruction(output_stream: TextIO, *, no_color
 
     console = build_console(output_stream, no_color=no_color, environ=environ)
     console.print("Clarification remains unanswered.", style="yellow")
-    console.print("Run `engineering-flow resume --repo . --answer \"...\"`.")
+    console.print("Run `engineering-flow resume --answer \"...\"`.")
 
 
 def render_plan_decision_result(output_stream: TextIO, decision: str, *, no_color: bool = False,

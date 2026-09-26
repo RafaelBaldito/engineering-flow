@@ -82,6 +82,21 @@ class WorkflowStatus(_ValueEnum):
     CHANGES_REQUESTED = "changes_requested"
 
 
+def is_terminal_workflow_status(status: WorkflowStatus) -> bool:
+    """Return whether a workflow lifecycle status cannot be continued.
+
+    ``FAILED`` and ``HUMAN_ATTENTION`` are deliberately absent: both are
+    recoverable boundaries in the existing V2 lifecycle.
+    """
+
+    return status in {
+        WorkflowStatus.CANCELLED,
+        WorkflowStatus.REJECTED,
+        WorkflowStatus.PLAN_APPROVED,
+        WorkflowStatus.COMPLETED,
+    }
+
+
 class ApprovalPolicy(_ValueEnum):
     REQUIRED = "required"
     AUTOMATIC = "automatic"
