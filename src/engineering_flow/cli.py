@@ -8,7 +8,7 @@ import sqlite3
 import sys
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from .codex_cli import CodexCliRuntime
 from .config import (
@@ -33,6 +33,7 @@ from .domain import (
     LifecycleVersion,
 )
 from .orchestrator import IntakeOrchestrator, PlanningOrchestrator, V2PlanOrchestrator
+from .presentation import OutputMode, make_plan_progress_renderer, render_result
 from .sanitization import sanitize_payload, sanitize_text
 from .store import WorkflowStore
 
@@ -94,20 +95,25 @@ def build_parser() -> argparse.ArgumentParser:
     input_mode.add_argument("--feature-file", metavar="PATH")
     input_mode.add_argument("--request", metavar="TEXT")
     run.add_argument("--provider", choices=("codex-cli",), default="codex-cli")
+    run_output = run.add_mutually_exclusive_group()
+    run_output.add_argument("--json", action="store_true", dest="json_output")
+    run_output.add_argument("--verbose", action="store_true")
+    run.add_argument("--no-color", action="store_true")
 
     for name in ("status", "approve", "reject", "resume", "intervene", "logs"):
         command = commands.add_parser(name)
         command.add_argument("--repo", required=True, metavar="PATH")
         command.add_argument("--workflow", required=True, metavar="ID")
-        if name in ("status", "logs", "intervene"):
-            command.add_argument("--json", action="store_true", dest="json_output")
+        output = command.add_mutually_exclusive_group()
+        output.add_argument("--json", action="store_true", dest="json_output")
+        output.add_argument("--verbose", action="store_true")
+        command.add_argument("--no-color", action="store_true")
         if name in ("approve", "reject"):
             command.add_argument("--artifact", required=True, metavar="ID")
         if name in ("approve", "reject"):
             command.add_argument("--reason", required=name == "reject", metavar="TEXT")
         if name == "resume":
             command.add_argument("--regenerate", choices=("prd", "techspec", "task-plan"))
-            command.add_argument("--json", action="store_true", dest="json_output")
         if name == "intervene":
             command.add_argument("--task", required=True, metavar="ID")
             command.add_argument("--reason", required=True, metavar="TEXT")
@@ -137,9 +143,15 @@ def _workflow_payload(store: WorkflowStore, workflow: Workflow) -> dict[str, Any
     if latest is not None:
         execution = {
             "id": latest.id,
+            "session_id": latest.session_id,
+            "role": latest.role.value,
+            "provider_execution_id": latest.provider_execution_id,
+            "request_hash": latest.request_hash,
             "lifecycle": latest.lifecycle.value,
             "failure_classification": latest.failure_classification.value if latest.failure_classification else None,
             "failure_detail": latest.failure_detail,
+            "created_at": latest.created_at,
+            "updated_at": latest.updated_at,
         }
     tasks = [_task_payload(store, task) for task in store.list_tasks(workflow.id)]
     active_task = next((task for task in tasks if task["status"] == "active"), None)
@@ -185,7 +197,12 @@ def _plan_payload(store: WorkflowStore, workflow: Workflow) -> dict[str, Any]:
     approval = store.get_approval_for_artifact(artifact.id)
     return {"plan": {"artifact_id": artifact.id, "sha256": artifact.sha256, "revision": artifact.revision,
                       "approval_state": artifact.approval_state.value,
-                      "decision_reason": approval.reason if approval else None, **plan}}
+                      "decision_reason": approval.reason if approval else None,
+                      "approval": ({"id": approval.id, "decision": approval.decision.value,
+                                    "actor": approval.actor, "reason": approval.reason,
+                                    "created_at": approval.created_at}
+                                   if approval else None),
+                      **plan}}
 
 
 def _task_evidence(store: WorkflowStore, artifact_id: str | None, *, kind: str) -> dict[str, Any] | None:
@@ -265,55 +282,6 @@ def _result_document(command: str, *, workflow: Workflow | None = None, error_co
     return sanitize_payload(document)
 
 
-def _print_result(document: dict[str, Any], json_output: bool) -> None:
-    if json_output:
-        print(json.dumps(document, ensure_ascii=False, sort_keys=True))
-        return
-    if document.get("command_result") == "error":
-        print(f"error: {document.get('error_code')}: {document.get('message', '')}")
-        return
-    print(f"command: {document.get('command_result')}")
-    if document.get("workflow_id"):
-        print(f"workflow: {document['workflow_id']}")
-    if document.get("status"):
-        print(f"status: {document['status']}")
-    if document.get("stage"):
-        print(f"stage: {document['stage']}")
-    intake = document.get("intake")
-    if intake:
-        print(f"Intake: {intake.get('outcome')}")
-        if intake.get("open_questions"):
-            print("\nOpen questions:")
-            for question in intake["open_questions"]:
-                print(f"- {question}")
-    plan = document.get("plan")
-    if plan:
-        details = plan.get("plan", {})
-        print(f"Plan: {details.get('id')} revision={plan.get('revision')} artifact={plan.get('artifact_id')} approval={plan.get('approval_state')}")
-        print(f"Strategy: {details.get('strategy')}")
-        for task in details.get("tasks", []):
-            print(f"Task {task['id']}: {task['objective']} (depends_on={task['depends_on']}, complexity={task['complexity']}, risk={task['risk']})")
-            for name in ("relevant_files", "existing_patterns"):
-                print(f"  {name}: {task['context'][name]}")
-            for name in ("requirements", "acceptance_criteria", "verification", "constraints"):
-                print(f"  {name}: {task[name]}")
-        if document.get("status") == WorkflowStatus.AWAITING_APPROVAL.value:
-            print("Waiting for human approval.")
-        elif document.get("status") == WorkflowStatus.PLAN_APPROVED.value:
-            print("Plan approved.")
-            print("No implementation has started.")
-        elif document.get("status") == WorkflowStatus.REJECTED.value:
-            print("Plan rejected.")
-            if plan.get("decision_reason"):
-                print("Rejection reason recorded.")
-    if document.get("artifacts") is not None:
-        for artifact in document["artifacts"]:
-            print(f"artifact: {artifact['id']} {artifact['stage']} revision={artifact['revision']} approval={artifact['approval_state']}")
-    if document.get("events") is not None:
-        for event in document["events"]:
-            print(json.dumps(event, ensure_ascii=False, sort_keys=True))
-
-
 def _failure_for_workflow(store: WorkflowStore, workflow: Workflow) -> tuple[str | None, int]:
     if workflow.status is WorkflowStatus.HUMAN_ATTENTION:
         latest = store.get_latest_execution(workflow.id)
@@ -374,21 +342,6 @@ def _services(config: FlowConfig) -> tuple[WorkflowStore, PlanningOrchestrator, 
         max_review_cycles=config.max_review_cycles,
     )
     return store, orchestrator, IntakeOrchestrator(store, runtime, timeout_seconds=config.timeout_seconds), V2PlanOrchestrator(store, runtime, timeout_seconds=config.timeout_seconds)
-
-
-def _progress_renderer() -> Callable[[Any], None] | None:
-    if not sys.stderr.isatty():
-        return None
-    def render(event: Any) -> None:
-        if event.kind == "started": text = "→ PLAN started"
-        elif event.kind == "heartbeat": text = f"  Codex running... {event.elapsed_seconds:.0f}s"
-        elif event.kind == "activity": text = f"  {event.message}" if event.message else ""
-        elif event.kind == "completed": text = f"✓ PLAN completed ({event.elapsed_seconds:.1f}s)"
-        elif event.kind == "timed_out": text = f"✗ PLAN timed out ({event.elapsed_seconds:.1f}s)"
-        else: text = f"✗ PLAN failed ({event.elapsed_seconds:.1f}s)"
-        if text:
-            print(text, file=sys.stderr, flush=True)
-    return render
 
 
 def _init(repository_value: str) -> dict[str, Any]:
@@ -467,7 +420,12 @@ def _run_command(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
             if existing.lifecycle_version is LifecycleVersion.V2:
                 if args.regenerate:
                     raise ValidationFailure("--regenerate is V1-only")
-                workflow = plan_orchestrator.resume(args.workflow, progress_sink=None if args.json_output else _progress_renderer())
+                workflow = plan_orchestrator.resume(
+                    args.workflow,
+                    progress_sink=(None if args.json_output else make_plan_progress_renderer(
+                        sys.stderr, no_color=args.no_color,
+                    )),
+                )
             else:
                 regenerate = {"prd": Stage.PRD, "techspec": Stage.TECHSPEC, "task-plan": Stage.TASK_PLAN}.get(args.regenerate)
                 workflow = orchestrator.resume(args.workflow, regenerate=regenerate)
@@ -543,7 +501,14 @@ def main(argv: list[str] | None = None) -> int:
         ("args" in locals() and getattr(args, "json_output", False))
         or _requested_json_output(raw_argv)
     )
-    _print_result(document, json_output)
+    verbose_output = bool("args" in locals() and getattr(args, "verbose", False))
+    mode = OutputMode.JSON if json_output else (OutputMode.VERBOSE if verbose_output else OutputMode.HUMAN)
+    render_result(
+        document,
+        mode=mode,
+        stream=sys.stdout,
+        no_color=bool("args" in locals() and getattr(args, "no_color", False)),
+    )
     return exit_code
 
 

@@ -176,6 +176,28 @@ class CliTests(unittest.TestCase):
         self.assertIn("Codex running... 10s", stderr.getvalue())
         self.assertIn("✓ PLAN completed", stderr.getvalue())
         self.assertNotIn("Codex running", stdout.getvalue())
+        self.assertIn("AWAITING_APPROVAL", stdout.getvalue())
+        self.assertIn("T1", stdout.getvalue())
+        self.assertIn("low complexity", stdout.getvalue())
+        self.assertNotIn(workflow_id, stdout.getvalue())
+        self.assertNotIn("source.py", stdout.getvalue())
+        self.assertNotIn("Update behavior.", stdout.getvalue())
+
+        store = WorkflowStore(self.repository / ".engineering-flow" / "workflows.sqlite3")
+        plan_artifact = store.list_artifacts(workflow_id, Stage.PLAN)[0]
+        store.close()
+        code, verbose = self.invoke([
+            "status", "--repo", str(self.repository), "--workflow", workflow_id,
+            "--verbose", "--no-color",
+        ])
+        self.assertEqual(code, 0)
+        self.assertIn(workflow_id, verbose)
+        self.assertIn(plan_artifact.id, verbose)
+        self.assertIn(plan_artifact.sha256, verbose)
+        self.assertIn("Change source.", verbose)
+        self.assertIn("source.py", verbose)
+        self.assertIn("Update behavior.", verbose)
+        self.assertNotRegex(verbose, r"\x1b\[")
 
         # A reopened V2 workflow does not execute again; both machine modes remain noise-free.
         json_out, json_err = io.StringIO(), Tty()
@@ -379,6 +401,105 @@ class CliTests(unittest.TestCase):
             self.assertIn("workflow_id", result)
             self.assertIn("status", result)
             self.assertIn("stage", result)
+
+    def test_run_approve_and_reject_json_are_single_documents_with_empty_stderr(self):
+        class IntakeRuntime(FakeRuntime):
+            def execute_planning(self, request):
+                return PlanningExecutionResult(
+                    "codex-cli", request.logical_session_id or "session", "thread", request.execution_id,
+                    TerminalState.SUCCEEDED, {"outcome": "READY", "feature": {
+                        "id": request.workflow_id, "goal": "Change the CLI safely.",
+                        "requirements": ["Preserve compatibility."],
+                        "acceptance_criteria": ["The CLI remains compatible."],
+                        "constraints": [], "out_of_scope": [], "assumptions": [], "open_questions": [],
+                    }},
+                )
+
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with patch("engineering_flow.cli.CodexCliRuntime", IntakeRuntime), \
+                contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            self.assertEqual(main([
+                "run", "--repo", str(self.repository), "--request", "Change the CLI safely.", "--json",
+            ]), 0)
+        self.assertEqual(stderr.getvalue(), "")
+        self.assertEqual(len(stdout.getvalue().splitlines()), 1)
+        run_document = json.loads(stdout.getvalue())
+        self.assertEqual((run_document["command"], run_document["stage"], run_document["status"]),
+                         ("run", "intake", "ready"))
+        self.assertNotRegex(stdout.getvalue(), r"\x1b\[")
+
+        class PlanRuntime(FakeRuntime):
+            def verify_planning_capabilities(self, repository):
+                return CapabilityReport("fake", "fake", str(repository), True, {"read_only": True}, True)
+
+            def execute(self, request):
+                artifact_id, sha256 = re.search(
+                    r"artifact UUID ([^,]+), sha256 ([^)]+)", request.instruction,
+                ).groups()
+                return PlanningExecutionResult(
+                    "fake", request.logical_session_id or "session", "thread", "turn",
+                    TerminalState.SUCCEEDED, {"plan": {
+                        "id": f"{request.workflow_id}:plan:r1", "workflow_id": request.workflow_id,
+                        "revision": 1, "feature_contract": {"artifact_id": artifact_id, "sha256": sha256},
+                        "strategy": "Change source.", "assumptions": [],
+                        "verification_strategy": ["tests"], "tasks": [{
+                            "id": "T1", "objective": "Change source.",
+                            "context": {"relevant_files": ["source.py"], "existing_patterns": []},
+                            "requirements": ["Update behavior."], "acceptance_criteria": ["Works."],
+                            "verification": ["tests"], "constraints": [], "depends_on": [],
+                            "complexity": "low", "risk": "low",
+                        }],
+                    }},
+                )
+
+        def waiting_plan():
+            workflow_id = self.ready_v2_workflow()
+            out, err = io.StringIO(), io.StringIO()
+            with patch("engineering_flow.cli.CodexCliRuntime", PlanRuntime), \
+                    contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                self.assertEqual(main([
+                    "resume", "--repo", str(self.repository), "--workflow", workflow_id, "--json",
+                ]), 0)
+            self.assertEqual(err.getvalue(), "")
+            store = WorkflowStore(self.repository / ".engineering-flow" / "workflows.sqlite3")
+            artifact_id = store.list_artifacts(workflow_id, Stage.PLAN)[0].id
+            store.close()
+            return workflow_id, artifact_id
+
+        for decision in ("approve", "reject"):
+            with self.subTest(decision=decision):
+                workflow_id, artifact_id = waiting_plan()
+                argv = [
+                    decision, "--repo", str(self.repository), "--workflow", workflow_id,
+                    "--artifact", artifact_id,
+                ]
+                if decision == "reject":
+                    argv.extend(["--reason", "Revise it."])
+                argv.append("--json")
+                out, err = io.StringIO(), io.StringIO()
+                with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                    self.assertEqual(main(argv), 0)
+                self.assertEqual(err.getvalue(), "")
+                self.assertEqual(len(out.getvalue().splitlines()), 1)
+                document = json.loads(out.getvalue())
+                self.assertEqual(document["command"], decision)
+                self.assertEqual(document["status"], "plan_approved" if decision == "approve" else "rejected")
+                self.assertEqual(document["plan"]["approval"]["decision"],
+                                 "approved" if decision == "approve" else "rejected")
+                self.assertNotRegex(out.getvalue(), r"\x1b\[")
+
+    def test_verbose_and_json_conflict_as_one_json_usage_error(self):
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            code = main([
+                "status", "--repo", str(self.repository), "--workflow", "workflow-id",
+                "--verbose", "--json",
+            ])
+        self.assertEqual(code, 2)
+        self.assertEqual(stderr.getvalue(), "")
+        self.assertEqual(len(stdout.getvalue().splitlines()), 1)
+        document = json.loads(stdout.getvalue())
+        self.assertEqual((document["command_result"], document["error_code"]), ("error", "usage"))
 
     def test_task_status_logs_and_intervention_are_persisted_projections(self):
         store = WorkflowStore(self.repository / ".engineering-flow" / "workflows.sqlite3")

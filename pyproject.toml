@@ -7,7 +7,9 @@ name = "engineering-flow"
 version = "0.1.0"
 description = "Agent-agnostic orchestration engine for autonomous software engineering workflows, from requirements to review-ready pull requests."
 requires-python = ">=3.13,<3.14"
-dependencies = []
+dependencies = [
+    "rich>=13.9,<15",
+]
 
 [project.scripts]
 engineering-flow = "engineering_flow.cli:main"
