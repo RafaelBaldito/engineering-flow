@@ -12,6 +12,7 @@ from engineering_flow.domain import (  # noqa: E402
     ApprovalDecision,
     ApprovalPolicy,
     ApprovalState,
+    ArtifactCorruptionFailure,
     ConflictFailure,
     FailureClassification,
     CanonicalStage,
@@ -21,6 +22,7 @@ from engineering_flow.domain import (  # noqa: E402
     Role,
     Stage,
     TaskArtifactType,
+    ValidationFailure,
     WorkKind,
     WorkflowStatus,
 )
@@ -856,6 +858,130 @@ class V2PlanTests(unittest.TestCase):
             self.assertEqual(store.list_tasks(workflow.id), [])
             self.assertEqual(runtime.requests[-1].role, Role.PLANNER)
             store.close()
+
+
+class V2PlanApprovalTests(unittest.TestCase):
+    def setUp(self):
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.root = Path(self.tempdir.name)
+        (self.root / "source.py").write_text("x = 1\n", encoding="utf-8")
+        self.store = WorkflowStore(self.root / ".engineering-flow" / "workflows.sqlite3")
+
+    def tearDown(self):
+        self.store.close()
+        self.tempdir.cleanup()
+
+    def pending_plan(self):
+        workflow = self.store.create_workflow(
+            self.root, provider="fake", configuration_snapshot={}, feature_content=b"request",
+            feature_path=self.root / ".engineering-flow" / "workflows" / "input",
+            lifecycle_version=LifecycleVersion.V2, stage=Stage.INTAKE,
+        )
+        intent = self.store.create_generation_intent(
+            workflow.id, Stage.INTAKE, request_hash=f"source-{workflow.id}", provider="fake",
+            role=Role.INTAKE, revision=1,
+            artifact_path=self.root / ".engineering-flow" / "workflows" / workflow.id / "artifacts" / "001-feature-contract.json",
+        )
+        feature_payload = {"outcome": "READY", "feature": {"id": workflow.id, "goal": "Goal",
+            "requirements": ["Requirement"], "acceptance_criteria": ["Criterion"], "constraints": [],
+            "out_of_scope": [], "assumptions": [], "open_questions": []}}
+        feature = self.store.complete_generation(
+            intent.operation.idempotency_key, content=json.dumps(feature_payload),
+            artifact_path=self.root / ".engineering-flow" / "workflows" / workflow.id / "artifacts" / "001-feature-contract.json",
+            stage=Stage.INTAKE, revision=1, workflow_stage=Stage.INTAKE,
+            workflow_status=WorkflowStatus.READY, approval_state=ApprovalState.NOT_REQUIRED,
+        )
+
+        class Runtime(FakeRuntime):
+            def execute(runtime_self, request):
+                runtime_self.requests.append(request)
+                return PlanningExecutionResult(runtime_self.provider, request.logical_session_id or "s", "thread", "turn",
+                    TerminalState.SUCCEEDED, {"plan": {"id": f"{request.workflow_id}:plan:r1",
+                    "workflow_id": request.workflow_id, "revision": 1,
+                    "feature_contract": {"artifact_id": feature.id, "sha256": feature.sha256},
+                    "strategy": "Change source.", "assumptions": [], "verification_strategy": ["unit tests"],
+                    "tasks": [{"id": "T1", "objective": "Change source.",
+                    "context": {"relevant_files": ["source.py"], "existing_patterns": []},
+                    "requirements": ["Update behavior."], "acceptance_criteria": ["Works."],
+                    "verification": ["tests"], "constraints": [], "depends_on": [], "complexity": "low", "risk": "high"}]}})
+
+        runtime = Runtime()
+        result = V2PlanOrchestrator(self.store, runtime).resume(workflow.id)
+        return result, self.store.list_artifacts(workflow.id, Stage.PLAN)[0], feature, runtime
+
+    def test_approve_persists_plan_stop_and_resume_does_not_dispatch(self):
+        workflow, plan, _feature, runtime = self.pending_plan()
+        event_count = len(self.store.list_events(workflow.id))
+        approved = V2PlanOrchestrator(self.store, runtime).approve(workflow.id, plan.id)
+        self.assertEqual((approved.stage, approved.status), (Stage.PLAN, WorkflowStatus.PLAN_APPROVED))
+        self.assertEqual(self.store.get_artifact(plan.id).approval_state, ApprovalState.APPROVED)
+        self.assertIsNotNone(self.store.get_approval_for_artifact(plan.id))
+        self.assertTrue(any(event.type == "plan.approved" for event in self.store.list_events(workflow.id)))
+        self.assertGreater(len(self.store.list_events(workflow.id)), event_count)
+        self.store.close()
+        self.store = WorkflowStore(self.root / ".engineering-flow" / "workflows.sqlite3")
+        reopened = self.store.get_workflow(workflow.id)
+        self.assertEqual((reopened.stage, reopened.status), (Stage.PLAN, WorkflowStatus.PLAN_APPROVED))
+        resumed = V2PlanOrchestrator(self.store, runtime).resume(workflow.id)
+        self.assertEqual((resumed.stage, resumed.status), (Stage.PLAN, WorkflowStatus.PLAN_APPROVED))
+        self.assertEqual(len(runtime.requests), 1)
+        self.assertEqual(self.store.list_tasks(workflow.id), [])
+        self.assertEqual(self.store._connection.execute(
+            "SELECT COUNT(*) FROM task_artifacts WHERE workflow_id = ?", (workflow.id,)
+        ).fetchone()[0], 0)
+
+    def test_approval_guards_fail_closed_for_wrong_duplicate_tampered_and_invalid_inputs(self):
+        workflow, plan, feature, runtime = self.pending_plan()
+        orchestrator = V2PlanOrchestrator(self.store, runtime)
+        before_events = len(self.store.list_events(workflow.id))
+        with self.assertRaises(ConflictFailure):
+            orchestrator.approve(workflow.id, feature.id)
+        self.assertEqual(self.store.get_artifact(plan.id).approval_state, ApprovalState.PENDING)
+        self.assertEqual(len(self.store.list_events(workflow.id)), before_events)
+
+        other_workflow, other_plan, _other_feature, _other_runtime = self.pending_plan()
+        with self.assertRaises(ConflictFailure):
+            orchestrator.approve(workflow.id, other_plan.id)
+        self.assertEqual(self.store.get_artifact(plan.id).approval_state, ApprovalState.PENDING)
+
+        Path(plan.path).write_text("tampered", encoding="utf-8")
+        with self.assertRaises(ArtifactCorruptionFailure):
+            orchestrator.approve(workflow.id, plan.id)
+        self.assertEqual(self.store.get_artifact(plan.id).approval_state, ApprovalState.PENDING)
+        self.assertIsNone(self.store.get_approval_for_artifact(plan.id))
+
+        # Restore immutable bytes, then alter the valid JSON binding while
+        # preserving its stored hash to prove approval re-parses the source.
+        bad_plan = {"plan": {"id": f"{workflow.id}:plan:r1", "workflow_id": workflow.id, "revision": 1,
+            "feature_contract": {"artifact_id": feature.id, "sha256": "0" * 64}, "strategy": "Change source.",
+            "assumptions": [], "verification_strategy": ["unit tests"], "tasks": [{"id": "T1", "objective": "Change source.",
+            "context": {"relevant_files": ["source.py"], "existing_patterns": []}, "requirements": ["Update behavior."],
+            "acceptance_criteria": ["Works."], "verification": ["tests"], "constraints": [], "depends_on": [],
+            "complexity": "low", "risk": "high"}]}}
+        content = json.dumps(bad_plan)
+        Path(plan.path).write_text(content, encoding="utf-8")
+        self.store._connection.execute("UPDATE artifacts SET sha256 = ? WHERE id = ?", (hashlib.sha256(content.encode()).hexdigest(), plan.id))
+        with self.assertRaises(ValidationFailure):
+            orchestrator.approve(workflow.id, plan.id)
+        self.assertEqual(self.store.get_artifact(plan.id).approval_state, ApprovalState.PENDING)
+        self.assertIsNone(self.store.get_approval_for_artifact(plan.id))
+
+        # The Step-2 slice has only revision 1; a mismatched projection is a
+        # representable non-current decision and must also leave it pending.
+        self.store._connection.execute("UPDATE workflows SET current_artifact_revision = 2 WHERE id = ?", (workflow.id,))
+        with self.assertRaises(ConflictFailure):
+            orchestrator.approve(workflow.id, plan.id)
+        self.assertEqual(self.store.get_artifact(plan.id).approval_state, ApprovalState.PENDING)
+
+    def test_duplicate_approval_fails_without_mutation(self):
+        workflow, plan, _feature, runtime = self.pending_plan()
+        orchestrator = V2PlanOrchestrator(self.store, runtime)
+        orchestrator.approve(workflow.id, plan.id)
+        event_count = len(self.store.list_events(workflow.id))
+        with self.assertRaises(ConflictFailure):
+            orchestrator.approve(workflow.id, plan.id)
+        self.assertEqual(len(self.store.list_events(workflow.id)), event_count)
+        self.assertEqual(self.store.get_artifact(plan.id).approval_state, ApprovalState.APPROVED)
 
 
 if __name__ == "__main__":

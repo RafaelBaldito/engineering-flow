@@ -222,6 +222,67 @@ class V2PlanOrchestrator:
         self._progress(progress_sink, "completed", time.monotonic() - started)
         return self.store.get_workflow(workflow.id)
 
+    def approve(self, workflow_id: str, artifact_id: str, *, actor: str = "human",
+                reason: str | None = None) -> Workflow:
+        """Approve exactly the verified current V2 Plan and stop at its gate."""
+        workflow = self.store.get_workflow(workflow_id)
+        if workflow.lifecycle_version is not LifecycleVersion.V2:
+            raise ConflictFailure("workflow is not V2")
+        if workflow.stage is not Stage.PLAN or workflow.status is not WorkflowStatus.AWAITING_APPROVAL:
+            raise ConflictFailure("workflow is not awaiting Plan approval")
+        supplied = self.store.get_artifact(artifact_id)
+        if supplied.workflow_id != workflow.id:
+            raise ConflictFailure("artifact does not belong to workflow")
+        if supplied.stage is not Stage.PLAN:
+            raise ConflictFailure("approval requires a Plan artifact")
+        plans = self.store.list_artifacts(workflow.id, Stage.PLAN)
+        if not plans:
+            raise ConflictFailure("no Plan artifact is awaiting approval")
+        artifact = plans[-1]
+        if artifact.id != artifact_id:
+            raise ConflictFailure("approval targets a stale artifact")
+        if (workflow.current_artifact_revision != artifact.revision
+                or artifact.revision != max(item.revision for item in plans)):
+            raise ConflictFailure("approval targets a noncurrent Plan artifact")
+        if artifact.approval_state is not ApprovalState.PENDING:
+            raise ConflictFailure("artifact approval has already been decided")
+        if self.store.get_approval_for_artifact(artifact.id) is not None:
+            raise ConflictFailure("artifact approval has already been decided")
+
+        # Re-read immutable bytes before the transaction; approval is for the
+        # verified Plan, not merely for its database identifier.
+        try:
+            payload = json.loads(self.store.read_artifact(artifact.id))
+        except json.JSONDecodeError as exc:
+            raise ValidationFailure("Plan artifact is not valid JSON") from exc
+        source = self.store.list_artifacts(workflow.id, Stage.INTAKE)
+        if len(source) != 1:
+            raise ValidationFailure("exact READY Feature Contract artifact is required")
+        feature_artifact = source[0]
+        if (feature_artifact.revision != 1
+                or feature_artifact.approval_state is not ApprovalState.NOT_REQUIRED):
+            raise ValidationFailure("Feature Contract artifact is not a READY Intake artifact")
+        try:
+            feature_payload = json.loads(self.store.read_artifact(feature_artifact.id))
+        except json.JSONDecodeError as exc:
+            raise ValidationFailure("Feature Contract artifact is not valid JSON") from exc
+        feature = FeatureContract.parse(feature_payload, workflow_id=workflow.id)
+        if feature.outcome is not IntakeOutcome.READY or feature.open_questions:
+            raise ValidationFailure("Feature Contract must be READY")
+        plan = Plan.parse(
+            payload, workflow_id=workflow.id, revision=artifact.revision,
+            feature_contract_artifact_id=feature_artifact.id,
+            feature_contract_sha256=feature_artifact.sha256,
+            repository_path=workflow.repository_path,
+        )
+        self.store.record_approval(
+            workflow.id, artifact.id, ApprovalDecision.APPROVED, actor=actor, reason=reason,
+            workflow_stage=Stage.PLAN, workflow_status=WorkflowStatus.PLAN_APPROVED,
+            transition_event_type="plan.approved",
+            transition_payload={"plan_id": plan.id, "revision": plan.revision},
+        )
+        return self.store.get_workflow(workflow.id)
+
     @staticmethod
     def _progress(sink: Any, kind: str, elapsed: float) -> None:
         if sink:

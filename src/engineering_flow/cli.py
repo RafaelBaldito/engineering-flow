@@ -297,6 +297,9 @@ def _print_result(document: dict[str, Any], json_output: bool) -> None:
                 print(f"  {name}: {task[name]}")
         if document.get("status") == WorkflowStatus.AWAITING_APPROVAL.value:
             print("Waiting for human approval.")
+        elif document.get("status") == WorkflowStatus.PLAN_APPROVED.value:
+            print("Plan approved.")
+            print("No implementation has started.")
     if document.get("artifacts") is not None:
         for artifact in document["artifacts"]:
             print(f"artifact: {artifact['id']} {artifact['stage']} revision={artifact['revision']} approval={artifact['approval_state']}")
@@ -442,7 +445,11 @@ def _run_command(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
             code, exit_code = _failure_for_workflow(store, workflow)
             return _result_document(command, workflow=workflow, error_code=code, data=payload), exit_code
         elif command == "approve":
-            workflow = orchestrator.approve(args.workflow, args.artifact, reason=args.reason)
+            existing = store.get_workflow(args.workflow)
+            if existing.lifecycle_version is LifecycleVersion.V2:
+                workflow = plan_orchestrator.approve(args.workflow, args.artifact, reason=args.reason)
+            else:
+                workflow = orchestrator.approve(args.workflow, args.artifact, reason=args.reason)
         elif command == "reject":
             workflow = orchestrator.reject(args.workflow, args.artifact, reason=args.reason)
         elif command == "resume":
@@ -465,7 +472,9 @@ def _run_command(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
         else:
             raise ValidationFailure(f"unsupported command: {command}")
         code, exit_code = _failure_for_workflow(store, workflow)
-        payload = _workflow_payload(store, workflow) if command == "resume" and workflow.lifecycle_version is LifecycleVersion.V2 else None
+        payload = (_workflow_payload(store, workflow)
+                   if command in ("resume", "approve") and workflow.lifecycle_version is LifecycleVersion.V2
+                   else None)
         return _result_document(command, workflow=workflow, error_code=code, data=payload), exit_code
     finally:
         store.close()

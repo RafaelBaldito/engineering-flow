@@ -2563,6 +2563,13 @@ class WorkflowStore:
             raise NotFoundFailure(f"approval not found: {approval_id}")
         return self._approval_from_row(row)
 
+    def get_approval_for_artifact(self, artifact_id: str) -> Approval | None:
+        """Return the single decision bound to an artifact, if one exists."""
+        row = self._connection.execute(
+            "SELECT * FROM approvals WHERE artifact_id = ?", (artifact_id,)
+        ).fetchone()
+        return self._approval_from_row(row) if row is not None else None
+
     def get_operation(self, operation_id: str) -> Operation:
         row = self._connection.execute("SELECT * FROM operations WHERE id = ?", (operation_id,)).fetchone()
         if row is None:

@@ -38,7 +38,7 @@ class DomainTests(unittest.TestCase):
         ])
         self.assertEqual({item.value for item in WorkflowStatus}, {
             "created", "running", "awaiting_approval", "rejected", "failed",
-            "cancelled", "human_attention", "completed", "ready", "needs_clarification",
+            "cancelled", "human_attention", "completed", "ready", "needs_clarification", "plan_approved",
         })
         self.assertEqual({item.value for item in ApprovalPolicy}, {"required", "automatic", "conditional"})
         self.assertEqual({item.value for item in ApprovalDecision}, {"approved", "rejected", "auto_approved"})

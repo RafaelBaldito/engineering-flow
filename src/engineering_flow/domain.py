@@ -78,6 +78,7 @@ class WorkflowStatus(_ValueEnum):
     COMPLETED = "completed"
     READY = "ready"
     NEEDS_CLARIFICATION = "needs_clarification"
+    PLAN_APPROVED = "plan_approved"
 
 
 class ApprovalPolicy(_ValueEnum):
