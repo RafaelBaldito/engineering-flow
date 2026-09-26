@@ -22,6 +22,9 @@ from engineering_flow.domain import (  # noqa: E402
     WorkflowStatus,
     GovernanceDecision,
     GovernanceDecisionType,
+    FeatureContract,
+    IntakeOutcome,
+    ValidationFailure,
 )
 
 
@@ -64,6 +67,42 @@ class DomainTests(unittest.TestCase):
         for record in (Workflow, TaskDefinition, TaskCycle, TaskArtifact, Intervention):
             self.assertTrue(dataclasses.is_dataclass(record))
             self.assertTrue(record.__dataclass_params__.frozen)
+
+    def test_needs_clarification_requires_non_empty_open_questions(self):
+        payload = {
+            "outcome": "NEEDS_CLARIFICATION",
+            "feature": {
+                "id": "workflow-1", "goal": "Allow users to cancel orders.",
+                "requirements": [], "acceptance_criteria": [], "constraints": [],
+                "out_of_scope": [], "assumptions": [],
+                "open_questions": ["Which order states allow cancellation?"],
+            },
+        }
+        contract = FeatureContract.parse(payload, workflow_id="workflow-1")
+        self.assertEqual(contract.outcome, IntakeOutcome.NEEDS_CLARIFICATION)
+        self.assertEqual(contract.open_questions, ("Which order states allow cancellation?",))
+
+        payload["feature"]["open_questions"] = []
+        with self.assertRaisesRegex(ValidationFailure, "requires open questions"):
+            FeatureContract.parse(payload, workflow_id="workflow-1")
+
+    def test_feature_contract_rejects_ready_questions_and_invalid_shapes(self):
+        payload = {
+            "outcome": "READY",
+            "feature": {
+                "id": "workflow-1", "goal": "A goal", "requirements": ["A requirement"],
+                "acceptance_criteria": ["A criterion"], "constraints": [], "out_of_scope": [],
+                "assumptions": [], "open_questions": ["A question"],
+            },
+        }
+        with self.assertRaisesRegex(ValidationFailure, "no open questions"):
+            FeatureContract.parse(payload, workflow_id="workflow-1")
+        del payload["feature"]["constraints"]
+        with self.assertRaisesRegex(ValidationFailure, "invalid shape"):
+            FeatureContract.parse(payload, workflow_id="workflow-1")
+        payload["unexpected"] = True
+        with self.assertRaisesRegex(ValidationFailure, "only outcome and feature"):
+            FeatureContract.parse(payload, workflow_id="workflow-1")
 
 
 if __name__ == "__main__":

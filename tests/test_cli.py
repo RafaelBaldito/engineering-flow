@@ -104,6 +104,34 @@ class CliTests(unittest.TestCase):
         self.assertEqual(status["artifacts"][0]["approval_state"], "not_required")
         self.assertEqual(status["tasks"], [])
 
+    def test_inline_request_displays_and_reopens_needs_clarification(self):
+        class ClarifyingRuntime(FakeRuntime):
+            def execute_planning(self, request):
+                self.requests.append(request)
+                return PlanningExecutionResult(
+                    "codex-cli", request.logical_session_id or "session", "thread", request.execution_id,
+                    TerminalState.SUCCEEDED, {"outcome": "NEEDS_CLARIFICATION", "feature": {
+                        "id": request.workflow_id, "goal": "Allow users to cancel orders.",
+                        "requirements": [], "acceptance_criteria": [], "constraints": [], "out_of_scope": [],
+                        "assumptions": [],
+                        "open_questions": ["Which order states allow cancellation?"],
+                    }},
+                )
+
+        with patch("engineering_flow.cli.CodexCliRuntime", ClarifyingRuntime):
+            code, text = self.invoke(["run", "--repo", str(self.repository), "--request", "Allow users to cancel orders."])
+        self.assertEqual(code, 0)
+        self.assertIn("Intake: NEEDS_CLARIFICATION", text)
+        self.assertIn("Open questions:\n- Which order states allow cancellation?", text)
+        workflow_id = next(line.split(": ", 1)[1] for line in text.splitlines() if line.startswith("workflow:"))
+        code, status = self.invoke(["status", "--repo", str(self.repository), "--workflow", workflow_id, "--json"])
+        self.assertEqual(code, 0)
+        self.assertEqual((status["lifecycle_version"], status["stage"], status["status"]),
+                         ("v2", "intake", "needs_clarification"))
+        self.assertEqual(status["intake"]["open_questions"], ["Which order states allow cancellation?"])
+        self.assertEqual(status["tasks"], [])
+        self.assertEqual([artifact["stage"] for artifact in status["artifacts"]], ["intake"])
+
     def test_cli_fake_runtime_reaches_wave_two_after_three_exact_approvals(self):
         with patch("engineering_flow.cli.CodexCliRuntime", FakeRuntime):
             _, text = self.invoke(["run", "--repo", str(self.repository), "--feature-file", str(self.feature)])

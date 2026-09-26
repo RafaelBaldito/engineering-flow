@@ -92,8 +92,9 @@ class IntakeOrchestrator:
         request_digest = hashlib.sha256(raw).hexdigest()
         instruction = (
             f"You are the Intake agent. The raw user request is the authoritative UTF-8 file {request_path} (sha256: {request_digest}); read it before responding. "
-            f"Read the repository only when facts are discoverable; record safe engineering assumptions; "
-            f"ask open questions instead of inventing material product or business decisions. Do not implement, plan, mutate files, or progress beyond Intake. "
+            "If information can reasonably be discovered from the repository, inspect the repository instead of asking the user. "
+            "You may make and record safe engineering assumptions. If a material product or business decision is missing, do not invent it; "
+            "ask an explicit open question instead. Do not implement, plan, mutate files, or progress beyond Intake. "
             f"Return only the Feature Contract schema. feature.id must be {workflow.id}. "
             "Set outcome READY only when requirements and acceptance_criteria are non-empty and open_questions is empty. "
             "If any material product or business question remains, set outcome NEEDS_CLARIFICATION and include it in open_questions."

@@ -9,7 +9,7 @@ from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 
-from engineering_flow.codex_cli import CodexCliRuntime, CodexMechanismDescriptor, FINAL_OUTPUT_SCHEMA, REVIEWER_OUTPUT_SCHEMA  # noqa: E402
+from engineering_flow.codex_cli import CodexCliRuntime, CodexMechanismDescriptor, FINAL_OUTPUT_SCHEMA, INTAKE_OUTPUT_SCHEMA, REVIEWER_OUTPUT_SCHEMA  # noqa: E402
 from engineering_flow.domain import FailureClassification, Role, Stage, ValidationFailure, WorkKind  # noqa: E402
 from engineering_flow.runtime import (  # noqa: E402
     ExecutionContract, PlanningExecutionRequest, TaskExecutionRequest, TerminalState,
@@ -139,6 +139,15 @@ class CodexCliTests(unittest.TestCase):
             final_output_path=str(self.output), timeout_seconds=3, required_capabilities=("json_events",),
         )
 
+    def intake_request(self):
+        return PlanningExecutionRequest(
+            workflow_id="workflow-1", execution_id="execution-intake", logical_session_id="session-1",
+            role=Role.INTAKE, stage=Stage.INTAKE, repository_path=str(self.root),
+            authoritative_input_paths=(str(self.root / "request.txt"),), authoritative_input_hashes=("hash",),
+            instruction="Perform Intake only.", output_schema_path=str(self.schema),
+            final_output_path=str(self.output), timeout_seconds=3, required_capabilities=("read_only",),
+        )
+
     def run_factory(self, *args, **kwargs):
         return self.help_result
 
@@ -254,6 +263,23 @@ class CodexCliTests(unittest.TestCase):
         self.assertFalse(kwargs["shell"])
         self.assertEqual(kwargs["cwd"], str(self.root.resolve()))
         self.assertNotIn("API_KEY", kwargs["env"])
+
+    def test_intake_uses_strict_schema_and_rejects_additional_fields(self):
+        def intake_popen(argv, **kwargs):
+            self.output.parent.mkdir(parents=True, exist_ok=True)
+            self.output.write_text(json.dumps({
+                "outcome": "NEEDS_CLARIFICATION", "unexpected": True, "feature": {
+                    "id": "workflow-1", "goal": "Allow cancellation.", "requirements": [],
+                    "acceptance_criteria": [], "constraints": [], "out_of_scope": [], "assumptions": [],
+                    "open_questions": ["Which states allow cancellation?"],
+                },
+            }), encoding="utf-8")
+            return FakeProcess('{"type":"turn.completed","id":"intake-turn"}\n')
+
+        result = self.runtime(popen_factory=intake_popen).execute_planning(self.intake_request())
+        self.assertEqual(json.loads(self.schema.read_text(encoding="utf-8")), INTAKE_OUTPUT_SCHEMA)
+        self.assertEqual(result.terminal_state, TerminalState.FAILED)
+        self.assertEqual(result.failure_classification, FailureClassification.AGENT_EXECUTION)
 
     def test_malformed_output_is_agent_failure(self):
         def malformed_popen(argv, **kwargs):

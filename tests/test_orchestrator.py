@@ -24,7 +24,7 @@ from engineering_flow.domain import (  # noqa: E402
     WorkKind,
     WorkflowStatus,
 )
-from engineering_flow.orchestrator import CanonicalLifecycleOrchestrator, PlanningOrchestrator  # noqa: E402
+from engineering_flow.orchestrator import CanonicalLifecycleOrchestrator, IntakeOrchestrator, PlanningOrchestrator  # noqa: E402
 from engineering_flow.runtime import (  # noqa: E402
     CapabilityReport,
     PlanningExecutionResult,
@@ -85,6 +85,40 @@ class OrchestratorTests(unittest.TestCase):
     def approve_current(self, workflow):
         artifact = self.store.list_artifacts(workflow.id, workflow.stage)[-1]
         return self.orchestrator.approve(workflow.id, artifact.id, "reviewer")
+
+    def test_intake_persists_needs_clarification_and_stops(self):
+        class ClarifyingRuntime(FakeRuntime):
+            def execute_planning(self, request):
+                self.requests.append(request)
+                return PlanningExecutionResult(
+                    provider=self.provider, logical_session_id=request.logical_session_id or "session",
+                    provider_session_id="thread-1", provider_execution_id="turn-1",
+                    terminal_state=TerminalState.SUCCEEDED, final_payload={
+                        "outcome": "NEEDS_CLARIFICATION", "feature": {
+                            "id": request.workflow_id, "goal": "Allow users to cancel orders.",
+                            "requirements": [], "acceptance_criteria": [], "constraints": [],
+                            "out_of_scope": [], "assumptions": [],
+                            "open_questions": ["Which order states allow a user to cancel an order?"],
+                        },
+                    },
+                )
+
+        runtime = ClarifyingRuntime()
+        workflow = IntakeOrchestrator(self.store, runtime).run(self.root, "Allow users to cancel orders.")
+
+        self.assertEqual((workflow.lifecycle_version.value, workflow.stage, workflow.status.value),
+                         ("v2", Stage.INTAKE, "needs_clarification"))
+        self.assertEqual(len(runtime.requests), 1)
+        instruction = runtime.requests[0].instruction
+        self.assertIn("inspect the repository instead of asking", instruction)
+        self.assertIn("safe engineering assumptions", instruction)
+        self.assertIn("material product or business decision", instruction)
+        artifacts = self.store.list_artifacts(workflow.id)
+        self.assertEqual([(artifact.stage, artifact.approval_state.value) for artifact in artifacts],
+                         [(Stage.INTAKE, "not_required")])
+        completed = [event for event in self.store.list_events(workflow.id) if event.type == "intake.completed"]
+        self.assertEqual(len(completed), 1)
+        self.assertEqual(completed[0].payload, {"outcome": "NEEDS_CLARIFICATION", "question_count": 1})
 
 
     def test_required_workflow_is_sequential_and_context_is_scoped(self):
