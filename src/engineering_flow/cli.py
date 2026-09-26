@@ -33,8 +33,10 @@ from .domain import (
     WorkflowStatus,
     LifecycleVersion,
 )
-from .orchestrator import IntakeOrchestrator, PlanningOrchestrator, V2PlanOrchestrator
-from .presentation import OutputMode, create_progress_renderer, render_result
+from .orchestrator import IntakeOrchestrator, PlanningOrchestrator, V2HappyPathCoordinator, V2PlanOrchestrator
+from .presentation import (OutputMode, create_progress_renderer, interactive_prompt_eligible,
+                           prompt_for_plan_decision, render_plan_decision_result,
+                           render_recovery_instruction, render_result)
 from .sanitization import sanitize_payload, sanitize_text
 from .store import WorkflowStore
 
@@ -464,15 +466,46 @@ def _run_command(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
 
         if command == "run":
             if args.request is not None:
-                workflow = intake_orchestrator.run(
+                progress_sink = (None if args.json_output else create_progress_renderer(
+                    sys.stderr, no_color=args.no_color,
+                ))
+                workflow = V2HappyPathCoordinator(intake_orchestrator, plan_orchestrator).run(
                     config.repository_path, args.request, provider=config.provider_name,
                     configuration_snapshot=config.snapshot,
-                    progress_sink=(None if args.json_output else create_progress_renderer(
-                        sys.stderr, no_color=args.no_color,
-                    )),
+                    progress_sink=progress_sink,
                 )
                 payload = payload_for(workflow)
-                return _result_document(command, workflow=workflow, data=payload), EXIT_SUCCESS
+                code, exit_code = _failure_for_workflow(store, workflow)
+                document = _result_document(command, workflow=workflow, error_code=code, data=payload)
+                if args.json_output or workflow.stage is not Stage.PLAN or workflow.status is not WorkflowStatus.AWAITING_APPROVAL:
+                    return document, exit_code
+
+                projection = payload.get("plan", {}).get("projection_error") if isinstance(payload.get("plan"), dict) else None
+                if projection:
+                    document["recovery_instruction"] = True
+                    return document, exit_code
+                if not interactive_prompt_eligible(sys.stdin, sys.stdout, sys.stderr):
+                    document["recovery_instruction"] = True
+                    return document, exit_code
+
+                # Render the verified review view before reading a decision.
+                # Resolution itself reuses every canonical approval guard.
+                artifact_id = plan_orchestrator.resolve_current_pending_plan_artifact(workflow.id)
+                render_result(document, mode=OutputMode.VERBOSE if args.verbose else OutputMode.HUMAN,
+                              stream=sys.stdout, no_color=args.no_color)
+                decision = prompt_for_plan_decision(sys.stdin, sys.stdout, no_color=args.no_color)
+                if decision is None:
+                    render_recovery_instruction(sys.stdout, no_color=args.no_color)
+                    document["_already_rendered"] = True
+                    return document, exit_code
+                action, reason = decision
+                workflow = (plan_orchestrator.approve(workflow.id, artifact_id)
+                            if action == "approve"
+                            else plan_orchestrator.reject(workflow.id, artifact_id, reason=reason))
+                result = _result_document(command, workflow=workflow, data=_workflow_payload(store, workflow))
+                render_plan_decision_result(sys.stdout, action, no_color=args.no_color)
+                result["_already_rendered"] = True
+                return result, EXIT_SUCCESS
             feature_file = _validate_feature_file(args.feature_file)
             workflow = orchestrator.run(config.repository_path, feature_file=feature_file, provider=config.provider_name, configuration_snapshot=config.snapshot)
         elif command == "status":
@@ -597,6 +630,9 @@ def main(argv: list[str] | None = None) -> int:
     )
     verbose_output = bool("args" in locals() and getattr(args, "verbose", False))
     mode = OutputMode.JSON if json_output else (OutputMode.VERBOSE if verbose_output else OutputMode.HUMAN)
+    already_rendered = bool(document.pop("_already_rendered", False))
+    if already_rendered:
+        return exit_code
     render_result(
         document,
         mode=mode,

@@ -405,6 +405,47 @@ class V2PlanOrchestrator:
         )
         return workflow, artifact, plan
 
+
+class V2HappyPathCoordinator:
+    """Compose the bounded V2 Intake and Plan operations for ``run``.
+
+    This deliberately has no decision or implementation authority.  The
+    existing orchestrators retain persistence and transition ownership; this
+    facade only permits the one READY successor needed by the human happy path.
+    """
+
+    def __init__(self, intake: IntakeOrchestrator, plan: V2PlanOrchestrator) -> None:
+        self.intake = intake
+        self.plan = plan
+
+    def run(self, repository_path: str | Path, request: str, *, provider: str | None = None,
+            configuration_snapshot: Mapping[str, Any] | None = None, progress_sink: Any = None) -> Workflow:
+        workflow = self.intake.run(
+            repository_path, request, provider=provider,
+            configuration_snapshot=configuration_snapshot, progress_sink=progress_sink,
+        )
+        if workflow.stage is Stage.INTAKE:
+            if workflow.status is WorkflowStatus.READY:
+                planned = self.plan.resume(workflow.id, progress_sink=progress_sink)
+                if planned.stage is Stage.PLAN and planned.status in {
+                    WorkflowStatus.AWAITING_APPROVAL,
+                    WorkflowStatus.FAILED,
+                    WorkflowStatus.HUMAN_ATTENTION,
+                }:
+                    return planned
+                raise ConflictFailure("Plan reached an unexpected state; refusing to continue")
+            if workflow.status in {
+                WorkflowStatus.NEEDS_CLARIFICATION,
+                WorkflowStatus.REJECTED,
+                WorkflowStatus.FAILED,
+                WorkflowStatus.HUMAN_ATTENTION,
+            }:
+                return workflow
+            raise ConflictFailure("Intake reached an unexpected state; refusing to continue")
+        # Intake owns creation, so any other stage is an invariant violation,
+        # not a reason to infer a successor.
+        raise ConflictFailure("Intake reached an unexpected stage; refusing to continue")
+
 def _emit_progress(sink: Any, stage: Stage, kind: str, elapsed: float) -> None:
     """Emit safe transient stage progress without coupling it to lifecycle work."""
 

@@ -8,7 +8,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 
 from engineering_flow.domain import Stage  # noqa: E402
-from engineering_flow.presentation import OutputMode, ProgressRenderer, create_progress_renderer, render_result  # noqa: E402
+from engineering_flow.presentation import (OutputMode, ProgressRenderer, create_progress_renderer,
+                                           prompt_for_plan_decision, render_result)  # noqa: E402
 from engineering_flow.runtime import RuntimeProgressEvent  # noqa: E402
 
 
@@ -86,6 +87,15 @@ class Tty(io.StringIO):
 
 
 class PresentationTests(unittest.TestCase):
+    def test_plan_prompt_accepts_explicit_values_reprompts_and_leaves_eof_undecided(self):
+        output = Tty()
+        self.assertEqual(prompt_for_plan_decision(Tty("wat\nYES\n"), output, no_color=True), ("approve", None))
+        self.assertIn("Please enter y or n.", output.getvalue())
+        self.assertEqual(prompt_for_plan_decision(Tty("n\nToo broad.\n"), Tty(), no_color=True),
+                         ("reject", "Too broad."))
+        self.assertEqual(prompt_for_plan_decision(Tty("\n"), Tty(), no_color=True), ("approve", None))
+        self.assertIsNone(prompt_for_plan_decision(Tty(""), Tty(), no_color=True))
+
     def test_tty_progress_updates_one_live_renderer_then_finalizes(self):
         output = Tty()
         instances = []

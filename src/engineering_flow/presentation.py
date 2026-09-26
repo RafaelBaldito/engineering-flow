@@ -229,6 +229,10 @@ def render_human(console: Console, document: Mapping[str, Any]) -> None:
         _heading(console, "Events")
         for event in events:
             console.print(json.dumps(event, ensure_ascii=False, sort_keys=True))
+    if document.get("recovery_instruction"):
+        console.print()
+        console.print("Plan is awaiting approval.", style="yellow")
+        console.print("Run `engineering-flow approve --repo .` or `engineering-flow reject --repo . --reason \"...\"`.")
 
 
 def render_verbose(console: Console, document: Mapping[str, Any]) -> None:
@@ -260,6 +264,61 @@ def render_result(
         render_verbose(console, document)
     else:
         render_human(console, document)
+
+
+def interactive_prompt_eligible(input_stream: TextIO, output_stream: TextIO, error_stream: TextIO) -> bool:
+    """Return whether reading a human decision is safe for this invocation."""
+
+    return _is_terminal(input_stream) and _is_terminal(output_stream) and _is_terminal(error_stream)
+
+
+def prompt_for_plan_decision(
+    input_stream: TextIO,
+    output_stream: TextIO,
+    *,
+    no_color: bool = False,
+    environ: Mapping[str, str] | None = None,
+) -> tuple[str, str | None] | None:
+    """Read one explicit Plan decision at the presentation boundary.
+
+    ``None`` means EOF before a complete decision.  Empty input approves only
+    at the decision prompt; a rejection reason remains subject to the domain's
+    existing optional/required rule.
+    """
+
+    console = build_console(output_stream, no_color=no_color, environ=environ)
+    while True:
+        console.print("Approve this plan? [Y/n]", end=" ")
+        answer = input_stream.readline()
+        if answer == "":
+            return None
+        normalized = answer.strip().casefold()
+        if normalized in {"", "y", "yes"}:
+            return "approve", None
+        if normalized in {"n", "no"}:
+            console.print("Rejection reason:", end=" ")
+            reason = input_stream.readline()
+            if reason == "":
+                return None
+            return "reject", reason.strip() or None
+        console.print("Please enter y or n.", style="yellow")
+
+
+def render_recovery_instruction(output_stream: TextIO, *, no_color: bool = False,
+                                environ: Mapping[str, str] | None = None) -> None:
+    console = build_console(output_stream, no_color=no_color, environ=environ)
+    console.print("Plan is awaiting approval.", style="yellow")
+    console.print("Run `engineering-flow approve --repo .` or `engineering-flow reject --repo . --reason \"...\"`.")
+
+
+def render_plan_decision_result(output_stream: TextIO, decision: str, *, no_color: bool = False,
+                                environ: Mapping[str, str] | None = None) -> None:
+    console = build_console(output_stream, no_color=no_color, environ=environ)
+    if decision == "approve":
+        console.print("✓ Plan approved.", style="green")
+        console.print("Implementation has not started.")
+    else:
+        console.print("Plan rejected.", style="red")
 
 
 class ProgressRenderer:
@@ -360,6 +419,10 @@ __all__ = [
     "build_console",
     "ProgressRenderer",
     "create_progress_renderer",
+    "interactive_prompt_eligible",
+    "prompt_for_plan_decision",
+    "render_plan_decision_result",
+    "render_recovery_instruction",
     "render_human",
     "render_plan_summary",
     "render_result",

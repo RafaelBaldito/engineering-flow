@@ -128,26 +128,65 @@ class CliTests(unittest.TestCase):
                         "assumptions": [], "open_questions": [],
                     }},
                 )
+            def verify_planning_capabilities(self, repository):
+                return CapabilityReport("fake", "fake", str(repository), True, {"read_only": True}, True)
+            def execute(self, request):
+                artifact_id, sha256 = re.search(r"artifact UUID ([^,]+), sha256 ([^)]+)", request.instruction).groups()
+                return PlanningExecutionResult("fake", request.logical_session_id or "session", "thread", "turn", TerminalState.SUCCEEDED,
+                    {"plan": {"id": f"{request.workflow_id}:plan:r1", "workflow_id": request.workflow_id, "revision": 1,
+                    "feature_contract": {"artifact_id": artifact_id, "sha256": sha256}, "strategy": "Change source.", "assumptions": [],
+                    "verification_strategy": ["tests"], "tasks": [{"id": "T1", "objective": "Change source.",
+                    "context": {"relevant_files": ["feature.md"], "existing_patterns": []}, "requirements": ["Update behavior."],
+                    "acceptance_criteria": ["Works."], "verification": ["tests"], "constraints": [], "depends_on": [],
+                    "complexity": "low", "risk": "low"}]}})
         request = "Allow users to cancel an order before shipment. Only PENDING orders may be cancelled. SHIPPED orders cannot be cancelled."
         with patch("engineering_flow.cli.CodexCliRuntime", IntakeRuntime):
             code, text = self.invoke(["run", "--repo", str(self.repository), "--request", request])
         self.assertEqual(code, 0)
-        self.assertIn("Intake: READY", text)
-        workflow_id = next(line.split(": ", 1)[1] for line in text.splitlines() if line.startswith("workflow:"))
+        self.assertIn("AWAITING_APPROVAL", text)
         code, status = self.invoke(["status", "--repo", str(self.repository), "--json"])
         self.assertEqual(code, 0)
-        self.assertEqual((status["lifecycle_version"], status["stage"], status["status"]), ("v2", "intake", "ready"))
+        self.assertEqual((status["lifecycle_version"], status["stage"], status["status"]), ("v2", "plan", "awaiting_approval"))
         self.assertEqual(status["intake"]["outcome"], "READY")
         self.assertEqual(status["intake"]["open_questions"], [])
-        self.assertEqual(len(status["artifacts"]), 1)
-        self.assertEqual(status["artifacts"][0]["approval_state"], "not_required")
+        self.assertEqual(len(status["artifacts"]), 2)
+        self.assertEqual(status["artifacts"][-1]["approval_state"], "pending")
         self.assertEqual(status["tasks"], [])
-        self.assertEqual([artifact["stage"] for artifact in status["artifacts"]], ["intake"])
-        code, logs = self.invoke(["logs", "--repo", str(self.repository), "--workflow", workflow_id, "--json"])
+        self.assertEqual([artifact["stage"] for artifact in status["artifacts"]], ["intake", "plan"])
+        code, logs = self.invoke(["logs", "--repo", str(self.repository), "--workflow", status["workflow_id"], "--json"])
         self.assertEqual(code, 0)
         self.assertEqual(logs["lifecycle_version"], "v2")
         self.assertEqual(logs["intake"]["outcome"], "READY")
         self.assertTrue(any(event["type"] == "intake.completed" for event in logs["events"]))
+
+    def test_interactive_run_approves_the_displayed_plan_without_starting_tasks(self):
+        class Runtime(FakeRuntime):
+            def execute_planning(self, request):
+                return PlanningExecutionResult("fake", request.logical_session_id or "s", "thread", "turn", TerminalState.SUCCEEDED,
+                    {"outcome": "READY", "feature": {"id": request.workflow_id, "goal": "Goal", "requirements": ["Requirement"],
+                    "acceptance_criteria": ["Criterion"], "constraints": [], "out_of_scope": [], "assumptions": [], "open_questions": []}})
+            def verify_planning_capabilities(self, repository):
+                return CapabilityReport("fake", "fake", str(repository), True, {"read_only": True}, True)
+            def execute(self, request):
+                artifact_id, sha256 = re.search(r"artifact UUID ([^,]+), sha256 ([^)]+)", request.instruction).groups()
+                return PlanningExecutionResult("fake", request.logical_session_id or "s", "thread", "turn", TerminalState.SUCCEEDED,
+                    {"plan": {"id": f"{request.workflow_id}:plan:r1", "workflow_id": request.workflow_id, "revision": 1,
+                    "feature_contract": {"artifact_id": artifact_id, "sha256": sha256}, "strategy": "Strategy", "assumptions": [], "verification_strategy": ["tests"],
+                    "tasks": [{"id": "T1", "objective": "Change feature.", "context": {"relevant_files": ["feature.md"], "existing_patterns": []},
+                    "requirements": ["Requirement"], "acceptance_criteria": ["Criterion"], "verification": ["tests"], "constraints": [], "depends_on": [], "complexity": "low", "risk": "low"}]}})
+        class Tty(io.StringIO):
+            def isatty(self): return True
+        stdout, stderr, stdin = Tty(), Tty(), Tty("\n")
+        with patch("engineering_flow.cli.CodexCliRuntime", Runtime), patch("engineering_flow.cli.sys.stdin", stdin), \
+                patch("engineering_flow.cli.sys.stdout", stdout), patch("engineering_flow.cli.sys.stderr", stderr):
+            self.assertEqual(main(["run", "--repo", str(self.repository), "--request", "Change feature."]), 0)
+        self.assertIn("Approve this plan? [Y/n]", stdout.getvalue())
+        self.assertIn("Plan approved.", stdout.getvalue())
+        store = WorkflowStore(self.repository / ".engineering-flow" / "workflows.sqlite3")
+        workflow = store.get_workflow(store.get_selected_workflow_id())
+        self.assertEqual((workflow.stage, workflow.status), (Stage.PLAN, WorkflowStatus.PLAN_APPROVED))
+        self.assertEqual(store.list_tasks(workflow.id), [])
+        store.close()
 
     def test_resume_progress_uses_tty_stderr_and_json_and_non_tty_is_bounded(self):
         class PlanRuntime(FakeRuntime):
@@ -440,6 +479,17 @@ class CliTests(unittest.TestCase):
                         "constraints": [], "out_of_scope": [], "assumptions": [], "open_questions": [],
                     }},
                 )
+            def verify_planning_capabilities(self, repository):
+                return CapabilityReport("fake", "fake", str(repository), True, {"read_only": True}, True)
+            def execute(self, request):
+                artifact_id, sha256 = re.search(r"artifact UUID ([^,]+), sha256 ([^)]+)", request.instruction).groups()
+                return PlanningExecutionResult("fake", request.logical_session_id or "session", "thread", "turn", TerminalState.SUCCEEDED,
+                    {"plan": {"id": f"{request.workflow_id}:plan:r1", "workflow_id": request.workflow_id, "revision": 1,
+                    "feature_contract": {"artifact_id": artifact_id, "sha256": sha256}, "strategy": "Change source.", "assumptions": [],
+                    "verification_strategy": ["tests"], "tasks": [{"id": "T1", "objective": "Change source.",
+                    "context": {"relevant_files": ["feature.md"], "existing_patterns": []}, "requirements": ["Update behavior."],
+                    "acceptance_criteria": ["Works."], "verification": ["tests"], "constraints": [], "depends_on": [],
+                    "complexity": "low", "risk": "low"}]}})
 
         stdout, stderr = io.StringIO(), io.StringIO()
         with patch("engineering_flow.cli.CodexCliRuntime", IntakeRuntime), \
@@ -451,7 +501,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(len(stdout.getvalue().splitlines()), 1)
         run_document = json.loads(stdout.getvalue())
         self.assertEqual((run_document["command"], run_document["stage"], run_document["status"]),
-                         ("run", "intake", "ready"))
+                         ("run", "plan", "awaiting_approval"))
         self.assertNotRegex(stdout.getvalue(), r"\x1b\[")
 
         class PlanRuntime(FakeRuntime):
