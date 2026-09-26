@@ -1124,7 +1124,8 @@ class WorkflowStore:
                                      canonical_root: str, task_contract_id: str,
                                      task_contract_sha256: str, request_hash: str,
                                      baseline: Mapping[str, Any], owner_instance_id: str,
-                                     owner_pid: int, owner_host_id: str, requested_profile: str = "fake",
+                                     owner_pid: int, owner_host_id: str, owner_boot_id: str | None = None,
+                                     requested_profile: str = "fake",
                                      requested_provider: str = "fake", requested_model: str | None = None,
                                      requested_reasoning: str | None = None) -> dict[str, str]:
         """Atomically create the only Slice-2 writer intent and its durable lease.
@@ -1160,8 +1161,8 @@ class WorkflowStore:
             conn.execute("""INSERT INTO implementation_attempts (id,workflow_id,execution_id,operation_id,lease_id,feature_artifact_id,feature_sha256,plan_artifact_id,plan_sha256,plan_revision,plan_id,approval_id,task_contract_id,task_contract_sha256,sequence,request_hash,requested_profile,requested_provider,requested_model,requested_reasoning,started_at,status,baseline_repository_json,created_at,updated_at)
                 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'preparing',?,?,?)""",
                 (attempt_id,workflow_id,execution_id,operation_id,lease_id,authority.feature_contract_artifact.id,authority.feature_contract_artifact.sha256,authority.plan_artifact.id,authority.plan_artifact.sha256,authority.plan.revision,authority.plan.id,authority.approval.id,task_contract_id,task_contract_sha256,sequence,request_hash,requested_profile,requested_provider,requested_model,requested_reasoning,now,_json(baseline),now,now))
-            conn.execute("""INSERT INTO workspace_writer_leases (repository_key,lease_id,attempt_id,workflow_id,canonical_root,owner_instance_id,owner_pid,owner_host_id,acquired_at,updated_at)
-                VALUES (?,?,?,?,?,?,?,?,?,?)""", (repository_key,lease_id,attempt_id,workflow_id,canonical_root,owner_instance_id,owner_pid,owner_host_id,now,now))
+            conn.execute("""INSERT INTO workspace_writer_leases (repository_key,lease_id,attempt_id,workflow_id,canonical_root,owner_instance_id,owner_pid,owner_host_id,owner_boot_id,acquired_at,updated_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?)""", (repository_key,lease_id,attempt_id,workflow_id,canonical_root,owner_instance_id,owner_pid,owner_host_id,owner_boot_id,now,now))
             conn.execute("""INSERT INTO task_implementation_states (id,workflow_id,plan_artifact_id,plan_sha256,task_contract_id,task_contract_sha256,status,selected_at,updated_at)
                 VALUES (?,?,?,?,?,?, 'implementing',?,?) ON CONFLICT(workflow_id,plan_artifact_id,task_contract_id)
                 DO UPDATE SET status='implementing', selected_at=excluded.selected_at, updated_at=excluded.updated_at""",
@@ -1179,13 +1180,25 @@ class WorkflowStore:
                 raise ConflictFailure("implementation attempt/lease ownership mismatch")
             pid = evidence.get("pid")
             group = evidence.get("process_group")
+            start = evidence.get("process_start")
             if type(pid) is not int: pid = None
             if type(group) is not int: group = None
             now = _now()
-            conn.execute("UPDATE workspace_writer_leases SET provider_pid=?,provider_process_group=?,updated_at=? WHERE attempt_id=? AND lease_id=?",
-                         (pid, group, now, attempt_id, lease_id))
+            if not isinstance(start, str) or not start:
+                start = None
+            conn.execute("UPDATE workspace_writer_leases SET provider_pid=?,provider_process_start=?,provider_process_group=?,updated_at=? WHERE attempt_id=? AND lease_id=?",
+                         (pid, start, group, now, attempt_id, lease_id))
             conn.execute("UPDATE implementation_attempts SET started_at=?,status='running',updated_at=? WHERE id=?", (now, now, attempt_id))
             conn.execute("UPDATE executions SET lifecycle='running',updated_at=? WHERE id=?", (now, row["execution_id"]))
+
+    def update_implementation_baseline(self, attempt_id: str, lease_id: str,
+                                       baseline: Mapping[str, Any]) -> None:
+        """Replace pre-acquisition evidence with the accepted pre-spawn baseline."""
+        with self._transaction() as conn:
+            result = conn.execute("UPDATE implementation_attempts SET baseline_repository_json=?,updated_at=? WHERE id=? AND lease_id=? AND status='preparing'",
+                (_json(baseline), _now(), attempt_id, lease_id))
+            if result.rowcount != 1:
+                raise ConflictFailure("implementation baseline ownership mismatch")
 
     def finish_implementation_attempt(self, attempt_id: str, lease_id: str, *, status: str,
                                       classification: str, final: Mapping[str, Any] | None,
@@ -1194,7 +1207,7 @@ class WorkflowStore:
                                       actual_provider: str | None = None, actual_model: str | None = None,
                                       actual_reasoning: str | None = None, provider_operation_ref: str | None = None,
                                       provider_session_ref: str | None = None, usage: Mapping[str, Any] | None = None,
-                                      error_classification: str | None = None) -> None:
+                                      error_classification: str | None = None, release_lease: bool = True) -> None:
         with self._transaction() as conn:
             row = conn.execute("SELECT * FROM implementation_attempts WHERE id=? AND lease_id=?", (attempt_id, lease_id)).fetchone()
             if row is None: raise ConflictFailure("implementation attempt/lease ownership mismatch")
@@ -1207,7 +1220,25 @@ class WorkflowStore:
             conn.execute("UPDATE operations SET status=?, updated_at=? WHERE id=?", ("completed" if task_status == "implementation_completed" else "unknown",now,row["operation_id"]))
             conn.execute("UPDATE task_implementation_states SET status=?,updated_at=? WHERE workflow_id=? AND plan_artifact_id=? AND task_contract_id=?", (task_status,now,row["workflow_id"],row["plan_artifact_id"],row["task_contract_id"]))
             conn.execute("UPDATE workflows SET stage=?,status=?,updated_at=? WHERE id=?", (Stage.PLAN.value if classification == "baseline_refusal" else Stage.TASK_EXECUTION.value,workflow_status,now,row["workflow_id"]))
-            conn.execute("DELETE FROM workspace_writer_leases WHERE lease_id=? AND attempt_id=?", (lease_id,attempt_id))
+            if release_lease:
+                # Exact compare-and-delete: a stale recovery cannot delete a
+                # lease that has been rebound by a future owner.
+                conn.execute("DELETE FROM workspace_writer_leases WHERE lease_id=? AND attempt_id=?", (lease_id,attempt_id))
+
+    def active_implementation_lease(self, workflow_id: str) -> Mapping[str, Any] | None:
+        """Return one unresolved V2 writer lease joined to its attempt.
+
+        This intentionally exposes raw persisted evidence only to the narrow
+        recovery service; normal presentation must not display process IDs.
+        """
+        rows = self._connection.execute("""SELECT l.*, a.status AS attempt_status,
+            a.result_classification, a.baseline_repository_json, a.workflow_id AS attempt_workflow_id,
+            a.lease_id AS attempt_lease_id, a.task_contract_id, a.plan_artifact_id
+            FROM workspace_writer_leases l JOIN implementation_attempts a ON a.id=l.attempt_id
+            WHERE l.workflow_id=?""", (workflow_id,)).fetchall()
+        if len(rows) > 1:
+            raise PersistenceFailure("workflow has multiple unresolved writer leases")
+        return dict(rows[0]) if rows else None
 
     def request_plan_changes(self, workflow_id: str, target_plan_artifact_id: str, feedback: str, *, actor: str = "human") -> PlanChangeRequest:
         if not isinstance(feedback, str) or not feedback.strip():

@@ -7,6 +7,7 @@ import os
 import re
 import shutil
 import subprocess
+import signal
 import threading
 import time
 from collections import deque
@@ -29,6 +30,8 @@ from .runtime import (
     RuntimeProgressEvent,
     TerminalState,
 )
+from .process_identity import (owned_process_evidence, local_host_boot_identity,
+                               signal_owned_group)
 from .sanitization import sanitize_payload, sanitize_text
 
 
@@ -538,11 +541,10 @@ class CodexCliRuntime(AgentRuntime):
             **({"start_new_session": True} if request.implementation_profile is not None else {}),
         )
         if request.provider_started is not None:
-            evidence: dict[str, Any] = {"pid": getattr(process, "pid", None)}
-            # The group is reliably the child PID when start_new_session was
-            # accepted; do not manufacture it for fixture/legacy processes.
-            if isinstance(evidence["pid"], int):
-                evidence["process_group"] = evidence["pid"]
+            pid = getattr(process, "pid", None)
+            evidence: dict[str, Any] = (owned_process_evidence(pid)
+                                        if request.implementation_profile is not None and type(pid) is int
+                                        else {"pid": pid})
             request.provider_started(evidence)
         return process
 
@@ -921,19 +923,45 @@ class CodexCliRuntime(AgentRuntime):
                 process, request.timeout_seconds, state, events, request
             )
         except KeyboardInterrupt:
-            # The process belongs to this invocation.  Stop it before allowing
-            # orchestration to persist an unknown outcome and the CLI to exit.
-            try:
-                process.terminate()
-            except (AttributeError, OSError):
-                pass
+            # IMPLEMENT owns a session.  Signal its exact group rather than
+            # merely the immediate child, and never use a bare recycled PID.
+            pid = getattr(process, "pid", None)
+            stopped_by_group = False
+            if request.implementation_profile is not None and type(pid) is int:
+                evidence = owned_process_evidence(pid)
+                try:
+                    host = local_host_boot_identity()
+                    stopped_by_group = signal_owned_group(
+                        process_group=evidence.get("process_group"), provider_pid=pid,
+                        provider_process_start=evidence.get("process_start"),
+                        host_id=host.host_id, boot_id=host.boot_id, sig=signal.SIGTERM,
+                    )
+                except OSError:
+                    stopped_by_group = False
+            if request.implementation_profile is None:
+                try:
+                    process.terminate()
+                except (AttributeError, OSError):
+                    pass
             try:
                 process.communicate(timeout=0.5)
             except (AttributeError, OSError, subprocess.TimeoutExpired):
-                try:
-                    process.kill()
-                except (AttributeError, OSError):
-                    pass
+                if stopped_by_group and type(pid) is int:
+                    try:
+                        host = local_host_boot_identity()
+                        signal_owned_group(process_group=evidence.get("process_group"), provider_pid=pid,
+                                           provider_process_start=evidence.get("process_start"),
+                                           host_id=host.host_id, boot_id=host.boot_id, sig=signal.SIGKILL)
+                        process.communicate(timeout=0.5)
+                    except OSError:
+                        pass
+                    except subprocess.TimeoutExpired:
+                        pass
+                if request.implementation_profile is None:
+                    try:
+                        process.kill()
+                    except (AttributeError, OSError):
+                        pass
             raise
         except subprocess.TimeoutExpired as exc:
             timed_out = True

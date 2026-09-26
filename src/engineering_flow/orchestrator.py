@@ -7,7 +7,7 @@ import json
 import uuid
 import time
 import os
-import socket
+from enum import Enum
 from dataclasses import asdict, dataclass, is_dataclass
 from pathlib import Path
 from typing import Any, Mapping
@@ -38,6 +38,7 @@ from .domain import (
     Plan,
     TaskSelection,
     TaskImplementationStatus,
+    TaskSelectionOutcome,
     select_executable_task,
     select_implementation_profile,
 )
@@ -55,7 +56,8 @@ from .runtime import (
 )
 from .plan_markdown import render_plan_markdown
 from .store import WorkflowStore
-from .repository import RepositoryInspector, RepositorySnapshot
+from .repository import RepositoryInspector, RepositorySnapshot, control_state_fingerprint
+from .process_identity import HostBootIdentity, ProcessObservation, local_host_boot_identity, observe_exact_process
 
 
 _STAGES: tuple[Stage, ...] = (Stage.PRD, Stage.TECHSPEC, Stage.TASK_PLAN)
@@ -127,6 +129,70 @@ class FakeWriterResult:
     provider_session_ref: str | None = None
     usage: Mapping[str, Any] | None = None
     error_classification: str | None = None
+
+
+class ReconciliationOutcome(Enum):
+    WRITER_ALIVE = "writer_alive"
+    WRITER_GONE_UNCHANGED = "writer_gone_unchanged"
+    WRITER_GONE_CHANGED = "writer_gone_changed"
+    IDENTITY_AMBIGUOUS = "identity_ambiguous"
+    REPOSITORY_UNINSPECTABLE = "repository_uninspectable"
+    STATE_INCONSISTENT = "state_inconsistent"
+
+
+class ImplementationRecoveryService:
+    """Reconcile one persisted writer without ever dispatching a replacement."""
+
+    def __init__(self, store: WorkflowStore, *, identity: HostBootIdentity | None = None,
+                 observer: Any = observe_exact_process) -> None:
+        self.store, self.identity, self.observer = store, identity, observer
+
+    def reconcile(self, workflow_id: str) -> ReconciliationOutcome | None:
+        lease = self.store.active_implementation_lease(workflow_id)
+        if lease is None:
+            return None
+        # A lease is only meaningful when it names its one persisted attempt.
+        if (lease["attempt_workflow_id"] != workflow_id or lease["attempt_lease_id"] != lease["lease_id"]
+                or lease["attempt_status"] not in {"preparing", "running", "unknown", "interrupted"}):
+            self._unresolved(lease, "persisted attempt/lease state is internally inconsistent")
+            return ReconciliationOutcome.STATE_INCONSISTENT
+        observation = self.observer(host_id=lease.get("owner_host_id"), boot_id=lease.get("owner_boot_id"),
+            provider_pid=lease.get("provider_pid"), provider_process_start=lease.get("provider_process_start"),
+            identity=self.identity)
+        if observation is ProcessObservation.ALIVE:
+            return ReconciliationOutcome.WRITER_ALIVE
+        if observation is not ProcessObservation.GONE:
+            self._unresolved(lease, "writer process identity cannot be proven dead")
+            return ReconciliationOutcome.IDENTITY_AMBIGUOUS
+        try:
+            baseline = json.loads(lease["baseline_repository_json"])
+            inspector = RepositoryInspector(lease["canonical_root"])
+            final = inspector.capture()
+            control = control_state_fingerprint(lease["canonical_root"])
+        except Exception as exc:
+            self._unresolved(lease, f"recovery repository inspection failed: {exc}")
+            return ReconciliationOutcome.REPOSITORY_UNINSPECTABLE
+        # Exact persisted baseline comparison, including control state when it
+        # was captured by this slice.  Old/incomplete evidence is unsafe.
+        expected_control = baseline.get("control_state_fingerprint")
+        if not expected_control:
+            self._unresolved(lease, "persisted baseline lacks control-state evidence")
+            return ReconciliationOutcome.STATE_INCONSISTENT
+        unchanged = final.fingerprint == baseline.get("fingerprint") and control == expected_control
+        if unchanged:
+            self.store.finish_implementation_attempt(lease["attempt_id"], lease["lease_id"], status="failed",
+                classification="failed_unchanged", final=final.as_payload(), workspace_changed=False,
+                error_detail="recovered after writer death with exact unchanged baseline")
+            return ReconciliationOutcome.WRITER_GONE_UNCHANGED
+        self.store.finish_implementation_attempt(lease["attempt_id"], lease["lease_id"], status="unknown",
+            classification="interrupted_changed", final=final.as_payload(), workspace_changed=True,
+            error_detail="recovered after writer death with changed or control-violating workspace")
+        return ReconciliationOutcome.WRITER_GONE_CHANGED
+
+    def _unresolved(self, lease: Mapping[str, Any], detail: str) -> None:
+        self.store.finish_implementation_attempt(lease["attempt_id"], lease["lease_id"], status="unknown",
+            classification="owner_uncertain", final=None, workspace_changed=None, error_detail=detail,
+            release_lease=False)
 
 
 def build_implementation_instruction(authority: Any, task: Any, profile: ImplementationProfile) -> str:
@@ -220,12 +286,21 @@ class ImplementationAttemptOrchestrator:
                 after.head_sha, after.branch_name, after.detached, after.local_git_config_sha256)
 
     def run_once(self, workflow_id: str) -> TaskSelection:
+        # Recovery is a hard invocation boundary: it never falls through to a
+        # new selection/dispatch, even when it made a retry-safe failure.
+        if ImplementationRecoveryService(self.store).reconcile(workflow_id) is not None:
+            return TaskSelection(TaskSelectionOutcome.NO_EXECUTABLE_TASK)
         selection = ImplementationSelectionOrchestrator(self.store).select_once(workflow_id)
         if selection.task is None:
             return selection
         authority = self.store.load_approved_v2_plan_authority(workflow_id)
         inspector = RepositoryInspector(authority.workflow.repository_path)
         baseline = inspector.capture(require_clean=True)
+        baseline_payload = baseline.as_payload()
+        try:
+            identity = local_host_boot_identity()
+        except OSError as exc:
+            raise ValidationFailure(f"cannot establish Linux host/boot identity: {exc}") from exc
         profile, model, reasoning = getattr(self.writer, "routing_for", lambda _: (None, "", ""))(selection.task)
         instruction = (build_implementation_instruction(authority, selection.task, profile)
                        if isinstance(profile, ImplementationProfile) else "fake-writer")
@@ -237,7 +312,8 @@ class ImplementationAttemptOrchestrator:
         intent = self.store.create_implementation_intent(workflow_id, repository_key=inspector.repository_key(),
             canonical_root=baseline.canonical_root, task_contract_id=selection.task.id,
             task_contract_sha256=selection.task.payload_sha256(), request_hash=request_hash,
-            baseline=baseline.as_payload(), owner_instance_id=str(uuid.uuid4()), owner_pid=os.getpid(), owner_host_id=socket.gethostname(),
+            baseline=baseline_payload, owner_instance_id=str(uuid.uuid4()), owner_pid=os.getpid(), owner_host_id=identity.host_id,
+            owner_boot_id=identity.boot_id,
             requested_profile=getattr(profile, "value", "fake"), requested_provider=getattr(self.writer, "provider", "fake"),
             requested_model=model or None, requested_reasoning=reasoning or None)
         # Close the preflight/acquisition TOCTOU window.  This hook exists only
@@ -254,10 +330,23 @@ class ImplementationAttemptOrchestrator:
             self.store.finish_implementation_attempt(intent["attempt_id"], intent["lease_id"], status="failed",
                 classification="baseline_refusal", final=accepted.as_payload(), workspace_changed=False, error_detail="baseline changed after lease")
             return selection
+        # The lease/intent itself is an expected control write.  Capture the
+        # immutable control boundary only after it, immediately before spawn.
+        baseline_payload["control_state_fingerprint"] = control_state_fingerprint(baseline.canonical_root)
+        self.store.update_implementation_baseline(intent["attempt_id"], intent["lease_id"], baseline_payload)
         if hasattr(self.writer, "bind"):
             self.writer.bind(authority, selection.task, intent, self.store)
         # Exactly one possible writer dispatch per invocation.
-        result = self.writer(authority.workflow.repository_path, selection.task)
+        try:
+            result = self.writer(authority.workflow.repository_path, selection.task)
+        except KeyboardInterrupt:
+            # The runtime has already attempted owned-group termination.  Do
+            # not classify from the exception: process and repository evidence
+            # decide whether the lease can move.
+            outcome = ImplementationRecoveryService(self.store).reconcile(workflow_id)
+            if outcome is None:
+                raise PersistenceFailure("interrupted implementation lost its lease")
+            raise
         try:
             final = inspector.capture()
         except Exception as exc:
@@ -265,7 +354,22 @@ class ImplementationAttemptOrchestrator:
                 classification="safety_violation", final=None, workspace_changed=None, error_detail=str(exc), agent_result={"summary": getattr(result, "summary", "")})
             return selection
         changed = final.fingerprint != baseline.fingerprint
-        safe = self._same_structure(baseline, final)
+        safe = (self._same_structure(baseline, final)
+                and control_state_fingerprint(baseline.canonical_root) == baseline_payload["control_state_fingerprint"])
+        try:
+            # SQLite bytes are volatile due to our own lifecycle writes, so
+            # validate the authority records and immutable artifact bytes
+            # semantically as well as fingerprinting control files.
+            feature_now = self.store.get_artifact(authority.feature_contract_artifact.id)
+            plan_now = self.store.get_artifact(authority.plan_artifact.id)
+            approval_now = self.store.get_approval_for_artifact(plan_now.id)
+            safe = safe and (feature_now.sha256 == authority.feature_contract_artifact.sha256
+                and plan_now.sha256 == authority.plan_artifact.sha256
+                and approval_now is not None and approval_now.id == authority.approval.id
+                and bool(self.store.read_artifact(feature_now.id))
+                and bool(self.store.read_artifact(plan_now.id)))
+        except Exception:
+            safe = False
         if not safe:
             status, classification = "unknown", "safety_violation"
         elif result.success and changed:

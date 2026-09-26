@@ -20,6 +20,28 @@ def _sha(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def control_state_fingerprint(root: str | Path) -> str:
+    """Hash control files, excluding per-attempt runtime outputs.
+
+    This is detection evidence, not a sandbox.  If it cannot be collected the
+    caller must treat the execution result as unsafe rather than ignore it.
+    """
+    control = Path(root).resolve() / ".engineering-flow"
+    if not control.exists():
+        return _sha(b"missing")
+    rows: list[bytes] = []
+    for path in sorted(control.rglob("*")):
+        if ("implementation-runtime" in path.parts or not path.is_file()
+                # SQLite/WAL bytes necessarily change as the parent persists
+                # lifecycle evidence.  Authority rows are revalidated by the
+                # store instead of pretending these volatile bytes are stable.
+                or path.name.startswith("workflows.sqlite3")):
+            continue
+        relative = path.relative_to(control)
+        rows.append(os.fsencode(str(relative)) + b"\0" + _sha(path.read_bytes()).encode())
+    return _sha(b"\n".join(rows))
+
+
 @dataclass(frozen=True, slots=True)
 class RepositorySnapshot:
     canonical_root: str
