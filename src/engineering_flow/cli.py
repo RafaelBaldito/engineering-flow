@@ -120,7 +120,9 @@ def build_parser() -> argparse.ArgumentParser:
             command.add_argument("--reason", required=name == "reject", metavar="TEXT")
         if name == "resume":
             command.add_argument("--regenerate", choices=("prd", "techspec", "task-plan"))
-            command.add_argument("--answer", metavar="TEXT")
+            inputs = command.add_mutually_exclusive_group()
+            inputs.add_argument("--answer", metavar="TEXT")
+            inputs.add_argument("--feedback", metavar="TEXT")
         if name == "intervene":
             command.add_argument("--task", required=True, metavar="ID")
             command.add_argument("--reason", required=True, metavar="TEXT")
@@ -224,6 +226,7 @@ def _plan_payload(store: WorkflowStore, workflow: Workflow, *, projection: Any =
             "projection_state": projection.state,
             "projection_error": projection.error,
         }
+    changes = store.list_plan_change_requests(workflow.id)
     return {"plan": {"artifact_id": artifact.id, "sha256": artifact.sha256, "revision": artifact.revision,
                       "approval_state": artifact.approval_state.value,
                       "decision_reason": approval.reason if approval else None,
@@ -231,6 +234,11 @@ def _plan_payload(store: WorkflowStore, workflow: Workflow, *, projection: Any =
                                     "actor": approval.actor, "reason": approval.reason,
                                     "created_at": approval.created_at}
                                    if approval else None),
+                      "change_requests": [{"id": item.id, "sequence": item.sequence,
+                                           "target_plan_artifact_id": item.target_plan_artifact_id,
+                                           "replacement_plan_artifact_id": item.replacement_plan_artifact_id,
+                                           "actor": item.actor, "created_at": item.created_at,
+                                           "completed_at": item.completed_at} for item in changes],
                       **projection_data, **plan}}
 
 
@@ -623,6 +631,8 @@ def _run_command(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
                     raise ValidationFailure("--regenerate is V1-only")
                 if args.answer is not None:
                     workflow = intake_orchestrator.resume_answer(existing.id, args.answer, progress_sink=(None if args.json_output else create_progress_renderer(sys.stderr, no_color=args.no_color)))
+                elif args.feedback is not None:
+                    workflow = plan_orchestrator.request_changes(existing.id, args.feedback, progress_sink=(None if args.json_output else create_progress_renderer(sys.stderr, no_color=args.no_color)))
                 elif existing.stage is Stage.INTAKE and existing.status in {WorkflowStatus.NEEDS_CLARIFICATION, WorkflowStatus.FAILED, WorkflowStatus.HUMAN_ATTENTION, WorkflowStatus.READY}:
                     progress_sink = (None if args.json_output else create_progress_renderer(sys.stderr, no_color=args.no_color))
                     workflow, eof_at_clarification = _continue_v2_clarifications(
@@ -634,8 +644,8 @@ def _run_command(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
                 else:
                     workflow = plan_orchestrator.resume(existing.id, progress_sink=(None if args.json_output else create_progress_renderer(sys.stderr, no_color=args.no_color)))
             else:
-                if args.answer is not None:
-                    raise ValidationFailure("--answer is V2-only")
+                if args.answer is not None or args.feedback is not None:
+                    raise ValidationFailure("--answer and --feedback are V2-only")
                 regenerate = {"prd": Stage.PRD, "techspec": Stage.TECHSPEC, "task-plan": Stage.TASK_PLAN}.get(args.regenerate)
                 workflow = orchestrator.resume(existing.id, regenerate=regenerate)
             if explicit and workflow.lifecycle_version is LifecycleVersion.V2:
@@ -660,7 +670,7 @@ def _run_command(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
         if eof_at_clarification:
             document["_already_rendered"] = True
             return document, exit_code
-        if (command == "resume" and not args.json_output
+        if (command == "resume" and args.feedback is None and existing.status is not WorkflowStatus.CHANGES_REQUESTED and not args.json_output
                 and workflow.lifecycle_version is LifecycleVersion.V2
                 and workflow.stage is Stage.PLAN and workflow.status is WorkflowStatus.AWAITING_APPROVAL
                 and interactive_prompt_eligible(sys.stdin, sys.stdout, sys.stderr)):

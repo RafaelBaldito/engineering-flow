@@ -243,10 +243,21 @@ class V2PlanOrchestrator:
         workflow = self.store.get_workflow(workflow_id)
         if workflow.lifecycle_version is not LifecycleVersion.V2:
             raise ConflictFailure("workflow is not V2")
-        if workflow.stage is Stage.PLAN or not (workflow.stage is Stage.INTAKE and workflow.status is WorkflowStatus.READY):
+        change_request = self.store.get_open_plan_change_request(workflow.id)
+        if workflow.stage is Stage.PLAN and workflow.status is not WorkflowStatus.CHANGES_REQUESTED:
+            return workflow
+        if workflow.stage is Stage.PLAN and change_request is None:
+            raise PersistenceFailure("changes-requested Plan workflow has no open change request")
+        if workflow.stage is not Stage.PLAN and not (workflow.stage is Stage.INTAKE and workflow.status is WorkflowStatus.READY):
             return workflow
         feature_artifact, feature = self._latest_ready_feature_contract(workflow)
-        revision = self.store.next_generation_revision(workflow.id, Stage.PLAN)
+        target_plan = None
+        if change_request is not None:
+            target_plan = self.store.get_artifact(change_request.target_plan_artifact_id)
+            # This verifies the exact immutable bytes and Feature Contract binding
+            # before provider dispatch, even though it is no longer approvable.
+            self._parse_plan_artifact(workflow, target_plan, feature_artifact)
+        revision = self.store.next_artifact_revision(workflow.id, Stage.PLAN)
         plan_id = f"{workflow.id}:plan:r{revision}"
         instruction = (
             f"You are the Planner. Read the authoritative READY Feature Contract at {feature_artifact.path} (artifact UUID {feature_artifact.id}, sha256 {feature_artifact.sha256}) and inspect repository {workflow.repository_path}. "
@@ -255,21 +266,26 @@ class V2PlanOrchestrator:
             f"Return only strict Plan JSON. plan.id={plan_id}; workflow_id={workflow.id}; revision={revision}; feature_contract artifact_id={feature_artifact.id}; sha256={feature_artifact.sha256}. "
             "Each task must be precise with bounded context and verification; complexity and risk are independent; assumptions must not change product behavior."
         )
-        request_hash = hashlib.sha256(json.dumps({"feature_artifact_id": feature_artifact.id, "feature_sha256": feature_artifact.sha256, "instruction": instruction, "stage": "plan", "revision": revision, "output": "plan-v1"}, sort_keys=True).encode()).hexdigest()
+        if change_request is not None and target_plan is not None:
+            instruction += (f" Existing approved-candidate Plan is the canonical JSON at {target_plan.path} (artifact UUID {target_plan.id}, sha256 {target_plan.sha256}, revision {target_plan.revision}). "
+                            f"Human requested changes (change request {change_request.id}): {change_request.feedback!r}. Produce a complete replacement Plan, not a patch.")
+        request_hash = hashlib.sha256(json.dumps({"feature_artifact_id": feature_artifact.id, "feature_sha256": feature_artifact.sha256, "target_plan_id": target_plan.id if target_plan else None, "target_plan_sha256": target_plan.sha256 if target_plan else None, "change_request_id": change_request.id if change_request else None, "feedback": change_request.feedback if change_request else None, "instruction": instruction, "stage": "plan", "revision": revision, "output": "plan-v1"}, sort_keys=True).encode()).hexdigest()
         report = self.runtime.verify_planning_capabilities(workflow.repository_path)
-        artifact_path = self.store.workspace_path / "workflows" / workflow.id / "artifacts" / "002-plan.json"
+        artifact_path = self.store.plan_path(workflow.id, revision)
         intent = self.store.create_generation_intent(workflow.id, Stage.PLAN, request_hash=request_hash, provider=workflow.provider, role=Role.PLANNER, revision=revision, artifact_path=artifact_path, capability_report=_json_mapping(report))
         if intent.reused:
             return self.store.get_workflow(workflow.id)
         if not report.available or not report.read_only_planning:
-            self.store.fail_generation(intent.operation.idempotency_key, FailureClassification.PROVIDER, report.failure_detail or "Planner runtime is unavailable")
+            self.store.fail_generation(intent.operation.idempotency_key, FailureClassification.PROVIDER, report.failure_detail or "Planner runtime is unavailable", workflow_status=WorkflowStatus.CHANGES_REQUESTED if change_request else WorkflowStatus.FAILED)
             return self.store.get_workflow(workflow.id)
         self.store.set_workflow_state(workflow.id, stage=Stage.PLAN, status=WorkflowStatus.RUNNING, event_type="workflow.running", payload={"execution_id": intent.execution.id})
         self.store.start_execution(intent.execution.id)
         started = self._monotonic()
         _emit_progress(progress_sink, Stage.PLAN, "started", 0)
         root = self.store.workspace_path / "workflows" / workflow.id / "runtime" / intent.execution.id
-        request = RuntimeExecutionRequest(workflow_id=workflow.id, execution_id=intent.execution.id, logical_session_id=intent.execution.session_id, role=Role.PLANNER, stage=Stage.PLAN, repository_path=workflow.repository_path, authoritative_input_paths=(feature_artifact.path,), authoritative_input_hashes=(feature_artifact.sha256,), instruction=instruction, output_schema_path=str(root / "plan.schema.json"), final_output_path=str(root / "final-output.json"), timeout_seconds=self.timeout_seconds, required_capabilities=("read_only",), progress_sink=progress_sink)
+        paths = (feature_artifact.path,) + ((target_plan.path,) if target_plan else ())
+        hashes = (feature_artifact.sha256,) + ((target_plan.sha256,) if target_plan else ())
+        request = RuntimeExecutionRequest(workflow_id=workflow.id, execution_id=intent.execution.id, logical_session_id=intent.execution.session_id, role=Role.PLANNER, stage=Stage.PLAN, repository_path=workflow.repository_path, authoritative_input_paths=paths, authoritative_input_hashes=hashes, instruction=instruction, output_schema_path=str(root / "plan.schema.json"), final_output_path=str(root / "final-output.json"), timeout_seconds=self.timeout_seconds, required_capabilities=("read_only",), progress_sink=progress_sink)
         try:
             result = self.runtime.execute(request)
         except KeyboardInterrupt:
@@ -277,34 +293,34 @@ class V2PlanOrchestrator:
             # Do not retry, fabricate a Plan, or leave a running intent behind.
             self.store.mark_operation_unknown(intent.operation.idempotency_key, detail="interrupted by user")
             self.store.set_workflow_state(workflow.id, stage=Stage.PLAN,
-                                          status=WorkflowStatus.HUMAN_ATTENTION,
+                                          status=WorkflowStatus.CHANGES_REQUESTED if change_request else WorkflowStatus.HUMAN_ATTENTION,
                                           event_type="workflow.human_attention",
                                           payload={"reason": "provider operation interrupted"})
             _emit_progress(progress_sink, Stage.PLAN, "interrupted", self._monotonic() - started)
             raise
         except Exception as exc:
             self.store.mark_operation_unknown(intent.operation.idempotency_key, detail=str(exc))
-            result_workflow = self.store.set_workflow_state(workflow.id, stage=Stage.PLAN, status=WorkflowStatus.HUMAN_ATTENTION, event_type="workflow.human_attention", payload={"reason": "provider operation outcome is unknown"})
+            result_workflow = self.store.set_workflow_state(workflow.id, stage=Stage.PLAN, status=WorkflowStatus.CHANGES_REQUESTED if change_request else WorkflowStatus.HUMAN_ATTENTION, event_type="workflow.human_attention", payload={"reason": "provider operation outcome is unknown"})
             _emit_progress(progress_sink, Stage.PLAN, "failed", self._monotonic() - started)
             return result_workflow
         for event in result.events:
             self.store.append_event(workflow.id, f"agent.runtime.{event.type}", stage=Stage.PLAN, execution_id=intent.execution.id, payload={"provider_event_id": event.provider_event_id, "timestamp": event.timestamp, **dict(event.payload)})
         if result.terminal_state is TerminalState.UNKNOWN:
             self.store.mark_operation_unknown(intent.operation.idempotency_key, detail=result.failure_detail or "unknown provider outcome")
-            result_workflow = self.store.set_workflow_state(workflow.id, stage=Stage.PLAN, status=WorkflowStatus.HUMAN_ATTENTION, event_type="workflow.human_attention", payload={"reason": "provider operation outcome is unknown"})
+            result_workflow = self.store.set_workflow_state(workflow.id, stage=Stage.PLAN, status=WorkflowStatus.CHANGES_REQUESTED if change_request else WorkflowStatus.HUMAN_ATTENTION, event_type="workflow.human_attention", payload={"reason": "provider operation outcome is unknown"})
             _emit_progress(progress_sink, Stage.PLAN, "failed", self._monotonic() - started)
             return result_workflow
         if not result.success or not isinstance(result.final_payload, Mapping):
-            self.store.fail_generation(intent.operation.idempotency_key, result.failure_classification or FailureClassification.AGENT_EXECUTION, result.failure_detail or "Planner runtime failed")
+            self.store.fail_generation(intent.operation.idempotency_key, result.failure_classification or FailureClassification.AGENT_EXECUTION, result.failure_detail or "Planner runtime failed", workflow_status=WorkflowStatus.CHANGES_REQUESTED if change_request else WorkflowStatus.FAILED)
             _emit_progress(progress_sink, Stage.PLAN, "timed_out" if result.terminal_state is TerminalState.TIMED_OUT else "failed", self._monotonic() - started)
             return self.store.get_workflow(workflow.id)
         try:
             plan = Plan.parse(result.final_payload, workflow_id=workflow.id, revision=revision, feature_contract_artifact_id=feature_artifact.id, feature_contract_sha256=feature_artifact.sha256, repository_path=workflow.repository_path)
         except ValidationFailure as exc:
-            self.store.fail_generation(intent.operation.idempotency_key, FailureClassification.AGENT_EXECUTION, str(exc))
+            self.store.fail_generation(intent.operation.idempotency_key, FailureClassification.AGENT_EXECUTION, str(exc), workflow_status=WorkflowStatus.CHANGES_REQUESTED if change_request else WorkflowStatus.FAILED)
             _emit_progress(progress_sink, Stage.PLAN, "failed", self._monotonic() - started)
             return self.store.get_workflow(workflow.id)
-        self.store.complete_generation(intent.operation.idempotency_key, content=json.dumps(plan.as_payload(), ensure_ascii=False, indent=2) + "\n", artifact_path=artifact_path, stage=Stage.PLAN, revision=revision, terminal_result={"provider": result.provider, "final_payload": plan.as_payload(), "usage": dict(result.usage), "metadata": dict(result.metadata)}, workflow_stage=Stage.PLAN, workflow_status=WorkflowStatus.AWAITING_APPROVAL, approval_state=ApprovalState.PENDING, completion_event_type="plan.completed", completion_event_payload={"plan_id": plan.id, "revision": revision, "task_count": len(plan.tasks), "feature_contract_artifact_id": feature_artifact.id})
+        self.store.complete_generation(intent.operation.idempotency_key, content=json.dumps(plan.as_payload(), ensure_ascii=False, indent=2) + "\n", artifact_path=artifact_path, stage=Stage.PLAN, revision=revision, terminal_result={"provider": result.provider, "final_payload": plan.as_payload(), "usage": dict(result.usage), "metadata": dict(result.metadata)}, workflow_stage=Stage.PLAN, workflow_status=WorkflowStatus.AWAITING_APPROVAL, approval_state=ApprovalState.PENDING, completion_event_type="plan.completed", completion_event_payload={"plan_id": plan.id, "revision": revision, "task_count": len(plan.tasks), "feature_contract_artifact_id": feature_artifact.id}, result_plan_change_request_id=change_request.id if change_request else None)
         # The canonical JSON transaction has committed.  This is deliberately
         # best-effort: projection failure cannot change Plan validity or state.
         try:
@@ -314,18 +330,23 @@ class V2PlanOrchestrator:
         _emit_progress(progress_sink, Stage.PLAN, "completed", self._monotonic() - started)
         return self.store.get_workflow(workflow.id)
 
+    def request_changes(self, workflow_id: str, feedback: str, *, actor: str = "human", progress_sink: Any = None) -> Workflow:
+        artifact_id = self.resolve_current_pending_plan_artifact(workflow_id)
+        self.store.request_plan_changes(workflow_id, artifact_id, feedback, actor=actor)
+        return self.resume(workflow_id, progress_sink=progress_sink)
+
     def inspect_plan_projection(self, workflow_id: str, *, repair: bool = False) -> PlanProjection:
         """Verify canonical inputs then inspect, and optionally repair, its view."""
 
         workflow, _artifact, plan = self._verified_plan(workflow_id)
         expected_markdown = render_plan_markdown(plan)
         expected = expected_markdown.encode("utf-8")
-        path = self.store.plan_markdown_path(workflow.id)
-        actual = self.store.read_plan_markdown(workflow.id)
+        path = self.store.plan_markdown_path(workflow.id, plan.revision)
+        actual = self.store.read_plan_markdown(workflow.id, plan.revision)
         state = "missing" if actual is None else ("current" if actual == expected else "modified")
         if repair and state != "current":
             try:
-                self.store.write_plan_markdown(workflow.id, expected_markdown)
+                self.store.write_plan_markdown(workflow.id, expected_markdown, plan.revision)
             except PersistenceFailure as exc:
                 return PlanProjection(path, state, str(exc))
             return PlanProjection(path, "current")
@@ -425,18 +446,19 @@ class V2PlanOrchestrator:
         if not plans:
             raise ValidationFailure("Plan artifact is required for projection")
         artifact = plans[-1]
+        feature_artifact, feature = self._latest_ready_feature_contract(workflow)
+        plan = self._parse_plan_artifact(workflow, artifact, feature_artifact)
+        return workflow, artifact, plan
+
+    def _parse_plan_artifact(self, workflow: Workflow, artifact: Any, feature_artifact: Any) -> Plan:
         try:
             payload = json.loads(self.store.read_artifact(artifact.id))
         except json.JSONDecodeError as exc:
             raise ValidationFailure("Plan artifact is not valid JSON") from exc
-        feature_artifact, feature = self._latest_ready_feature_contract(workflow)
-        plan = Plan.parse(
-            payload, workflow_id=workflow.id, revision=artifact.revision,
-            feature_contract_artifact_id=feature_artifact.id,
-            feature_contract_sha256=feature_artifact.sha256,
-            repository_path=workflow.repository_path,
-        )
-        return workflow, artifact, plan
+        return Plan.parse(payload, workflow_id=workflow.id, revision=artifact.revision,
+                          feature_contract_artifact_id=feature_artifact.id,
+                          feature_contract_sha256=feature_artifact.sha256,
+                          repository_path=workflow.repository_path)
 
     def _latest_ready_feature_contract(self, workflow: Workflow) -> tuple[Any, FeatureContract]:
         """Resolve the stage-local Feature Contract authority for V2 Plan work."""

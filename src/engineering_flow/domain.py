@@ -79,6 +79,7 @@ class WorkflowStatus(_ValueEnum):
     READY = "ready"
     NEEDS_CLARIFICATION = "needs_clarification"
     PLAN_APPROVED = "plan_approved"
+    CHANGES_REQUESTED = "changes_requested"
 
 
 class ApprovalPolicy(_ValueEnum):
@@ -99,6 +100,7 @@ class ApprovalState(_ValueEnum):
     REJECTED = "rejected"
     AUTO_APPROVED = "auto_approved"
     NOT_REQUIRED = "not_required"
+    CHANGES_REQUESTED = "changes_requested"
 
 
 class TaskStatus(_ValueEnum):
@@ -356,6 +358,20 @@ class Clarification:
     result_feature_contract_artifact_id: str | None
     created_at: str
     answered_at: str | None
+    completed_at: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class PlanChangeRequest:
+    """Durable, Plan-specific human feedback and its replacement lineage."""
+    id: str
+    workflow_id: str
+    sequence: int
+    target_plan_artifact_id: str
+    feedback: str
+    actor: str
+    replacement_plan_artifact_id: str | None
+    created_at: str
     completed_at: str | None
 
 

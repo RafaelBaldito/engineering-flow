@@ -164,6 +164,8 @@ def render_plan_summary(console: Console, document: Mapping[str, Any], plan: Map
     console.print()
     if status == "awaiting_approval":
         console.print(Text("Waiting for human approval.", style="yellow"))
+    elif status == "changes_requested":
+        console.print(Text("Changes requested. Replacement Plan pending.", style="yellow"))
     elif status == "plan_approved":
         console.print(Text("Plan approved.", style="green"))
         console.print("No implementation has started.")

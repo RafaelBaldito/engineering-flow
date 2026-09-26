@@ -29,6 +29,7 @@ from .domain import (
     FailureClassification,
     CapabilityOperation,
     Clarification,
+    PlanChangeRequest,
     CanonicalStage,
     GenerationIntent,
     GovernanceDecision,
@@ -289,6 +290,18 @@ class WorkflowStore:
             completed_at TEXT,
             UNIQUE(workflow_id, sequence)
         );
+        CREATE TABLE IF NOT EXISTS plan_change_requests (
+            id TEXT PRIMARY KEY,
+            workflow_id TEXT NOT NULL REFERENCES workflows(id),
+            sequence INTEGER NOT NULL CHECK(sequence > 0),
+            target_plan_artifact_id TEXT NOT NULL UNIQUE REFERENCES artifacts(id),
+            feedback TEXT NOT NULL,
+            actor TEXT NOT NULL,
+            replacement_plan_artifact_id TEXT UNIQUE REFERENCES artifacts(id),
+            created_at TEXT NOT NULL,
+            completed_at TEXT,
+            UNIQUE(workflow_id, sequence)
+        );
         CREATE TABLE IF NOT EXISTS operations (
             id TEXT PRIMARY KEY,
             idempotency_key TEXT NOT NULL UNIQUE,
@@ -456,6 +469,7 @@ class WorkflowStore:
         CREATE INDEX IF NOT EXISTS idx_artifacts_workflow_stage
             ON artifacts(workflow_id, stage, revision);
         CREATE INDEX IF NOT EXISTS idx_clarifications_workflow ON clarifications(workflow_id, sequence);
+        CREATE INDEX IF NOT EXISTS idx_plan_change_requests_workflow ON plan_change_requests(workflow_id, sequence);
         CREATE INDEX IF NOT EXISTS idx_tasks_workflow_ordinal
             ON tasks(workflow_id, ordinal);
         CREATE INDEX IF NOT EXISTS idx_task_cycles_task
@@ -891,9 +905,57 @@ class WorkflowStore:
         row = self._connection.execute("SELECT COALESCE(MAX(revision), 0) FROM artifacts WHERE workflow_id = ? AND stage = ?", (workflow_id, stage.value)).fetchone()
         return int(row[0]) + 1
 
+    def plan_path(self, workflow_id: str, revision: int) -> Path:
+        name = "002-plan.json" if revision == 1 else f"002-plan-r{revision:03d}.json"
+        return self.workspace_path / "workflows" / workflow_id / "artifacts" / name
+
     def feature_contract_path(self, workflow_id: str, revision: int) -> Path:
         name = "001-feature-contract.json" if revision == 1 else f"001-feature-contract-r{revision:03d}.json"
         return self.workspace_path / "workflows" / workflow_id / "artifacts" / name
+
+    def list_plan_change_requests(self, workflow_id: str) -> list[PlanChangeRequest]:
+        rows = self._connection.execute("SELECT * FROM plan_change_requests WHERE workflow_id = ? ORDER BY sequence", (workflow_id,)).fetchall()
+        return [self._plan_change_request_from_row(row) for row in rows]
+
+    def get_open_plan_change_request(self, workflow_id: str) -> PlanChangeRequest | None:
+        rows = self._connection.execute("SELECT * FROM plan_change_requests WHERE workflow_id = ? AND replacement_plan_artifact_id IS NULL ORDER BY sequence", (workflow_id,)).fetchall()
+        if len(rows) > 1:
+            raise PersistenceFailure("workflow has multiple open Plan change requests")
+        return self._plan_change_request_from_row(rows[0]) if rows else None
+
+    def request_plan_changes(self, workflow_id: str, target_plan_artifact_id: str, feedback: str, *, actor: str = "human") -> PlanChangeRequest:
+        if not isinstance(feedback, str) or not feedback.strip():
+            raise ValidationFailure("Plan feedback must be non-empty")
+        if not actor:
+            raise ValidationFailure("Plan feedback actor is required")
+        with self._transaction() as conn:
+            workflow = conn.execute("SELECT lifecycle_version, stage, status FROM workflows WHERE id = ?", (workflow_id,)).fetchone()
+            if workflow is None:
+                raise NotFoundFailure(f"workflow not found: {workflow_id}")
+            if workflow["lifecycle_version"] != LifecycleVersion.V2.value:
+                raise ConflictFailure("workflow is not V2")
+            target = conn.execute("SELECT * FROM artifacts WHERE id = ? AND workflow_id = ?", (target_plan_artifact_id, workflow_id)).fetchone()
+            if target is None or target["stage"] != Stage.PLAN.value:
+                raise ConflictFailure("Plan feedback requires a workflow Plan artifact")
+            existing = conn.execute("SELECT * FROM plan_change_requests WHERE target_plan_artifact_id = ?", (target_plan_artifact_id,)).fetchone()
+            if existing is not None:
+                if existing["feedback"] == feedback:
+                    return self._plan_change_request_from_row(existing)
+                raise ConflictFailure("Plan already has a different change request")
+            if workflow["stage"] != Stage.PLAN.value or workflow["status"] != WorkflowStatus.AWAITING_APPROVAL.value:
+                raise ConflictFailure("workflow is not awaiting Plan approval")
+            latest = conn.execute("SELECT id FROM artifacts WHERE workflow_id = ? AND stage = ? ORDER BY revision DESC LIMIT 1", (workflow_id, Stage.PLAN.value)).fetchone()
+            if latest is None or latest["id"] != target_plan_artifact_id or target["approval_state"] != ApprovalState.PENDING.value:
+                raise ConflictFailure("Plan feedback targets a stale or non-pending Plan artifact")
+            if conn.execute("SELECT 1 FROM plan_change_requests WHERE workflow_id = ? AND replacement_plan_artifact_id IS NULL", (workflow_id,)).fetchone() is not None:
+                raise ConflictFailure("workflow already has an unresolved Plan change request")
+            now = _now()
+            request = PlanChangeRequest(str(uuid.uuid4()), workflow_id, conn.execute("SELECT COALESCE(MAX(sequence), 0) + 1 FROM plan_change_requests WHERE workflow_id = ?", (workflow_id,)).fetchone()[0], target_plan_artifact_id, feedback, sanitize_text(actor, self.secret_values), None, now, None)
+            conn.execute("INSERT INTO plan_change_requests (id, workflow_id, sequence, target_plan_artifact_id, feedback, actor, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)", (request.id, request.workflow_id, request.sequence, request.target_plan_artifact_id, request.feedback, request.actor, now))
+            conn.execute("UPDATE artifacts SET approval_state = ? WHERE id = ?", (ApprovalState.CHANGES_REQUESTED.value, target_plan_artifact_id))
+            conn.execute("UPDATE workflows SET stage = ?, status = ?, updated_at = ? WHERE id = ?", (Stage.PLAN.value, WorkflowStatus.CHANGES_REQUESTED.value, now, workflow_id))
+            self._event_unlocked(conn, workflow_id, "plan.changes_requested", stage=Stage.PLAN, artifact_id=target_plan_artifact_id, payload={"change_request_id": request.id, "sequence": request.sequence})
+        return self.get_open_plan_change_request(workflow_id)  # type: ignore[return-value]
 
     def list_clarifications(self, workflow_id: str) -> list[Clarification]:
         rows = self._connection.execute("SELECT * FROM clarifications WHERE workflow_id = ? ORDER BY sequence", (workflow_id,)).fetchall()
@@ -942,6 +1004,7 @@ class WorkflowStore:
         completion_event_payload: Mapping[str, Any] | None = None,
         result_clarification_id: str | None = None,
         next_clarification_question: str | None = None,
+        result_plan_change_request_id: str | None = None,
     ) -> Artifact:
         stage = self._require_enum(stage, Stage)
         if workflow_status is not None:
@@ -1039,6 +1102,17 @@ class WorkflowStore:
                 clarification_id = str(uuid.uuid4())
                 conn.execute("INSERT INTO clarifications (id, workflow_id, sequence, source_feature_contract_artifact_id, question, created_at) VALUES (?, ?, ?, ?, ?, ?)", (clarification_id, workflow_id, sequence, artifact_id, next_clarification_question, now))
                 self._event_unlocked(conn, workflow_id, "clarification.created", stage=Stage.INTAKE, artifact_id=artifact_id, payload={"clarification_id": clarification_id, "sequence": sequence})
+            if result_plan_change_request_id is not None:
+                if stage is not Stage.PLAN:
+                    raise ValidationFailure("Plan change request results require a Plan artifact")
+                change = conn.execute("SELECT * FROM plan_change_requests WHERE id = ? AND workflow_id = ?", (result_plan_change_request_id, workflow_id)).fetchone()
+                if change is None or change["replacement_plan_artifact_id"] is not None:
+                    raise ConflictFailure("Plan change request cannot be linked to a replacement")
+                target = conn.execute("SELECT workflow_id, stage FROM artifacts WHERE id = ?", (change["target_plan_artifact_id"],)).fetchone()
+                if target is None or target["workflow_id"] != workflow_id or target["stage"] != Stage.PLAN.value:
+                    raise PersistenceFailure("Plan change request target binding is invalid")
+                conn.execute("UPDATE plan_change_requests SET replacement_plan_artifact_id = ?, completed_at = ? WHERE id = ?", (artifact_id, now, result_plan_change_request_id))
+                self._event_unlocked(conn, workflow_id, "plan.change_request.completed", stage=Stage.PLAN, artifact_id=artifact_id, payload={"change_request_id": result_plan_change_request_id})
             if completion_event_type:
                 self._event_unlocked(conn, workflow_id, completion_event_type, stage=stage,
                                      artifact_id=artifact_id, execution_id=execution_id,
@@ -2033,7 +2107,7 @@ class WorkflowStore:
     def _artifact_destination(self, artifact_path: str | os.PathLike[str]) -> Path:
         return self._workspace_file(artifact_path, label="artifact")
 
-    def plan_markdown_path(self, workflow_id: str) -> Path:
+    def plan_markdown_path(self, workflow_id: str, revision: int = 1) -> Path:
         """Return the fixed, confined derived Plan projection path.
 
         This is deliberately not an artifact path: callers must not use it in
@@ -2041,7 +2115,7 @@ class WorkflowStore:
         """
 
         destination = self._workspace_file(
-            self.workspace_path / "workflows" / workflow_id / "artifacts" / "002-plan.md",
+            self.workspace_path / "workflows" / workflow_id / "artifacts" / ("002-plan.md" if revision == 1 else f"002-plan-r{revision:03d}.md"),
             label="Plan projection",
         )
         expected_parent = (self.workspace_path / "workflows" / workflow_id / "artifacts").resolve()
@@ -2051,10 +2125,10 @@ class WorkflowStore:
             raise ValidationFailure("Plan projection destination must be inside its workflow artifacts directory") from exc
         return destination
 
-    def read_plan_markdown(self, workflow_id: str) -> bytes | None:
+    def read_plan_markdown(self, workflow_id: str, revision: int = 1) -> bytes | None:
         """Read the derived view only; missing is an expected cache state."""
 
-        path = self.plan_markdown_path(workflow_id)
+        path = self.plan_markdown_path(workflow_id, revision)
         try:
             return path.read_bytes()
         except FileNotFoundError:
@@ -2062,10 +2136,10 @@ class WorkflowStore:
         except OSError as exc:
             raise PersistenceFailure(f"could not read Plan projection: {exc}") from exc
 
-    def write_plan_markdown(self, workflow_id: str, content: str) -> Path:
+    def write_plan_markdown(self, workflow_id: str, content: str, revision: int = 1) -> Path:
         """Atomically replace a derived Plan projection without touching SQLite."""
 
-        destination = self.plan_markdown_path(workflow_id)
+        destination = self.plan_markdown_path(workflow_id, revision)
         encoded = content.encode("utf-8")
         temporary_name: str | None = None
         try:
@@ -2853,6 +2927,9 @@ class WorkflowStore:
 
     def _clarification_from_row(self, row: sqlite3.Row) -> Clarification:
         return Clarification(row["id"], row["workflow_id"], row["sequence"], row["source_feature_contract_artifact_id"], row["question"], row["answer"], row["actor"], row["result_feature_contract_artifact_id"], row["created_at"], row["answered_at"], row["completed_at"])
+
+    def _plan_change_request_from_row(self, row: sqlite3.Row) -> PlanChangeRequest:
+        return PlanChangeRequest(row["id"], row["workflow_id"], row["sequence"], row["target_plan_artifact_id"], row["feedback"], row["actor"], row["replacement_plan_artifact_id"], row["created_at"], row["completed_at"])
 
     def _operation_from_row(self, row: sqlite3.Row) -> Operation:
         return Operation(row["id"], row["idempotency_key"], row["kind"], row["workflow_id"],

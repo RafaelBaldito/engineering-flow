@@ -1051,6 +1051,55 @@ class V2PlanApprovalTests(unittest.TestCase):
             "SELECT COUNT(*) FROM task_artifacts WHERE workflow_id = ?", (workflow.id,)
         ).fetchone()[0], 0)
 
+    def test_change_request_persists_before_replan_and_replacement_is_r2(self):
+        workflow, plan, feature, runtime = self.pending_plan()
+        original = Path(plan.path).read_bytes()
+
+        class ReplacementRuntime(FakeRuntime):
+            def execute(runtime_self, request):
+                runtime_self.requests.append(request)
+                return PlanningExecutionResult(runtime_self.provider, request.logical_session_id or "s", "thread", "turn",
+                    TerminalState.SUCCEEDED, {"plan": {"id": f"{request.workflow_id}:plan:r2",
+                    "workflow_id": request.workflow_id, "revision": 2,
+                    "feature_contract": {"artifact_id": feature.id, "sha256": feature.sha256},
+                    "strategy": "Replacement.", "assumptions": [], "verification_strategy": ["unit tests"],
+                    "tasks": [{"id": "T1", "objective": "Change source.",
+                    "context": {"relevant_files": ["source.py"], "existing_patterns": []},
+                    "requirements": ["Update behavior."], "acceptance_criteria": ["Works."],
+                    "verification": ["tests"], "constraints": [], "depends_on": [], "complexity": "low", "risk": "high"}]}})
+
+        replacement_runtime = ReplacementRuntime()
+        result = V2PlanOrchestrator(self.store, replacement_runtime).request_changes(workflow.id, "Use PascalCase.")
+        plans = self.store.list_artifacts(workflow.id, Stage.PLAN)
+        self.assertEqual((result.status, [item.revision for item in plans]), (WorkflowStatus.AWAITING_APPROVAL, [1, 2]))
+        self.assertEqual(Path(plan.path).read_bytes(), original)
+        self.assertEqual(plans[1].path.endswith("002-plan-r002.json"), True)
+        self.assertTrue(self.store.plan_markdown_path(workflow.id, 2).exists())
+        request = replacement_runtime.requests[0]
+        self.assertEqual(request.authoritative_input_paths, (feature.path, plan.path))
+        self.assertIn("Use PascalCase.", request.instruction)
+        self.assertIn(plan.id, request.instruction)
+        change = self.store.list_plan_change_requests(workflow.id)[0]
+        self.assertEqual((change.target_plan_artifact_id, change.replacement_plan_artifact_id), (plan.id, plans[1].id))
+        self.assertEqual(self.store.get_artifact(plan.id).approval_state, ApprovalState.CHANGES_REQUESTED)
+        with self.assertRaises(ConflictFailure):
+            V2PlanOrchestrator(self.store, replacement_runtime).approve(workflow.id, plan.id)
+        self.assertEqual(V2PlanOrchestrator(self.store, replacement_runtime).resolve_current_pending_plan_artifact(workflow.id), plans[1].id)
+
+    def test_failed_replan_keeps_feedback_and_retries_as_r2(self):
+        workflow, plan, feature, runtime = self.pending_plan()
+        failed = PlanningExecutionResult("fake", "s", "thread", "turn", TerminalState.FAILED, None,
+                                         failure_classification=FailureClassification.PROVIDER, failure_detail="offline")
+        runtime.results = [failed]
+        # Override the existing fake's planner output with a known provider failure.
+        runtime.execute = lambda request: (runtime.requests.append(request) or runtime.results.pop(0))
+        result = V2PlanOrchestrator(self.store, runtime).request_changes(workflow.id, "Use PascalCase.")
+        self.assertEqual(result.status, WorkflowStatus.CHANGES_REQUESTED)
+        self.assertEqual(len(self.store.list_artifacts(workflow.id, Stage.PLAN)), 1)
+        self.assertIsNone(self.store.get_open_plan_change_request(workflow.id).replacement_plan_artifact_id)
+        with self.assertRaises(ConflictFailure):
+            V2PlanOrchestrator(self.store, runtime).approve(workflow.id, plan.id)
+
     def test_current_pending_plan_resolution_reuses_strict_authority_checks(self):
         workflow, plan, _feature, runtime = self.pending_plan()
         orchestrator = V2PlanOrchestrator(self.store, runtime)
