@@ -6,6 +6,8 @@ import hashlib
 import json
 import uuid
 import time
+import os
+import socket
 from dataclasses import asdict, dataclass, is_dataclass
 from pathlib import Path
 from typing import Any, Mapping
@@ -51,6 +53,7 @@ from .runtime import (
 )
 from .plan_markdown import render_plan_markdown
 from .store import WorkflowStore
+from .repository import RepositoryInspector, RepositorySnapshot
 
 
 _STAGES: tuple[Stage, ...] = (Stage.PRD, Stage.TECHSPEC, Stage.TASK_PLAN)
@@ -104,9 +107,85 @@ class ImplementationSelectionOrchestrator:
             if state.task_contract_sha256 != task.payload_sha256():
                 raise PersistenceFailure("operational task state payload hash does not match Plan")
             state_by_task[task.id] = state.status
-        # Slice 1 has no implementation_attempts table, hence no retry-safe
-        # evidence can be supplied and IMPLEMENTATION_FAILED stays blocked.
-        return select_executable_task(authority.plan, state_by_task)
+        return select_executable_task(authority.plan, state_by_task,
+            retry_safe_failed_task_ids=self.store.retry_safe_failed_task_ids(workflow_id, authority.plan_artifact.id))
+
+
+@dataclass(frozen=True, slots=True)
+class FakeWriterResult:
+    """The deliberately tiny injected Slice-2 writer result; Git remains truth."""
+    success: bool
+    changed_files: tuple[str, ...] = ()
+    summary: str = ""
+    error: str | None = None
+
+
+class ImplementationAttemptOrchestrator:
+    """One fake-writer invocation, with durable intent before any mutation.
+
+    This is intentionally not used by the CLI and accepts a callable rather
+    than an AgentRuntime, making a real Codex dispatch impossible in Slice 2.
+    """
+    def __init__(self, store: WorkflowStore, writer: Any, *, before_dispatch: Any = None) -> None:
+        self.store, self.writer, self.before_dispatch = store, writer, before_dispatch
+
+    @staticmethod
+    def _same_structure(before: RepositorySnapshot, after: RepositorySnapshot) -> bool:
+        return (before.canonical_root, before.git_toplevel, before.git_dir, before.git_common_dir,
+                before.head_sha, before.branch_name, before.detached, before.local_git_config_sha256) == (
+                after.canonical_root, after.git_toplevel, after.git_dir, after.git_common_dir,
+                after.head_sha, after.branch_name, after.detached, after.local_git_config_sha256)
+
+    def run_once(self, workflow_id: str) -> TaskSelection:
+        selection = ImplementationSelectionOrchestrator(self.store).select_once(workflow_id)
+        if selection.task is None:
+            return selection
+        authority = self.store.load_approved_v2_plan_authority(workflow_id)
+        inspector = RepositoryInspector(authority.workflow.repository_path)
+        baseline = inspector.capture(require_clean=True)
+        request_hash = hashlib.sha256(json.dumps({"feature": authority.feature_contract_artifact.sha256,
+            "plan": authority.plan_artifact.sha256, "task": selection.task.payload_sha256(),
+            "baseline": baseline.fingerprint, "writer": "fake-v1"}, sort_keys=True).encode()).hexdigest()
+        intent = self.store.create_implementation_intent(workflow_id, repository_key=inspector.repository_key(),
+            canonical_root=baseline.canonical_root, task_contract_id=selection.task.id,
+            task_contract_sha256=selection.task.payload_sha256(), request_hash=request_hash,
+            baseline=baseline.as_payload(), owner_instance_id=str(uuid.uuid4()), owner_pid=os.getpid(), owner_host_id=socket.gethostname())
+        # Close the preflight/acquisition TOCTOU window.  This hook exists only
+        # for deterministic tests; it executes before the writer.
+        if self.before_dispatch:
+            self.before_dispatch()
+        try:
+            accepted = inspector.capture(require_clean=True)
+        except Exception as exc:
+            self.store.finish_implementation_attempt(intent["attempt_id"], intent["lease_id"], status="failed",
+                classification="baseline_refusal", final=None, workspace_changed=False, error_detail=f"baseline changed after lease: {exc}")
+            return selection
+        if accepted.fingerprint != baseline.fingerprint:
+            self.store.finish_implementation_attempt(intent["attempt_id"], intent["lease_id"], status="failed",
+                classification="baseline_refusal", final=accepted.as_payload(), workspace_changed=False, error_detail="baseline changed after lease")
+            return selection
+        # Exactly one possible call site for the injected fake writer.
+        result = self.writer(authority.workflow.repository_path, selection.task)
+        try:
+            final = inspector.capture()
+        except Exception as exc:
+            self.store.finish_implementation_attempt(intent["attempt_id"], intent["lease_id"], status="unknown",
+                classification="safety_violation", final=None, workspace_changed=None, error_detail=str(exc), agent_result={"summary": getattr(result, "summary", "")})
+            return selection
+        changed = final.fingerprint != baseline.fingerprint
+        safe = self._same_structure(baseline, final)
+        if not safe:
+            status, classification = "unknown", "safety_violation"
+        elif result.success and changed:
+            status, classification = "succeeded", "completed_changed"
+        elif changed:
+            status, classification = "unknown", "failed_changed"
+        else:
+            status, classification = "failed", "failed_unchanged"
+        self.store.finish_implementation_attempt(intent["attempt_id"], intent["lease_id"], status=status,
+            classification=classification, final=final.as_payload(), workspace_changed=changed,
+            error_detail=getattr(result, "error", None), agent_result={"summary": getattr(result, "summary", ""), "changed_files": list(getattr(result, "changed_files", ()))})
+        return selection
 
 
 class IntakeOrchestrator:

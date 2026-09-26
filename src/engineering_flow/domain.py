@@ -83,6 +83,9 @@ class WorkflowStatus(_ValueEnum):
     NEEDS_CLARIFICATION = "needs_clarification"
     PLAN_APPROVED = "plan_approved"
     CHANGES_REQUESTED = "changes_requested"
+    IMPLEMENTING = "implementing"
+    IMPLEMENTATION_COMPLETED = "implementation_completed"
+    IMPLEMENTATION_FAILED = "implementation_failed"
 
 
 def is_terminal_workflow_status(status: WorkflowStatus) -> bool:
