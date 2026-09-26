@@ -49,7 +49,7 @@ class ConfigTests(unittest.TestCase):
         with self.assertRaises(ValidationFailure):
             load_config(self.repository)
 
-    def test_execution_policy_is_required_and_is_captured_in_the_snapshot(self):
+    def test_execution_policy_defaults_and_is_captured_in_the_snapshot(self):
         application = self.repository / ".engineering-flow"
         application.mkdir()
         legacy = (
@@ -60,8 +60,7 @@ class ConfigTests(unittest.TestCase):
         config_path = application / "config.toml"
         config_path.write_text(legacy, encoding="utf-8")
         original = config_path.read_bytes()
-        with self.assertRaisesRegex(ValidationFailure, r"missing \[execution\] table"):
-            load_config(self.repository)
+        self.assertEqual(load_config(self.repository).max_review_cycles, 3)
         self.assertEqual(config_path.read_bytes(), original)
 
         config_path.write_text(legacy + (

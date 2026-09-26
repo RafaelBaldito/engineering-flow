@@ -154,6 +154,26 @@ class TaskSelectionOutcome(_ValueEnum):
     NO_EXECUTABLE_TASK = "no_executable_task"
 
 
+class ImplementationProfile(_ValueEnum):
+    """Provider-neutral implementation capacity selected from a Task Contract."""
+
+    EFFICIENT = "efficient"
+    BALANCED = "balanced"
+    STRONG = "strong"
+
+
+def select_implementation_profile(complexity: str, risk: str) -> ImplementationProfile:
+    """Apply the approved, deliberately small MDS #3 routing policy."""
+    allowed = {"low", "medium", "high"}
+    if complexity not in allowed or risk not in allowed:
+        raise ValidationFailure("Task Contract complexity and risk must be low, medium, or high")
+    if complexity == "low" and risk == "low":
+        return ImplementationProfile.EFFICIENT
+    if complexity == "high" or risk == "high":
+        return ImplementationProfile.STRONG
+    return ImplementationProfile.BALANCED
+
+
 class TaskArtifactType(_ValueEnum):
     DEFINITION = "definition"
     DEVELOPER_RESULT = "developer_result"

@@ -1124,7 +1124,9 @@ class WorkflowStore:
                                      canonical_root: str, task_contract_id: str,
                                      task_contract_sha256: str, request_hash: str,
                                      baseline: Mapping[str, Any], owner_instance_id: str,
-                                     owner_pid: int, owner_host_id: str) -> dict[str, str]:
+                                     owner_pid: int, owner_host_id: str, requested_profile: str = "fake",
+                                     requested_provider: str = "fake", requested_model: str | None = None,
+                                     requested_reasoning: str | None = None) -> dict[str, str]:
         """Atomically create the only Slice-2 writer intent and its durable lease.
 
         The authority projection is deliberately reloaded inside BEGIN IMMEDIATE;
@@ -1150,14 +1152,14 @@ class WorkflowStore:
                 WHERE workflow_id=? AND plan_artifact_id=? AND task_contract_id=?""",
                 (workflow_id, authority.plan_artifact.id, task_contract_id)).fetchone()[0])
             now, attempt_id, lease_id, execution_id, operation_id = _now(), str(uuid.uuid4()), str(uuid.uuid4()), str(uuid.uuid4()), str(uuid.uuid4())
-            session = self._create_session_unlocked(conn, workflow_id, "fake-writer", Role.DEVELOPER)
+            session = self._create_session_unlocked(conn, workflow_id, requested_provider, Role.DEVELOPER)
             conn.execute("""INSERT INTO executions (id,workflow_id,session_id,role,provider_execution_id,request_hash,lifecycle,capability_report,terminal_result,failure_classification,failure_detail,created_at,updated_at)
                 VALUES (?,?,?,?,NULL,?,'intent','{}',NULL,NULL,NULL,?,?)""", (execution_id, workflow_id, session.id, Role.DEVELOPER.value, request_hash, now, now))
             conn.execute("""INSERT INTO operations (id,idempotency_key,kind,workflow_id,status,related_record_id,created_at,updated_at)
                 VALUES (?,?,?,?,?,?,?,?)""", (operation_id, f"implementation:{attempt_id}", "implementation", workflow_id, "pending", execution_id, now, now))
-            conn.execute("""INSERT INTO implementation_attempts (id,workflow_id,execution_id,operation_id,lease_id,feature_artifact_id,feature_sha256,plan_artifact_id,plan_sha256,plan_revision,plan_id,approval_id,task_contract_id,task_contract_sha256,sequence,request_hash,requested_profile,requested_provider,started_at,status,baseline_repository_json,created_at,updated_at)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'fake',?,'preparing',?,?,?)""",
-                (attempt_id,workflow_id,execution_id,operation_id,lease_id,authority.feature_contract_artifact.id,authority.feature_contract_artifact.sha256,authority.plan_artifact.id,authority.plan_artifact.sha256,authority.plan.revision,authority.plan.id,authority.approval.id,task_contract_id,task_contract_sha256,sequence,request_hash,"fake",now,_json(baseline),now,now))
+            conn.execute("""INSERT INTO implementation_attempts (id,workflow_id,execution_id,operation_id,lease_id,feature_artifact_id,feature_sha256,plan_artifact_id,plan_sha256,plan_revision,plan_id,approval_id,task_contract_id,task_contract_sha256,sequence,request_hash,requested_profile,requested_provider,requested_model,requested_reasoning,started_at,status,baseline_repository_json,created_at,updated_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'preparing',?,?,?)""",
+                (attempt_id,workflow_id,execution_id,operation_id,lease_id,authority.feature_contract_artifact.id,authority.feature_contract_artifact.sha256,authority.plan_artifact.id,authority.plan_artifact.sha256,authority.plan.revision,authority.plan.id,authority.approval.id,task_contract_id,task_contract_sha256,sequence,request_hash,requested_profile,requested_provider,requested_model,requested_reasoning,now,_json(baseline),now,now))
             conn.execute("""INSERT INTO workspace_writer_leases (repository_key,lease_id,attempt_id,workflow_id,canonical_root,owner_instance_id,owner_pid,owner_host_id,acquired_at,updated_at)
                 VALUES (?,?,?,?,?,?,?,?,?,?)""", (repository_key,lease_id,attempt_id,workflow_id,canonical_root,owner_instance_id,owner_pid,owner_host_id,now,now))
             conn.execute("""INSERT INTO task_implementation_states (id,workflow_id,plan_artifact_id,plan_sha256,task_contract_id,task_contract_sha256,status,selected_at,updated_at)
@@ -1168,18 +1170,39 @@ class WorkflowStore:
             self._event_unlocked(conn, workflow_id, "implementation.attempt.created", stage=Stage.TASK_EXECUTION, execution_id=execution_id, payload={"attempt_id":attempt_id,"lease_id":lease_id})
         return {"attempt_id": attempt_id, "lease_id": lease_id, "execution_id": execution_id, "operation_id": operation_id}
 
+    def record_implementation_provider_started(self, attempt_id: str, lease_id: str,
+                                               evidence: Mapping[str, Any]) -> None:
+        """Persist only process identity actually exposed by the runtime."""
+        with self._transaction() as conn:
+            row = conn.execute("SELECT execution_id FROM implementation_attempts WHERE id=? AND lease_id=?", (attempt_id, lease_id)).fetchone()
+            if row is None:
+                raise ConflictFailure("implementation attempt/lease ownership mismatch")
+            pid = evidence.get("pid")
+            group = evidence.get("process_group")
+            if type(pid) is not int: pid = None
+            if type(group) is not int: group = None
+            now = _now()
+            conn.execute("UPDATE workspace_writer_leases SET provider_pid=?,provider_process_group=?,updated_at=? WHERE attempt_id=? AND lease_id=?",
+                         (pid, group, now, attempt_id, lease_id))
+            conn.execute("UPDATE implementation_attempts SET started_at=?,status='running',updated_at=? WHERE id=?", (now, now, attempt_id))
+            conn.execute("UPDATE executions SET lifecycle='running',updated_at=? WHERE id=?", (now, row["execution_id"]))
+
     def finish_implementation_attempt(self, attempt_id: str, lease_id: str, *, status: str,
                                       classification: str, final: Mapping[str, Any] | None,
                                       workspace_changed: bool | None, error_detail: str | None = None,
-                                      agent_result: Mapping[str, Any] | None = None) -> None:
+                                      agent_result: Mapping[str, Any] | None = None,
+                                      actual_provider: str | None = None, actual_model: str | None = None,
+                                      actual_reasoning: str | None = None, provider_operation_ref: str | None = None,
+                                      provider_session_ref: str | None = None, usage: Mapping[str, Any] | None = None,
+                                      error_classification: str | None = None) -> None:
         with self._transaction() as conn:
             row = conn.execute("SELECT * FROM implementation_attempts WHERE id=? AND lease_id=?", (attempt_id, lease_id)).fetchone()
             if row is None: raise ConflictFailure("implementation attempt/lease ownership mismatch")
             task_status = "implementation_completed" if classification == "completed_changed" else ("pending" if classification == "baseline_refusal" else ("implementation_failed" if classification == "failed_unchanged" else "implementation_unknown"))
             workflow_status = (WorkflowStatus.PLAN_APPROVED.value if classification == "baseline_refusal" else (WorkflowStatus.IMPLEMENTATION_COMPLETED.value if task_status == "implementation_completed" else (WorkflowStatus.IMPLEMENTATION_FAILED.value if task_status == "implementation_failed" else WorkflowStatus.HUMAN_ATTENTION.value)))
             now = _now()
-            conn.execute("""UPDATE implementation_attempts SET status=?,result_classification=?,finished_at=?,final_repository_json=?,workspace_changed=?,changed_paths_json=?,agent_result_json=?,error_detail=?,updated_at=? WHERE id=?""",
-                (status,classification,now,_json(final) if final else None,None if workspace_changed is None else int(workspace_changed),_json(final.get("changed_paths", [])) if final else None,_json(agent_result or {}),error_detail,now,attempt_id))
+            conn.execute("""UPDATE implementation_attempts SET status=?,result_classification=?,finished_at=?,final_repository_json=?,workspace_changed=?,changed_paths_json=?,agent_result_json=?,actual_provider=?,actual_model=?,actual_reasoning=?,provider_operation_ref=?,provider_session_ref=?,usage_json=?,error_classification=?,error_detail=?,updated_at=? WHERE id=?""",
+                (status,classification,now,_json(final) if final else None,None if workspace_changed is None else int(workspace_changed),_json(final.get("changed_paths", [])) if final else None,_json(agent_result or {}),actual_provider,actual_model,actual_reasoning,provider_operation_ref,provider_session_ref,_json(usage) if usage else None,error_classification,error_detail,now,attempt_id))
             conn.execute("UPDATE executions SET lifecycle=?, terminal_result=?, failure_detail=?, updated_at=? WHERE id=?", ("completed" if task_status == "implementation_completed" else ("failed" if task_status == "implementation_failed" else "unknown"),_json({"classification":classification}),error_detail,now,row["execution_id"]))
             conn.execute("UPDATE operations SET status=?, updated_at=? WHERE id=?", ("completed" if task_status == "implementation_completed" else "unknown",now,row["operation_id"]))
             conn.execute("UPDATE task_implementation_states SET status=?,updated_at=? WHERE workflow_id=? AND plan_artifact_id=? AND task_contract_id=?", (task_status,now,row["workflow_id"],row["plan_artifact_id"],row["task_contract_id"]))

@@ -13,6 +13,7 @@ from .domain import (
     DomainCapability,
     FailureClassification,
     HumanPolicyPlacement,
+    ImplementationProfile,
     LifecycleVersion,
     Role,
     Stage,
@@ -199,6 +200,10 @@ class RuntimeExecutionRequest:
     provider_name: str | None = None
     execution_contract: ExecutionContract = ExecutionContract.LEGACY
     progress_sink: Callable[[RuntimeProgressEvent], None] | None = None
+    implementation_profile: ImplementationProfile | None = None
+    requested_model: str | None = None
+    requested_reasoning: str | None = None
+    provider_started: Callable[[Mapping[str, Any]], None] | None = None
 
     def __post_init__(self) -> None:
         if not self.workflow_id or not self.execution_id:
@@ -234,6 +239,13 @@ class RuntimeExecutionRequest:
             raise ValueError("canonical requests require a complete capability binding")
         if self.execution_contract is ExecutionContract.LEGACY and any(capability_fields):
             raise ValueError("legacy requests cannot carry a canonical capability binding")
+        if self.implementation_profile is not None:
+            if self.role is not Role.DEVELOPER or self.work_kind is not WorkKind.DEVELOP:
+                raise ValueError("implementation profile requires Developer IMPLEMENT work")
+            if not self.requested_model or not self.requested_reasoning:
+                raise ValueError("implementation routing requires model and reasoning")
+        elif self.requested_model is not None or self.requested_reasoning is not None:
+            raise ValueError("requested routing requires an implementation profile")
 
     @property
     def repository(self) -> Path:

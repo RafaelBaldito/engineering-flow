@@ -9,30 +9,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
-from .domain import ApprovalPolicy, ValidationFailure
+from .domain import ApprovalPolicy, ImplementationProfile, ValidationFailure
 
 
 APPLICATION_DIRECTORY = ".engineering-flow"
 CONFIG_FILENAME = "config.toml"
 DATABASE_FILENAME = "workflows.sqlite3"
-INITIAL_CONFIG = """[provider]
-name = "codex-cli"
-command = "codex"
-timeout_seconds = 1800
-
-[approval]
-prd = "required"
-techspec = "required"
-task_plan = "required"
-
-[safety]
-allow_read_only_planning = true
-
-[execution]
-max_review_cycles = 3
-allow_workspace_write_development = true
-allow_read_only_review = true
-"""
+INITIAL_CONFIG = Path(__file__).with_name("default-config.toml").read_text(encoding="utf-8")
 
 _CREDENTIAL_PATTERN = re.compile(
     r"(?i)(?:api[_-]?key|access[_-]?key|secret|token|password|passwd|"
@@ -48,6 +31,24 @@ _ALLOWED_SAFETY_KEYS = frozenset({"allow_read_only_planning"})
 _ALLOWED_EXECUTION_KEYS = frozenset({
     "max_review_cycles", "allow_workspace_write_development", "allow_read_only_review",
 })
+
+
+def _merge_config(defaults: Mapping[str, Any], overrides: Mapping[str, Any]) -> dict[str, Any]:
+    """Recursively overlay project configuration on packaged defaults.
+
+    A table is merged key-by-key; every other project value replaces its
+    default. Consequently, a partial profile override inherits the packaged
+    fields it does not name (for example, ``model`` inherits ``reasoning``).
+    Validation always runs against this final merged configuration.
+    """
+
+    merged = dict(defaults)
+    for key, override in overrides.items():
+        default = merged.get(key)
+        merged[key] = (_merge_config(default, override)
+                       if isinstance(default, Mapping) and isinstance(override, Mapping)
+                       else override)
+    return merged
 
 
 def _resolved_directory(value: str | Path, label: str) -> Path:
@@ -176,6 +177,7 @@ class FlowConfig:
     max_review_cycles: int
     allow_workspace_write_development: bool
     allow_read_only_review: bool
+    implementation_profiles: Mapping[ImplementationProfile, tuple[str, str]] | None = None
 
     @property
     def provider(self) -> str:
@@ -196,6 +198,10 @@ class FlowConfig:
                 "name": self.provider_name,
                 "command": self.provider_command,
                 "timeout_seconds": self.timeout_seconds if self.timeout_seconds % 1 else int(self.timeout_seconds),
+                **({"implementation": {"profiles": {
+                    profile.value: {"model": model, "reasoning": reasoning}
+                    for profile, (model, reasoning) in self.implementation_profiles.items()
+                }}} if self.implementation_profiles is not None else {}),
             },
             "approval": {key: policy.value for key, policy in self.approval_policies.items()},
             "safety": {"allow_read_only_planning": self.allow_read_only_planning},
@@ -205,6 +211,14 @@ class FlowConfig:
                 "allow_read_only_review": self.allow_read_only_review,
             },
         }
+
+    def implementation_routing(self, profile: ImplementationProfile) -> tuple[str, str]:
+        if self.implementation_profiles is None:
+            raise ValidationFailure("missing [provider.implementation.profiles] table for the active provider")
+        try:
+            return self.implementation_profiles[profile]
+        except KeyError as exc:
+            raise ValidationFailure(f"missing implementation profile: {profile.value}") from exc
 
     @classmethod
     def load(cls, repository_path: str | Path) -> "FlowConfig":
@@ -222,16 +236,17 @@ def load_config(repository_path: str | Path) -> FlowConfig:
         raise ValidationFailure(f"configuration file not found: {config_path}")
     try:
         with config_path.open("rb") as stream:
-            raw = tomllib.load(stream)
+            overrides = tomllib.load(stream)
     except (OSError, tomllib.TOMLDecodeError) as exc:
         raise ValidationFailure(f"invalid configuration: {exc}") from exc
-    if not isinstance(raw, Mapping):
+    if not isinstance(overrides, Mapping):
         raise ValidationFailure("configuration must contain provider, approval, safety, and execution tables")
+    try:
+        defaults = tomllib.loads(INITIAL_CONFIG)
+    except tomllib.TOMLDecodeError as exc:
+        raise ValidationFailure(f"invalid packaged configuration: {exc}") from exc
+    raw = _merge_config(defaults, overrides)
     sections = set(raw)
-    if "execution" not in sections:
-        raise ValidationFailure(
-            "missing [execution] table; add the normative Wave 2 execution settings without rewriting this file"
-        )
     unknown_sections = sections - _ALLOWED_SECTIONS
     if unknown_sections:
         raise ValidationFailure(f"unknown configuration table: {sorted(unknown_sections)[0]}")
@@ -239,12 +254,23 @@ def load_config(repository_path: str | Path) -> FlowConfig:
     if missing_sections:
         raise ValidationFailure(f"missing configuration table: {sorted(missing_sections)[0]}")
     _reject_credentials(raw)
-    provider = _validate_mapping(raw["provider"], "provider", _ALLOWED_PROVIDER_KEYS)
+    provider_raw = raw["provider"]
+    if not isinstance(provider_raw, Mapping):
+        raise ValidationFailure("provider must be a table")
+    unknown_provider = set(provider_raw) - (_ALLOWED_PROVIDER_KEYS | {"implementation"})
+    if unknown_provider:
+        raise ValidationFailure(f"unknown provider setting: {sorted(unknown_provider)[0]}")
+    provider = _validate_mapping({key: provider_raw[key] for key in _ALLOWED_PROVIDER_KEYS if key in provider_raw},
+                                 "provider", _ALLOWED_PROVIDER_KEYS)
     approval = _validate_mapping(raw["approval"], "approval", _ALLOWED_APPROVAL_KEYS)
     safety = _validate_mapping(raw["safety"], "safety", _ALLOWED_SAFETY_KEYS)
     execution = _validate_mapping(raw["execution"], "execution", _ALLOWED_EXECUTION_KEYS)
-    if provider["name"] != "codex-cli":
-        raise ValidationFailure("only the codex-cli provider is supported in Wave 1")
+    if (
+        not isinstance(provider["name"], str)
+        or not provider["name"].strip()
+        or any(char.isspace() for char in provider["name"])
+    ):
+        raise ValidationFailure("provider.name must be a single non-empty identifier without whitespace")
     if (
         not isinstance(provider["command"], str)
         or not provider["command"].strip()
@@ -271,10 +297,29 @@ def load_config(repository_path: str | Path) -> FlowConfig:
         raise ValidationFailure("execution.allow_workspace_write_development must be true")
     if execution["allow_read_only_review"] is not True:
         raise ValidationFailure("execution.allow_read_only_review must be true")
+    profiles: dict[ImplementationProfile, tuple[str, str]] | None = None
+    implementation = provider_raw.get("implementation")
+    if implementation is not None:
+        if not isinstance(implementation, Mapping) or set(implementation) != {"profiles"}:
+            raise ValidationFailure("provider.implementation requires profiles")
+        table = implementation["profiles"]
+        if not isinstance(table, Mapping) or set(table) != {item.value for item in ImplementationProfile}:
+            raise ValidationFailure("provider.implementation.profiles must define efficient, balanced, and strong")
+        profiles = {}
+        for profile in ImplementationProfile:
+            entry = table[profile.value]
+            if not isinstance(entry, Mapping) or set(entry) != {"model", "reasoning"}:
+                raise ValidationFailure(f"provider.implementation.profiles.{profile.value} requires model and reasoning")
+            model, reasoning = entry["model"], entry["reasoning"]
+            if not isinstance(model, str) or not model.strip() or any(char.isspace() for char in model):
+                raise ValidationFailure(f"provider.implementation.profiles.{profile.value}.model must be a non-empty identifier")
+            if reasoning not in {"low", "medium", "high"}:
+                raise ValidationFailure(f"provider.implementation.profiles.{profile.value}.reasoning must be low, medium, or high")
+            profiles[profile] = (model, reasoning)
     return FlowConfig(
         repository, application, config_path, database_path,
-        "codex-cli", provider["command"].strip(), float(timeout), parsed_policies, True,
-        max_review_cycles, True, True,
+        provider["name"].strip(), provider["command"].strip(), float(timeout), parsed_policies, True,
+        max_review_cycles, True, True, profiles,
     )
 
 

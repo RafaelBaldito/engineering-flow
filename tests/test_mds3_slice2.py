@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from engineering_flow.domain import ApprovalDecision, ApprovalState, LifecycleVersion, Stage, WorkflowStatus
+from engineering_flow.domain import ApprovalDecision, ApprovalState, ImplementationProfile, LifecycleVersion, Stage, WorkflowStatus
 from engineering_flow.domain import ConflictFailure
 from engineering_flow.orchestrator import FakeWriterResult, ImplementationAttemptOrchestrator
 from engineering_flow.repository import RepositoryInspector
@@ -105,3 +105,30 @@ class Slice2Tests(unittest.TestCase):
         def before(): (self.root/"source.py").write_text("raced\n")
         ImplementationAttemptOrchestrator(self.store, lambda *_: calls.append(1) or FakeWriterResult(True), before_dispatch=before).run_once(w.id)
         self.assertEqual(calls,[])
+
+    def test_resolved_routing_binds_hash_and_persists_requested_separate_from_actual(self):
+        class RoutedWriter:
+            provider = "codex-cli"
+            def __init__(self, model, reasoning): self.model, self.reasoning, self.calls = model, reasoning, []
+            def routing_for(self, task): return ImplementationProfile.BALANCED, self.model, self.reasoning
+            def bind(self, authority, task, intent, store): self.intent = intent
+            def __call__(self, root, task):
+                self.calls.append(task.id); (Path(root) / "source.py").write_text("value = 2\n")
+                return FakeWriterResult(True, actual_provider="codex-cli", actual_model="runtime-model",
+                    actual_reasoning="runtime-reasoning", provider_operation_ref="turn-1", provider_session_ref="session-1",
+                    usage={"input_tokens": 3})
+        writer = RoutedWriter("configured-balanced", "medium")
+        ImplementationAttemptOrchestrator(self.store, writer).run_once(self.approved().id)
+        row = self.store._connection.execute("""SELECT request_hash,requested_provider,requested_profile,
+            requested_model,requested_reasoning,actual_provider,actual_model,actual_reasoning,usage_json
+            FROM implementation_attempts""").fetchone()
+        self.assertEqual(writer.calls, ["T1"])
+        self.assertEqual(tuple(row[1:5]), ("codex-cli", "balanced", "configured-balanced", "medium"))
+        self.assertEqual(tuple(row[5:8]), ("codex-cli", "runtime-model", "runtime-reasoning"))
+        self.assertEqual(json.loads(row[8]), {"input_tokens": 3})
+        first_hash = row[0]
+        (self.root / "source.py").write_text("value = 1\n")
+        writer = RoutedWriter("changed-balanced", "high")
+        ImplementationAttemptOrchestrator(self.store, writer).run_once(self.approved().id)
+        second_hash = self.store._connection.execute("SELECT request_hash FROM implementation_attempts ORDER BY rowid DESC LIMIT 1").fetchone()[0]
+        self.assertNotEqual(first_hash, second_hash)

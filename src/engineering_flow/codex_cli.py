@@ -74,6 +74,17 @@ DEVELOPER_OUTPUT_SCHEMA: dict[str, Any] = {
     },
 }
 
+IMPLEMENTATION_OUTPUT_SCHEMA: dict[str, Any] = {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object", "additionalProperties": False,
+    "required": ["summary", "changed_files", "notes"],
+    "properties": {
+        "summary": {"type": "string"},
+        "changed_files": {"type": "array", "items": {"type": "string"}},
+        "notes": {"type": "array", "items": {"type": "string"}},
+    },
+}
+
 REVIEWER_OUTPUT_SCHEMA: dict[str, Any] = {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "type": "object",
@@ -201,6 +212,7 @@ class CodexCliRuntime(AgentRuntime):
         self,
         command: str = "codex",
         *,
+        provider: str = "codex-cli",
         timeout_seconds: float = 1800,
         allow_read_only_planning: bool = True,
         allow_workspace_write: bool = False,
@@ -218,6 +230,7 @@ class CodexCliRuntime(AgentRuntime):
             raise ValueError("Codex executable command is required")
         if timeout_seconds <= 0:
             raise ValueError("timeout_seconds must be positive")
+        self.provider = provider
         self.command = command
         self.timeout_seconds = timeout_seconds
         self.allow_read_only_planning = allow_read_only_planning
@@ -447,6 +460,8 @@ class CodexCliRuntime(AgentRuntime):
             return INTAKE_OUTPUT_SCHEMA
         if request.role is Role.PLANNER and request.stage.value == "plan":
             return PLAN_OUTPUT_SCHEMA
+        if request.implementation_profile is not None:
+            return IMPLEMENTATION_OUTPUT_SCHEMA
         if request.role is Role.DEVELOPER:
             return DEVELOPER_OUTPUT_SCHEMA
         if request.role is Role.REVIEWER:
@@ -494,6 +509,9 @@ class CodexCliRuntime(AgentRuntime):
             command = [self.command, *resume_argv, request.resume_provider_session_id]
         argv = [
             *command,
+            *( ("--ephemeral", "--model", request.requested_model, "-c",
+                 f"model_reasoning_effort={request.requested_reasoning}")
+               if request.implementation_profile is not None else () ),
             "--json",
             "--sandbox",
             self._sandbox_for(request),
@@ -507,7 +525,7 @@ class CodexCliRuntime(AgentRuntime):
                 mechanism=mechanism,
             ),
         ]
-        return self._popen(
+        process = self._popen(
             argv,
             cwd=str(Path(request.repository_path).expanduser().resolve()),
             env=_minimal_environment(self._environment),
@@ -517,7 +535,16 @@ class CodexCliRuntime(AgentRuntime):
             text=True,
             encoding="utf-8",
             errors="replace",
+            **({"start_new_session": True} if request.implementation_profile is not None else {}),
         )
+        if request.provider_started is not None:
+            evidence: dict[str, Any] = {"pid": getattr(process, "pid", None)}
+            # The group is reliably the child PID when start_new_session was
+            # accepted; do not manufacture it for fixture/legacy processes.
+            if isinstance(evidence["pid"], int):
+                evidence["process_group"] = evidence["pid"]
+            request.provider_started(evidence)
+        return process
 
     def _normalize_line(
         self,
@@ -560,6 +587,11 @@ class CodexCliRuntime(AgentRuntime):
             candidate = raw.get("thread_id") or raw.get("threadId") or raw.get("id")
             if isinstance(candidate, str):
                 state["provider_session_id"] = candidate
+        # Only retain actual routing when the CLI explicitly emitted it.
+        for key, state_key in (("model", "actual_model"), ("reasoning", "actual_reasoning"),
+                               ("reasoning_effort", "actual_reasoning")):
+            if isinstance(raw.get(key), str):
+                state[state_key] = raw[key]
         if event_type in _SUCCESS_EVENTS:
             candidate = raw.get("id")
             if isinstance(candidate, str):
@@ -577,6 +609,8 @@ class CodexCliRuntime(AgentRuntime):
             "malformed": False,
             "failure_seen": False,
             "usage": {},
+            "actual_model": None,
+            "actual_reasoning": None,
         }
         for line_number, line in enumerate(stdout.splitlines(), 1):
             self._normalize_line(line, line_number, state, events)
@@ -713,6 +747,8 @@ class CodexCliRuntime(AgentRuntime):
         required = set(schema["required"])
         if set(raw_payload) != required:
             return None, "final structured output does not match the approved schema"
+        if request.implementation_profile is not None:
+            return self._validate_implementation_payload(raw_payload, request)
         if request.role is Role.DEVELOPER:
             return self._validate_developer_payload(raw_payload, request)
         if request.role is Role.REVIEWER:
@@ -773,6 +809,23 @@ class CodexCliRuntime(AgentRuntime):
             "changed_files": normalized_paths,
             "test_results": [dict(result) for result in results],
         }, None
+
+    def _validate_implementation_payload(
+        self, payload: Mapping[str, Any], request: RuntimeExecutionRequest,
+    ) -> tuple[dict[str, Any] | None, str | None]:
+        if not isinstance(payload["summary"], str) or not isinstance(payload["notes"], list) or not all(isinstance(note, str) for note in payload["notes"]):
+            return None, "IMPLEMENT result summary and notes must be strings"
+        changed = payload["changed_files"]
+        if not isinstance(changed, list) or not all(isinstance(value, str) for value in changed):
+            return None, "IMPLEMENT changed_files must be an array of paths"
+        repository = Path(request.repository_path).expanduser().resolve()
+        normalized: list[str] = []
+        for value in changed:
+            candidate = (repository / value).resolve()
+            if not value or candidate == repository or repository not in candidate.parents:
+                return None, "IMPLEMENT changed_files contains a path outside the repository"
+            normalized.append(str(candidate.relative_to(repository)))
+        return {"summary": payload["summary"], "changed_files": normalized, "notes": list(payload["notes"])}, None
 
     def _validate_reviewer_payload(
         self, payload: Mapping[str, Any], request: RuntimeExecutionRequest
@@ -859,6 +912,8 @@ class CodexCliRuntime(AgentRuntime):
             "malformed": False,
             "failure_seen": False,
             "usage": {},
+            "actual_model": None,
+            "actual_reasoning": None,
         }
         events: list[NormalizedEvent] = []
         try:
@@ -951,6 +1006,8 @@ class CodexCliRuntime(AgentRuntime):
                     and request.resume_provider_session_id
                     and not resume_supported
                 ),
+                "actual_model": state["actual_model"],
+                "actual_reasoning": state["actual_reasoning"],
             },
             capability_id=request.capability_id,
             capability_schema_version=request.capability_schema_version,
@@ -962,4 +1019,4 @@ class CodexCliRuntime(AgentRuntime):
         return self.execute(request)
 
 
-__all__ = ["CodexCliRuntime", "CodexMechanismDescriptor", "FINAL_OUTPUT_SCHEMA"]
+__all__ = ["CodexCliRuntime", "CodexMechanismDescriptor", "FINAL_OUTPUT_SCHEMA", "IMPLEMENTATION_OUTPUT_SCHEMA"]

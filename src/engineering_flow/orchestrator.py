@@ -33,11 +33,13 @@ from .domain import (
     HumanAttentionOutcome,
     LifecycleVersion,
     FeatureContract,
+    ImplementationProfile,
     IntakeOutcome,
     Plan,
     TaskSelection,
     TaskImplementationStatus,
     select_executable_task,
+    select_implementation_profile,
 )
 from .runtime import (
     AgentRuntime,
@@ -118,6 +120,87 @@ class FakeWriterResult:
     changed_files: tuple[str, ...] = ()
     summary: str = ""
     error: str | None = None
+    actual_provider: str | None = None
+    actual_model: str | None = None
+    actual_reasoning: str | None = None
+    provider_operation_ref: str | None = None
+    provider_session_ref: str | None = None
+    usage: Mapping[str, Any] | None = None
+    error_classification: str | None = None
+
+
+def build_implementation_instruction(authority: Any, task: Any, profile: ImplementationProfile) -> str:
+    """Bounded prompt assembled solely from the immutable execution authority."""
+    feature = authority.feature_contract
+    lines = (
+        "Implement ONLY the selected approved Task Contract below.",
+        "Work only inside the target repository and follow repository AGENTS.md.",
+        "Do not choose another task, re-plan the feature, implement later tasks, perform semantic REVIEW or FIX loops, or mark anything VERIFIED.",
+        "Do not commit, push, open a PR, switch branches, create Git commits, modify Git config, run destructive Git recovery, or modify .git/.engineering-flow authority or control artifacts.",
+        "Do not touch paths outside the repository. Return only the structured implementation result.",
+        f"Selected task ID: {task.id}", f"Selected task objective: {task.objective}",
+        f"Requested profile: {profile.value}",
+        f"Exact selected Task Contract authority: {json.dumps(task.as_payload(), sort_keys=True, ensure_ascii=False)}",
+        f"Feature requirements: {json.dumps(list(feature.requirements), ensure_ascii=False)}",
+        f"Feature acceptance criteria: {json.dumps(list(feature.acceptance_criteria), ensure_ascii=False)}",
+        f"Plan strategy: {authority.plan.strategy}",
+        f"Task requirements: {json.dumps(list(task.requirements), ensure_ascii=False)}",
+        f"Task acceptance criteria: {json.dumps(list(task.acceptance_criteria), ensure_ascii=False)}",
+        f"Task verification instructions: {json.dumps(list(task.verification), ensure_ascii=False)}",
+        f"Task constraints: {json.dumps(list(task.constraints), ensure_ascii=False)}",
+        f"Relevant files: {json.dumps(list(task.relevant_files), ensure_ascii=False)}",
+        f"Existing patterns: {json.dumps(list(task.existing_patterns), ensure_ascii=False)}",
+        f"Dependencies: {json.dumps(list(task.depends_on), ensure_ascii=False)}",
+    )
+    return "\n".join(lines)
+
+
+class CodexImplementationWriter:
+    """Real Codex implementation adapter; callable through the Slice-2 seam."""
+
+    def __init__(self, runtime: AgentRuntime, config: Any) -> None:
+        self.runtime, self.config = runtime, config
+        self.provider = config.provider_name
+        self._bound: tuple[Any, Any, Mapping[str, str]] | None = None
+
+    def routing_for(self, task: Any) -> tuple[ImplementationProfile, str, str]:
+        profile = select_implementation_profile(task.complexity, task.risk)
+        model, reasoning = self.config.implementation_routing(profile)
+        return profile, model, reasoning
+
+    def bind(self, authority: Any, task: Any, intent: Mapping[str, str], store: WorkflowStore) -> None:
+        self._bound, self._store = (authority, task, intent), store
+
+    def __call__(self, root: str, task: Any) -> FakeWriterResult:
+        if self._bound is None:
+            raise ValidationFailure("Codex implementation writer was not bound to an attempt")
+        authority, bound_task, intent = self._bound
+        if bound_task.id != task.id:
+            raise ValidationFailure("Codex implementation task binding changed")
+        profile, model, reasoning = self.routing_for(task)
+        runtime_dir = Path(root) / ".engineering-flow" / "implementation-runtime" / intent["attempt_id"]
+        request = RuntimeExecutionRequest(
+            workflow_id=authority.workflow.id, execution_id=intent["execution_id"], role=Role.DEVELOPER,
+            stage=Stage.TASK_EXECUTION, repository_path=root,
+            authoritative_input_paths=(authority.feature_contract_artifact.path, authority.plan_artifact.path),
+            authoritative_input_hashes=(authority.feature_contract_artifact.sha256, authority.plan_artifact.sha256),
+            instruction=build_implementation_instruction(authority, task, profile),
+            output_schema_path=str(runtime_dir / "output-schema.json"), final_output_path=str(runtime_dir / "final.json"),
+            timeout_seconds=self.config.timeout_seconds, work_kind=WorkKind.DEVELOP,
+            implementation_profile=profile, requested_model=model, requested_reasoning=reasoning,
+            provider_started=lambda evidence: self._store.record_implementation_provider_started(
+                intent["attempt_id"], intent["lease_id"], evidence),
+        )
+        result = self.runtime.execute(request)
+        payload = result.final_payload if isinstance(result.final_payload, Mapping) else {}
+        return FakeWriterResult(
+            result.terminal_state is TerminalState.SUCCEEDED, tuple(payload.get("changed_files", ())),
+            str(payload.get("summary", "")), result.failure_detail,
+            actual_provider=result.provider, actual_model=result.metadata.get("actual_model"),
+            actual_reasoning=result.metadata.get("actual_reasoning"), provider_operation_ref=result.provider_execution_id,
+            provider_session_ref=result.provider_session_id, usage=result.usage or None,
+            error_classification=result.failure_classification.value if result.failure_classification else None,
+        )
 
 
 class ImplementationAttemptOrchestrator:
@@ -143,13 +226,20 @@ class ImplementationAttemptOrchestrator:
         authority = self.store.load_approved_v2_plan_authority(workflow_id)
         inspector = RepositoryInspector(authority.workflow.repository_path)
         baseline = inspector.capture(require_clean=True)
+        profile, model, reasoning = getattr(self.writer, "routing_for", lambda _: (None, "", ""))(selection.task)
+        instruction = (build_implementation_instruction(authority, selection.task, profile)
+                       if isinstance(profile, ImplementationProfile) else "fake-writer")
         request_hash = hashlib.sha256(json.dumps({"feature": authority.feature_contract_artifact.sha256,
-            "plan": authority.plan_artifact.sha256, "task": selection.task.payload_sha256(),
-            "baseline": baseline.fingerprint, "writer": "fake-v1"}, sort_keys=True).encode()).hexdigest()
+            "plan": authority.plan_artifact.sha256, "task": selection.task.as_payload(), "baseline": baseline.fingerprint,
+            "profile": getattr(profile, "value", "fake"), "provider": getattr(self.writer, "provider", "fake"),
+            "model": model, "reasoning": reasoning, "instruction": instruction, "output_contract": "implementation-v1"},
+            sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()).hexdigest()
         intent = self.store.create_implementation_intent(workflow_id, repository_key=inspector.repository_key(),
             canonical_root=baseline.canonical_root, task_contract_id=selection.task.id,
             task_contract_sha256=selection.task.payload_sha256(), request_hash=request_hash,
-            baseline=baseline.as_payload(), owner_instance_id=str(uuid.uuid4()), owner_pid=os.getpid(), owner_host_id=socket.gethostname())
+            baseline=baseline.as_payload(), owner_instance_id=str(uuid.uuid4()), owner_pid=os.getpid(), owner_host_id=socket.gethostname(),
+            requested_profile=getattr(profile, "value", "fake"), requested_provider=getattr(self.writer, "provider", "fake"),
+            requested_model=model or None, requested_reasoning=reasoning or None)
         # Close the preflight/acquisition TOCTOU window.  This hook exists only
         # for deterministic tests; it executes before the writer.
         if self.before_dispatch:
@@ -164,7 +254,9 @@ class ImplementationAttemptOrchestrator:
             self.store.finish_implementation_attempt(intent["attempt_id"], intent["lease_id"], status="failed",
                 classification="baseline_refusal", final=accepted.as_payload(), workspace_changed=False, error_detail="baseline changed after lease")
             return selection
-        # Exactly one possible call site for the injected fake writer.
+        if hasattr(self.writer, "bind"):
+            self.writer.bind(authority, selection.task, intent, self.store)
+        # Exactly one possible writer dispatch per invocation.
         result = self.writer(authority.workflow.repository_path, selection.task)
         try:
             final = inspector.capture()
@@ -184,7 +276,11 @@ class ImplementationAttemptOrchestrator:
             status, classification = "failed", "failed_unchanged"
         self.store.finish_implementation_attempt(intent["attempt_id"], intent["lease_id"], status=status,
             classification=classification, final=final.as_payload(), workspace_changed=changed,
-            error_detail=getattr(result, "error", None), agent_result={"summary": getattr(result, "summary", ""), "changed_files": list(getattr(result, "changed_files", ()))})
+            error_detail=getattr(result, "error", None), agent_result={"summary": getattr(result, "summary", ""), "changed_files": list(getattr(result, "changed_files", ()),), "notes": []},
+            actual_provider=getattr(result, "actual_provider", None), actual_model=getattr(result, "actual_model", None),
+            actual_reasoning=getattr(result, "actual_reasoning", None), provider_operation_ref=getattr(result, "provider_operation_ref", None),
+            provider_session_ref=getattr(result, "provider_session_ref", None), usage=getattr(result, "usage", None),
+            error_classification=getattr(result, "error_classification", None))
         return selection
 
 

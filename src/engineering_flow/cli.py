@@ -382,6 +382,7 @@ def _services(config: FlowConfig) -> tuple[WorkflowStore, PlanningOrchestrator, 
     store = WorkflowStore(config.database_path)
     runtime = CodexCliRuntime(
         config.provider_command,
+        provider=config.provider_name,
         timeout_seconds=config.timeout_seconds,
         allow_read_only_planning=config.allow_read_only_planning,
         allow_workspace_write=config.allow_workspace_write_development,

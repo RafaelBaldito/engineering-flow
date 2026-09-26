@@ -10,7 +10,7 @@ from types import SimpleNamespace
 sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 
 from engineering_flow.codex_cli import CodexCliRuntime, CodexMechanismDescriptor, FINAL_OUTPUT_SCHEMA, INTAKE_OUTPUT_SCHEMA, REVIEWER_OUTPUT_SCHEMA  # noqa: E402
-from engineering_flow.domain import FailureClassification, Role, Stage, ValidationFailure, WorkKind  # noqa: E402
+from engineering_flow.domain import FailureClassification, ImplementationProfile, Role, Stage, ValidationFailure, WorkKind  # noqa: E402
 from engineering_flow.runtime import (  # noqa: E402
     ExecutionContract, PlanningExecutionRequest, RuntimeExecutionRequest, TaskExecutionRequest, TerminalState,
 )
@@ -422,6 +422,25 @@ class CodexCliTests(unittest.TestCase):
         self.assertEqual(calls[0][0][4], "workspace-write")
         self.assertEqual(calls[0][1]["cwd"], str(self.root.resolve()))
         self.assertFalse(calls[0][1]["shell"])
+
+    def test_implement_profile_uses_scoped_write_model_and_fresh_process(self):
+        request = self.task_request(Role.DEVELOPER, WorkKind.DEVELOP,
+            implementation_profile=ImplementationProfile.BALANCED,
+            requested_model="configured-terra", requested_reasoning="medium")
+        def implement_popen(argv, **kwargs):
+            self.output.parent.mkdir(parents=True, exist_ok=True)
+            self.output.write_text(json.dumps({"summary":"done", "changed_files":["src/example.py"], "notes":[]}), encoding="utf-8")
+            self.calls.append((argv, kwargs)); return FakeProcess('{"type":"turn.completed","id":"turn"}\n')
+        result = self.runtime(allow_workspace_write=True, popen_factory=implement_popen).execute(request)
+        argv, kwargs = self.calls[0]
+        self.assertTrue(result.success)
+        self.assertEqual(json.loads(self.schema.read_text()), __import__("engineering_flow.codex_cli", fromlist=["IMPLEMENTATION_OUTPUT_SCHEMA"]).IMPLEMENTATION_OUTPUT_SCHEMA)
+        self.assertIn("workspace-write", argv); self.assertIn("--ephemeral", argv)
+        self.assertEqual(argv[argv.index("--model") + 1], "configured-terra")
+        self.assertIn("model_reasoning_effort=medium", argv)
+        self.assertNotIn("--add-dir", argv); self.assertNotIn("danger-full-access", argv)
+        self.assertEqual(kwargs["cwd"], str(self.root.resolve())); self.assertFalse(kwargs["shell"])
+        self.assertTrue(kwargs["start_new_session"])
 
     def test_reviewer_is_read_only_and_rejects_semantically_invalid_payload(self):
         request = self.task_request(
