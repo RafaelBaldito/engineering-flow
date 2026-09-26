@@ -224,8 +224,8 @@ def build_implementation_instruction(authority: Any, task: Any, profile: Impleme
 class CodexImplementationWriter:
     """Real Codex implementation adapter; callable through the Slice-2 seam."""
 
-    def __init__(self, runtime: AgentRuntime, config: Any) -> None:
-        self.runtime, self.config = runtime, config
+    def __init__(self, runtime: AgentRuntime, config: Any, *, progress_sink: Any = None) -> None:
+        self.runtime, self.config, self.progress_sink = runtime, config, progress_sink
         self.provider = config.provider_name
         self._bound: tuple[Any, Any, Mapping[str, str]] | None = None
 
@@ -254,6 +254,7 @@ class CodexImplementationWriter:
             output_schema_path=str(runtime_dir / "output-schema.json"), final_output_path=str(runtime_dir / "final.json"),
             timeout_seconds=self.config.timeout_seconds, work_kind=WorkKind.DEVELOP,
             implementation_profile=profile, requested_model=model, requested_reasoning=reasoning,
+            progress_sink=self.progress_sink,
             provider_started=lambda evidence: self._store.record_implementation_provider_started(
                 intent["attempt_id"], intent["lease_id"], evidence),
         )
@@ -270,13 +271,12 @@ class CodexImplementationWriter:
 
 
 class ImplementationAttemptOrchestrator:
-    """One fake-writer invocation, with durable intent before any mutation.
-
-    This is intentionally not used by the CLI and accepts a callable rather
-    than an AgentRuntime, making a real Codex dispatch impossible in Slice 2.
-    """
-    def __init__(self, store: WorkflowStore, writer: Any, *, before_dispatch: Any = None) -> None:
-        self.store, self.writer, self.before_dispatch = store, writer, before_dispatch
+    """One bounded writer invocation, with durable intent before mutation."""
+    def __init__(self, store: WorkflowStore, writer: Any, *, before_dispatch: Any = None,
+                 progress_sink: Any = None) -> None:
+        self.store, self.writer, self.before_dispatch, self.progress_sink = (
+            store, writer, before_dispatch, progress_sink
+        )
 
     @staticmethod
     def _same_structure(before: RepositorySnapshot, after: RepositorySnapshot) -> bool:
@@ -290,6 +290,7 @@ class ImplementationAttemptOrchestrator:
         # new selection/dispatch, even when it made a retry-safe failure.
         if ImplementationRecoveryService(self.store).reconcile(workflow_id) is not None:
             return TaskSelection(TaskSelectionOutcome.NO_EXECUTABLE_TASK)
+        _emit_progress(self.progress_sink, Stage.TASK_EXECUTION, "started", 0)
         selection = ImplementationSelectionOrchestrator(self.store).select_once(workflow_id)
         if selection.task is None:
             return selection
@@ -385,6 +386,8 @@ class ImplementationAttemptOrchestrator:
             actual_reasoning=getattr(result, "actual_reasoning", None), provider_operation_ref=getattr(result, "provider_operation_ref", None),
             provider_session_ref=getattr(result, "provider_session_ref", None), usage=getattr(result, "usage", None),
             error_classification=getattr(result, "error_classification", None))
+        _emit_progress(self.progress_sink, Stage.TASK_EXECUTION,
+                       "completed" if classification == "completed_changed" else "failed", 0)
         return selection
 
 

@@ -161,6 +161,8 @@ def render_plan_summary(console: Console, document: Mapping[str, Any], plan: Map
                 render_task_summary(console, task)
                 if task.get("implementation_status"):
                     console.print(Text(f"      implementation: {task['implementation_status']}"))
+                if task.get("verification_status"):
+                    console.print(Text(f"      verification: {str(task['verification_status']).upper()}"))
 
     status = document.get("status")
     console.print()
@@ -171,6 +173,7 @@ def render_plan_summary(console: Console, document: Mapping[str, Any], plan: Map
     elif status == "plan_approved":
         console.print(Text("Plan approved.", style="green"))
         console.print("No implementation has started.")
+        console.print("Run `engineering-flow resume` to IMPLEMENT one eligible Task.")
     elif status == "rejected":
         console.print(Text("Plan rejected.", style="red"))
         if plan.get("decision_reason"):
@@ -185,6 +188,50 @@ def render_plan_summary(console: Console, document: Mapping[str, Any], plan: Map
         console.print(Text(str(markdown_path)))
     if plan.get("projection_error"):
         console.print(Text("Plan view could not be regenerated from canonical JSON.", style="yellow"))
+
+
+def render_implementation_summary(console: Console, document: Mapping[str, Any], plan: Mapping[str, Any]) -> None:
+    implementation = plan.get("implementation")
+    if not isinstance(implementation, Mapping):
+        return
+    active = implementation.get("active_writer")
+    latest = implementation.get("latest_attempt")
+    status = document.get("status")
+    if active:
+        console.print()
+        _heading(console, "IMPLEMENT")
+        console.print(Text("Implementation is still active or unresolved; no new writer was started.", style="yellow"))
+        _rows(console, [("Task", active.get("task_id", "unknown"), None),
+                        ("Attempt", active.get("attempt_id", "unknown"), None),
+                        ("Workspace lease", "HELD", "yellow")])
+        return
+    if not isinstance(latest, Mapping):
+        return
+    console.print()
+    _heading(console, "IMPLEMENT")
+    task_id = latest.get("task_contract_id", "unknown")
+    classification = latest.get("result_classification") or "unknown"
+    changed = latest.get("workspace_changed")
+    _rows(console, [("Task", task_id, None), ("Attempt", latest.get("id", "unknown"), None),
+                    ("Result", str(classification).upper(), _semantic_style(status)),
+                    ("Workspace changed", "yes" if changed else "no" if changed is not None else "unknown", None)])
+    paths = latest.get("changed_paths")
+    if isinstance(paths, list) and paths:
+        console.print(Text("Changed paths: " + ", ".join(str(path) for path in paths[:100]), style="dim"))
+    requested_model = latest.get("requested_model")
+    if requested_model:
+        console.print(Text(f"Requested routing: {latest.get('requested_profile')} · {requested_model} · {latest.get('requested_reasoning')}", style="dim"))
+    if latest.get("actual_model"):
+        console.print(Text(f"Actual model: {latest['actual_model']} · {latest.get('actual_reasoning') or 'unknown reasoning'}", style="dim"))
+    if status == "implementation_completed":
+        console.print(Text("Implementation completed. Verification has NOT RUN; the Task is not VERIFIED.", style="yellow"))
+        console.print("Dependent Tasks remain blocked until a future verification phase.")
+    elif status == "implementation_failed":
+        console.print(Text("Implementation failed; repository remained unchanged and attempt evidence was persisted.", style="red"))
+        console.print("A later explicit `engineering-flow resume` may retry only if this attempt remains retry-safe.")
+    elif status == "human_attention":
+        console.print(Text("HUMAN ATTENTION REQUIRED", style="bold red"))
+        console.print(Text(str(latest.get("error_detail") or "Inspect the workspace and persisted attempt evidence before resuming."), style="yellow"))
 
 
 def _render_legacy_summary(console: Console, document: Mapping[str, Any]) -> None:
@@ -231,6 +278,7 @@ def render_human(console: Console, document: Mapping[str, Any]) -> None:
     plan = document.get("plan")
     if isinstance(plan, Mapping):
         render_plan_summary(console, document, plan)
+        render_implementation_summary(console, document, plan)
     elif not isinstance(intake, Mapping):
         _render_legacy_summary(console, document)
 

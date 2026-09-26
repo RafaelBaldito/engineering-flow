@@ -33,7 +33,9 @@ from .domain import (
     WorkflowStatus,
     LifecycleVersion,
 )
-from .orchestrator import IntakeOrchestrator, PlanningOrchestrator, V2HappyPathCoordinator, V2PlanOrchestrator
+from .orchestrator import (CodexImplementationWriter, ImplementationAttemptOrchestrator,
+                           IntakeOrchestrator, PlanningOrchestrator, V2HappyPathCoordinator,
+                           V2PlanOrchestrator)
 from .presentation import (OutputMode, create_progress_renderer, interactive_prompt_eligible,
                            prompt_for_clarification, prompt_for_plan_decision,
                            render_clarification_recovery_instruction, render_plan_decision_result,
@@ -182,7 +184,7 @@ def _workflow_payload(store: WorkflowStore, workflow: Workflow, *, plan_projecti
         "active_task": active_task,
         "lifecycle_version": workflow.lifecycle_version.value,
         **(_intake_payload(store, workflow) if workflow.lifecycle_version is LifecycleVersion.V2 else {}),
-        **(_plan_payload(store, workflow, projection=plan_projection) if workflow.lifecycle_version is LifecycleVersion.V2 and workflow.stage is Stage.PLAN else {}),
+        **(_plan_payload(store, workflow, projection=plan_projection) if workflow.lifecycle_version is LifecycleVersion.V2 else {}),
     }
 
 
@@ -214,20 +216,27 @@ def _plan_payload(store: WorkflowStore, workflow: Workflow, *, projection: Any =
         return {"plan": None}
     artifact = artifacts[-1]
     plan = json.loads(store.read_artifact(artifact.id))
-    if workflow.status is WorkflowStatus.PLAN_APPROVED:
-        # The authoritative selection projection remains read-only.  Absent
-        # operational rows deliberately render as pending.
-        authority = store.load_approved_v2_plan_authority(workflow.id)
-        states = {
-            state.task_contract_id: state.status.value
-            for state in store.list_task_implementation_states(workflow.id, authority.plan_artifact.id)
-        }
-        raw_plan = plan.get("plan") if isinstance(plan, dict) else None
-        raw_tasks = raw_plan.get("tasks") if isinstance(raw_plan, dict) else None
-        if isinstance(raw_tasks, list):
-            for task in raw_tasks:
-                if isinstance(task, dict) and isinstance(task.get("id"), str):
-                    task["implementation_status"] = states.get(task["id"], "pending")
+    # Plan task contracts stay immutable. Operational task states and attempts
+    # are projected alongside them for every V2 stop boundary.
+    states = {
+        state.task_contract_id: state.status.value
+        for state in store.list_task_implementation_states(workflow.id, artifact.id)
+    }
+    raw_plan = plan.get("plan") if isinstance(plan, dict) else None
+    raw_tasks = raw_plan.get("tasks") if isinstance(raw_plan, dict) else None
+    if isinstance(raw_tasks, list):
+        for task in raw_tasks:
+            if isinstance(task, dict) and isinstance(task.get("id"), str):
+                task["implementation_status"] = states.get(task["id"], "pending")
+                task["verification_status"] = "not_run"
+    attempts = store.list_implementation_attempts(workflow.id)
+    latest_attempt = attempts[-1] if attempts else None
+    if latest_attempt and isinstance(latest_attempt.get("changed_paths_json"), str):
+        try:
+            latest_attempt["changed_paths"] = json.loads(latest_attempt.pop("changed_paths_json"))
+        except json.JSONDecodeError:
+            latest_attempt["changed_paths"] = []
+    lease = store.active_implementation_lease(workflow.id)
     approval = store.get_approval_for_artifact(artifact.id)
     projection_data: dict[str, Any] = {}
     if projection is not None:
@@ -254,6 +263,16 @@ def _plan_payload(store: WorkflowStore, workflow: Workflow, *, projection: Any =
                                            "replacement_plan_artifact_id": item.replacement_plan_artifact_id,
                                            "actor": item.actor, "created_at": item.created_at,
                                            "completed_at": item.completed_at} for item in changes],
+                      "implementation": {
+                          "attempt_count": len(attempts),
+                          "latest_attempt": latest_attempt,
+                          "active_writer": (None if lease is None else {
+                              "task_id": lease.get("task_contract_id"),
+                              "attempt_id": lease.get("attempt_id"),
+                              "lease_held": True,
+                          }),
+                          "verification_status": "not_run",
+                      },
                       **projection_data, **plan}}
 
 
@@ -340,6 +359,8 @@ def _failure_for_workflow(store: WorkflowStore, workflow: Workflow) -> tuple[str
         if latest and latest.failure_classification is FailureClassification.AUTHENTICATION:
             return ERROR_CODES[FailureClassification.AUTHENTICATION.value], EXIT_AUTHENTICATION
         return ERROR_CODES["human_attention"], EXIT_HUMAN_ATTENTION
+    if workflow.status is WorkflowStatus.IMPLEMENTATION_FAILED:
+        return ERROR_CODES[FailureClassification.AGENT_EXECUTION.value], EXIT_PROVIDER
     if workflow.status is not WorkflowStatus.FAILED:
         return None, EXIT_SUCCESS
     latest = store.get_latest_execution(workflow.id)
@@ -708,6 +729,20 @@ def _run_command(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
                         interactive=(not args.json_output and interactive_prompt_eligible(sys.stdin, sys.stdout, sys.stderr)),
                         no_color=args.no_color,
                     )
+                elif (existing.status in {WorkflowStatus.PLAN_APPROVED, WorkflowStatus.IMPLEMENTATION_FAILED}
+                      or store.active_implementation_lease(existing.id) is not None):
+                    # The implementation orchestrator owns all authority,
+                    # recovery, lease, dispatch, and result decisions.  This
+                    # CLI branch is intentionally one call with no loop.
+                    progress_sink = (None if args.json_output else create_progress_renderer(
+                        sys.stderr, no_color=args.no_color,
+                    ))
+                    writer = CodexImplementationWriter(runtime=plan_orchestrator.runtime,
+                                                       config=config, progress_sink=progress_sink)
+                    ImplementationAttemptOrchestrator(
+                        store, writer, progress_sink=progress_sink,
+                    ).run_once(existing.id)
+                    workflow = store.get_workflow(existing.id)
                 else:
                     workflow = plan_orchestrator.resume(existing.id, progress_sink=(None if args.json_output else create_progress_renderer(sys.stderr, no_color=args.no_color)))
             else:

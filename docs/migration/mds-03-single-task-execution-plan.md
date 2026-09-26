@@ -1210,6 +1210,39 @@ create a disposable temporary Git repository, never the development checkout:
 Keep the feature tiny and use one provider call. Do not commit, push, create a
 PR, or introduce a deliberate failure in a non-disposable repository.
 
+### Slice 5 controlled command sequence
+
+Run this only after code review explicitly authorizes the token-consuming
+smoke.  The `resume` command below is the single real IMPLEMENT dispatch; do
+not invoke it a second time.
+
+```bash
+SMOKE_ROOT="$(mktemp -d)"
+REPO="$SMOKE_ROOT/repo"
+mkdir "$REPO" && git -C "$REPO" init
+git -C "$REPO" config user.email smoke@example.invalid
+git -C "$REPO" config user.name smoke
+printf '.engineering-flow/\n' > "$REPO/.gitignore"
+printf 'before\n' > "$REPO/greeting.txt"
+printf 'Follow the approved task only.\n' > "$REPO/AGENTS.md"
+git -C "$REPO" add . && git -C "$REPO" commit -m initial
+.venv/bin/engineering-flow init --repo "$REPO"
+# Create, inspect, and explicitly approve a tiny one-root-task Plan by the
+# normal Intake/Plan commands. Confirm T1 has low complexity and low risk.
+# Do not run resume during that setup.
+git -C "$REPO" status --porcelain=v2 --untracked-files=all
+.venv/bin/engineering-flow resume --repo "$REPO"
+.venv/bin/engineering-flow status --repo "$REPO"
+git -C "$REPO" diff --binary HEAD
+git -C "$REPO" status --porcelain=v2 --untracked-files=all
+```
+
+Expected observations: `resume` makes one IMPLEMENT call for T1 and stops;
+HEAD and branch remain unchanged; status reports `IMPLEMENTATION_COMPLETED`
+and `verification: NOT_RUN`; any T2 depending on T1 remains pending.  Do not
+run deterministic verification, review, fix, or another `resume` in this
+smoke.
+
 ## 20. Risks and mitigations
 
 | Risk | Mitigation / accepted limitation |

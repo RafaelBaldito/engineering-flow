@@ -1005,7 +1005,10 @@ class WorkflowStore:
         workflow = self.get_workflow(workflow_id)
         if (workflow.lifecycle_version is not LifecycleVersion.V2
                 or not ((workflow.stage is Stage.PLAN and workflow.status is WorkflowStatus.PLAN_APPROVED)
-                        or (workflow.stage is Stage.TASK_EXECUTION and workflow.status is WorkflowStatus.IMPLEMENTATION_FAILED))):
+                        or (workflow.stage is Stage.TASK_EXECUTION and workflow.status in {
+                            WorkflowStatus.IMPLEMENTATION_FAILED,
+                            WorkflowStatus.IMPLEMENTATION_COMPLETED,
+                        }))):
             raise ConflictFailure("workflow is not at V2 PLAN_APPROVED authority")
         plans = self.list_artifacts(workflow.id, Stage.PLAN)
         if not plans:
@@ -1239,6 +1242,20 @@ class WorkflowStore:
         if len(rows) > 1:
             raise PersistenceFailure("workflow has multiple unresolved writer leases")
         return dict(rows[0]) if rows else None
+
+    def list_implementation_attempts(self, workflow_id: str) -> list[Mapping[str, Any]]:
+        """Return bounded operational evidence for the CLI status projection."""
+        rows = self._connection.execute(
+            """SELECT id, task_contract_id, sequence, status, result_classification,
+                      requested_profile, requested_model, requested_reasoning,
+                      actual_provider, actual_model, actual_reasoning, started_at,
+                      finished_at, workspace_changed, changed_paths_json,
+                      error_classification, error_detail
+               FROM implementation_attempts WHERE workflow_id = ?
+               ORDER BY created_at, sequence""",
+            (workflow_id,),
+        ).fetchall()
+        return [dict(row) for row in rows]
 
     def request_plan_changes(self, workflow_id: str, target_plan_artifact_id: str, feedback: str, *, actor: str = "human") -> PlanChangeRequest:
         if not isinstance(feedback, str) or not feedback.strip():
