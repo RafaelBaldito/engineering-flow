@@ -1,4 +1,5 @@
 import dataclasses
+import copy
 import sys
 import tempfile
 from pathlib import Path
@@ -147,6 +148,59 @@ class DomainTests(unittest.TestCase):
             with self.assertRaisesRegex(ValidationFailure, "complexity and risk"):
                 Plan.parse(value, workflow_id="workflow-1", revision=1, feature_contract_artifact_id="artifact-1",
                     feature_contract_sha256="hash-1", repository_path=root)
+
+    def test_plan_parser_canonicalizes_model_local_task_keys_and_reparses_payload(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "source.py").write_text("x = 1\n", encoding="utf-8")
+            task = lambda key, dependencies: {"id": key, "objective": key,
+                "context": {"relevant_files": ["source.py"], "existing_patterns": []},
+                "requirements": ["Requirement"], "acceptance_criteria": ["Criterion"],
+                "verification": ["tests"], "constraints": [], "depends_on": dependencies,
+                "complexity": "low", "risk": "high"}
+            payload = {"plan": {"id": "workflow-1:plan:r1", "workflow_id": "workflow-1", "revision": 1,
+                "feature_contract": {"artifact_id": "artifact-1", "sha256": "hash-1"}, "strategy": "Plan it.",
+                "assumptions": [], "verification_strategy": ["unit tests"],
+                "tasks": [task("task-1", []), task("task-2", ["task-1"]),
+                          task("arbitrary local key", ["task-2"])]}}
+            parse = lambda value: Plan.parse(value, workflow_id="workflow-1", revision=1,
+                feature_contract_artifact_id="artifact-1", feature_contract_sha256="hash-1", repository_path=root)
+            parsed = parse(payload)
+            self.assertEqual([item.id for item in parsed.tasks], ["T1", "T2", "T3"])
+            self.assertEqual(parsed.tasks[1].depends_on, ("T1",))
+            self.assertEqual(parsed.tasks[2].depends_on, ("T2",))
+            canonical_payload = parsed.as_payload()
+            self.assertEqual([item["id"] for item in canonical_payload["plan"]["tasks"]], ["T1", "T2", "T3"])
+            self.assertEqual(canonical_payload["plan"]["tasks"][1]["depends_on"], ["T1"])
+            self.assertEqual(parse(canonical_payload), parsed)
+
+    def test_plan_parser_rejects_invalid_model_local_task_dependencies(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "source.py").write_text("x = 1\n", encoding="utf-8")
+            task = lambda key, dependencies: {"id": key, "objective": key,
+                "context": {"relevant_files": ["source.py"], "existing_patterns": []},
+                "requirements": ["Requirement"], "acceptance_criteria": ["Criterion"],
+                "verification": ["tests"], "constraints": [], "depends_on": dependencies,
+                "complexity": "low", "risk": "high"}
+            payload = {"plan": {"id": "workflow-1:plan:r1", "workflow_id": "workflow-1", "revision": 1,
+                "feature_contract": {"artifact_id": "artifact-1", "sha256": "hash-1"}, "strategy": "Plan it.",
+                "assumptions": [], "verification_strategy": ["unit tests"],
+                "tasks": [task("first", []), task("second", [])]}}
+            parse = lambda value: Plan.parse(value, workflow_id="workflow-1", revision=1,
+                feature_contract_artifact_id="artifact-1", feature_contract_sha256="hash-1", repository_path=root)
+            for mutate, message in (
+                (lambda value: value["plan"]["tasks"][1].update(id="first"), "local dependency keys"),
+                (lambda value: value["plan"]["tasks"][1].update(id=""), "task.id"),
+                (lambda value: value["plan"]["tasks"][1].update(depends_on=["missing"]), "dependencies"),
+                (lambda value: value["plan"]["tasks"][1].update(depends_on=[1]), "depends_on"),
+                (lambda value: value["plan"]["tasks"][1].update(depends_on=["second"]), "dependencies"),
+                (lambda value: value["plan"]["tasks"][0].update(depends_on=["second"]), "dependencies"),
+            ):
+                value = copy.deepcopy(payload)
+                mutate(value)
+                with self.assertRaisesRegex(ValidationFailure, message):
+                    parse(value)
 
 
 if __name__ == "__main__":

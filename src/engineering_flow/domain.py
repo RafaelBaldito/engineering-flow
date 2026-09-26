@@ -604,14 +604,19 @@ class Plan:
         if not isinstance(raw_tasks, list) or not raw_tasks:
             raise ValidationFailure("Plan tasks must be a non-empty list")
         repository = Path(repository_path).resolve()
-        tasks: list[TaskContract] = []
-        for index, raw in enumerate(raw_tasks, 1):
-            task_expected = {"id", "objective", "context", "requirements", "acceptance_criteria", "verification", "constraints", "depends_on", "complexity", "risk"}
+        task_expected = {"id", "objective", "context", "requirements", "acceptance_criteria", "verification", "constraints", "depends_on", "complexity", "risk"}
+        local_keys: list[str] = []
+        for raw in raw_tasks:
             if not isinstance(raw, Mapping) or set(raw) != task_expected or not isinstance(raw["context"], Mapping) or set(raw["context"]) != {"relevant_files", "existing_patterns"}:
                 raise ValidationFailure("Task Contract has an invalid shape")
-            task_id = _plan_text(raw["id"], "task.id")
-            if task_id != f"T{index}":
-                raise ValidationFailure("Task IDs must be contiguous T1, T2, ...")
+            local_keys.append(_plan_text(raw["id"], "task.id"))
+        if len(set(local_keys)) != len(local_keys):
+            raise ValidationFailure("Plan task local dependency keys must be unique")
+        canonical_ids = {local_key: f"T{index}" for index, local_key in enumerate(local_keys, 1)}
+        local_positions = {local_key: index for index, local_key in enumerate(local_keys)}
+        tasks: list[TaskContract] = []
+        for index, raw in enumerate(raw_tasks, 1):
+            task_id = f"T{index}"
             files = _plan_texts(raw["context"]["relevant_files"], "context.relevant_files")
             for item in files:
                 parsed = PurePosixPath(item)
@@ -624,10 +629,13 @@ class Plan:
                     raise ValidationFailure("Task relevant_files escapes repository") from exc
                 if not resolved.is_file():
                     raise ValidationFailure("Task relevant_files must exist as files")
-            dependencies = _plan_texts(raw["depends_on"], "depends_on")
-            known = {task.id for task in tasks}
-            if any(dep == task_id or dep not in known for dep in dependencies):
+            local_dependencies = _plan_texts(raw["depends_on"], "depends_on")
+            local_key = local_keys[index - 1]
+            if any(dependency == local_key or dependency not in canonical_ids
+                   or local_positions[dependency] >= index - 1
+                   for dependency in local_dependencies):
                 raise ValidationFailure("Task dependencies must refer only to earlier tasks")
+            dependencies = tuple(canonical_ids[dependency] for dependency in local_dependencies)
             complexity, risk = _plan_text(raw["complexity"], "complexity"), _plan_text(raw["risk"], "risk")
             if complexity not in {"low", "medium", "high"} or risk not in {"low", "medium", "high"}:
                 raise ValidationFailure("Task complexity and risk must be low, medium, or high")

@@ -956,7 +956,7 @@ class CanonicalLifecycleOrchestratorTests(unittest.TestCase):
 
 
 class V2PlanTests(unittest.TestCase):
-    def test_ready_contract_becomes_pending_plan_without_task_rows(self):
+    def test_smoke_style_local_task_keys_are_canonicalized_before_plan_approval(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             source = root / "source.py"
@@ -965,7 +965,12 @@ class V2PlanTests(unittest.TestCase):
             class Runtime(FakeRuntime):
                 def execute(self, request):
                     self.requests.append(request)
-                    return PlanningExecutionResult(self.provider, request.logical_session_id or "s", "thread", "turn", TerminalState.SUCCEEDED, {"plan": {"id": f"{request.workflow_id}:plan:r1", "workflow_id": request.workflow_id, "revision": 1, "feature_contract": {"artifact_id": feature.id, "sha256": feature.sha256}, "strategy": "Change source.", "assumptions": [], "verification_strategy": ["unit tests"], "tasks": [{"id": "T1", "objective": "Change source.", "context": {"relevant_files": ["source.py"], "existing_patterns": []}, "requirements": ["Update behavior."], "acceptance_criteria": ["Works."], "verification": ["tests"], "constraints": [], "depends_on": [], "complexity": "low", "risk": "high"}]}})
+                    task = lambda key, dependencies: {"id": key, "objective": "Change source.",
+                        "context": {"relevant_files": ["source.py"], "existing_patterns": []},
+                        "requirements": ["Update behavior."], "acceptance_criteria": ["Works."],
+                        "verification": ["tests"], "constraints": [], "depends_on": dependencies,
+                        "complexity": "low", "risk": "high"}
+                    return PlanningExecutionResult(self.provider, request.logical_session_id or "s", "thread", "turn", TerminalState.SUCCEEDED, {"plan": {"id": f"{request.workflow_id}:plan:r1", "workflow_id": request.workflow_id, "revision": 1, "feature_contract": {"artifact_id": feature.id, "sha256": feature.sha256}, "strategy": "Change source.", "assumptions": [], "verification_strategy": ["unit tests"], "tasks": [task("task-1", []), task("task-2", ["task-1"])]}})
             runtime = Runtime()
             intake = IntakeOrchestrator(store, runtime)
             # Persist a verified READY source without invoking the intake fake.
@@ -975,9 +980,20 @@ class V2PlanTests(unittest.TestCase):
             feature = store.complete_generation(intent.operation.idempotency_key, content=json.dumps(payload), artifact_path=root / ".engineering-flow" / "workflows" / workflow.id / "artifacts" / "001-feature-contract.json", stage=Stage.INTAKE, revision=1, workflow_stage=Stage.INTAKE, workflow_status=WorkflowStatus.READY, approval_state=ApprovalState.NOT_REQUIRED)
             result = V2PlanOrchestrator(store, runtime).resume(workflow.id)
             self.assertEqual((result.stage, result.status), (Stage.PLAN, WorkflowStatus.AWAITING_APPROVAL))
-            self.assertEqual(store.list_artifacts(workflow.id, Stage.PLAN)[0].approval_state, ApprovalState.PENDING)
+            plan_artifact = store.list_artifacts(workflow.id, Stage.PLAN)[0]
+            self.assertEqual(plan_artifact.approval_state, ApprovalState.PENDING)
+            persisted = json.loads(store.read_artifact(plan_artifact.id))
+            self.assertEqual([task["id"] for task in persisted["plan"]["tasks"]], ["T1", "T2"])
+            self.assertEqual(persisted["plan"]["tasks"][1]["depends_on"], ["T1"])
             self.assertEqual(store.list_tasks(workflow.id), [])
             self.assertEqual(runtime.requests[-1].role, Role.PLANNER)
+            self.assertIn("unique local dependency key", runtime.requests[-1].instruction)
+            self.assertIn("canonical task identities T<N>", runtime.requests[-1].instruction)
+            self.assertIn("depends_on must reference only those local keys", runtime.requests[-1].instruction)
+            V2PlanOrchestrator(store, runtime).approve(workflow.id, plan_artifact.id)
+            authority = store.load_approved_v2_plan_authority(workflow.id)
+            self.assertEqual([task.id for task in authority.plan.tasks], ["T1", "T2"])
+            self.assertEqual(authority.plan.tasks[1].depends_on, ("T1",))
             store.close()
 
 

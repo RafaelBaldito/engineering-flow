@@ -587,6 +587,7 @@ class V2PlanOrchestrator:
             f"You are the Planner. Read the authoritative READY Feature Contract at {feature_artifact.path} (artifact UUID {feature_artifact.id}, sha256 {feature_artifact.sha256}) and inspect repository {workflow.repository_path}. "
             "Read applicable AGENTS.md, relevant implementation, tests, configuration, and patterns. Produce a small ordered dependency-aware implementation Plan directly; do not create a PRD, Tech Spec, Wave or release governance. "
             "Do not modify files, commit, approve, invoke agents, run implementation work or progress beyond Plan. "
+            "For each task, id is a unique local dependency key, not its canonical identity. Engineering Flow assigns canonical task identities T<N> by task list order. depends_on must reference only those local keys of earlier tasks. "
             f"Return only strict Plan JSON. plan.id={plan_id}; workflow_id={workflow.id}; revision={revision}; feature_contract artifact_id={feature_artifact.id}; sha256={feature_artifact.sha256}. "
             "Each task must be precise with bounded context and verification; complexity and risk are independent; assumptions must not change product behavior."
         )
