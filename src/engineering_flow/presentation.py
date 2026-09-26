@@ -113,12 +113,17 @@ def render_intake_summary(console: Console, intake: Mapping[str, Any]) -> None:
     console.print()
     outcome = str(intake.get("outcome") or "unknown").upper()
     console.print(Text(f"Intake: {outcome}", style=_semantic_style(intake.get("outcome"))))
-    questions = intake.get("open_questions")
-    if isinstance(questions, list) and questions:
+    current = intake.get("current_clarification")
+    if isinstance(current, Mapping) and current.get("question"):
         console.print()
         _heading(console, "Open questions:")
-        for question in questions:
-            console.print(Text(f"- {question}"))
+        console.print(Text(f"- {current['question']}"))
+        if current.get("answered"):
+            console.print(Text("Answer persisted; Intake recovery is available.", style="yellow"))
+        else:
+            console.print("Continue with: engineering-flow resume --answer \"...\"")
+    elif outcome == "READY":
+        console.print(Text("Clarification accepted. Requirements are ready.", style="green"))
 
 
 def render_task_summary(console: Console, task: Mapping[str, Any]) -> None:

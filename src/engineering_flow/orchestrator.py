@@ -92,10 +92,53 @@ class IntakeOrchestrator:
     def status(self, workflow_id: str) -> Workflow:
         return self.store.get_workflow(workflow_id)
 
-    def _intake(self, workflow: Workflow, *, progress_sink: Any = None) -> Workflow:
+    def resume_answer(self, workflow_id: str, answer: str | None = None, *, progress_sink: Any = None) -> Workflow:
+        workflow = self.store.get_workflow(workflow_id)
+        if workflow.lifecycle_version is not LifecycleVersion.V2:
+            raise ConflictFailure("workflow is not V2")
+        if workflow.stage is not Stage.INTAKE or workflow.status not in {
+            WorkflowStatus.NEEDS_CLARIFICATION, WorkflowStatus.FAILED, WorkflowStatus.HUMAN_ATTENTION,
+        }:
+            raise ConflictFailure("workflow is not awaiting Intake clarification recovery")
+        clarification = self.store.get_active_clarification(workflow.id)
+        if clarification is None:
+            raise PersistenceFailure("workflow has no active clarification")
+        source = self.store.get_artifact(clarification.source_feature_contract_artifact_id)
+        if source.workflow_id != workflow.id or source.stage is not Stage.INTAKE:
+            raise PersistenceFailure("clarification source binding is invalid")
+        source_contract = FeatureContract.parse(json.loads(self.store.read_artifact(source.id)), workflow_id=workflow.id)
+        if (source_contract.outcome is not IntakeOutcome.NEEDS_CLARIFICATION
+                or not source_contract.open_questions
+                or source_contract.open_questions[0] != clarification.question):
+            raise PersistenceFailure("clarification question does not match its source Feature Contract")
+        if answer is not None:
+            clarification = self.store.answer_clarification(workflow.id, clarification.id, answer)
+        if clarification.answer is None:
+            return workflow
+        return self._intake(workflow, clarification=clarification, progress_sink=progress_sink)
+
+    def _intake(self, workflow: Workflow, *, clarification: Any = None, progress_sink: Any = None) -> Workflow:
         request_path = Path(workflow.feature_input_path or "")
         raw = request_path.read_bytes()
         request_digest = hashlib.sha256(raw).hexdigest()
+        if workflow.feature_input_sha256 and request_digest != workflow.feature_input_sha256:
+            raise PersistenceFailure("raw request bytes do not match persisted authority hash")
+        prior_contract = None
+        answered = []
+        if clarification is not None:
+            source = self.store.get_artifact(clarification.source_feature_contract_artifact_id)
+            if source.workflow_id != workflow.id or source.stage is not Stage.INTAKE:
+                raise PersistenceFailure("clarification source binding is invalid")
+            prior_contract = source
+            # Hash verification occurs through read_artifact before provider dispatch.
+            source_contract = FeatureContract.parse(json.loads(self.store.read_artifact(source.id)), workflow_id=workflow.id)
+            if (source_contract.outcome is not IntakeOutcome.NEEDS_CLARIFICATION
+                    or not source_contract.open_questions
+                    or source_contract.open_questions[0] != clarification.question):
+                raise PersistenceFailure("clarification question does not match its source Feature Contract")
+            for item in self.store.list_clarifications(workflow.id):
+                if item.answer is not None:
+                    answered.append({"id": item.id, "sequence": item.sequence, "source_artifact_id": item.source_feature_contract_artifact_id, "question": item.question, "answer": item.answer})
         instruction = (
             f"You are the Intake agent. The raw user request is the authoritative UTF-8 file {request_path} (sha256: {request_digest}); read it before responding. "
             "If information can reasonably be discovered from the repository, inspect the repository instead of asking the user. "
@@ -105,10 +148,15 @@ class IntakeOrchestrator:
             "Set outcome READY only when requirements and acceptance_criteria are non-empty and open_questions is empty. "
             "If any material product or business question remains, set outcome NEEDS_CLARIFICATION and include it in open_questions."
         )
-        request_hash = hashlib.sha256(json.dumps({"raw_request_sha256": request_digest, "stage": "intake", "instruction": instruction, "output": "feature-contract-v1"}, sort_keys=True).encode()).hexdigest()
+        if prior_contract is not None:
+            instruction += (f" This is a clarification re-evaluation. The exact prior Feature Contract is {prior_contract.path} (artifact UUID {prior_contract.id}, sha256 {prior_contract.sha256}). "
+                            f"The following persisted human answers are authoritative product input: {json.dumps(answered, ensure_ascii=False, sort_keys=True)}. Do not silently reinterpret them.")
+        request_hash = hashlib.sha256(json.dumps({"raw_request_sha256": request_digest, "prior_contract_id": prior_contract.id if prior_contract else None, "prior_contract_sha256": prior_contract.sha256 if prior_contract else None, "answered_clarifications": answered, "stage": "intake", "instruction": instruction, "output": "feature-contract-v1"}, sort_keys=True).encode()).hexdigest()
         report = self.runtime.verify_planning_capabilities(workflow.repository_path)
+        revision = 1 if clarification is None else self.store.next_artifact_revision(workflow.id, Stage.INTAKE)
+        artifact_path = self.store.feature_contract_path(workflow.id, revision)
         intent = self.store.create_generation_intent(workflow.id, Stage.INTAKE, request_hash=request_hash, provider=workflow.provider,
-            role=Role.INTAKE, revision=1, artifact_path=self.store.workspace_path / "workflows" / workflow.id / "artifacts" / "001-feature-contract.json", capability_report=_json_mapping(report))
+            role=Role.INTAKE, revision=revision, artifact_path=artifact_path, capability_report=_json_mapping(report))
         if intent.reused:
             return self.store.get_workflow(workflow.id)
         if not report.available or not report.read_only_planning:
@@ -121,7 +169,7 @@ class IntakeOrchestrator:
         root = self.store.workspace_path / "workflows" / workflow.id / "runtime" / intent.execution.id
         runtime_request = PlanningExecutionRequest(workflow_id=workflow.id, execution_id=intent.execution.id, logical_session_id=intent.execution.session_id,
             role=Role.INTAKE, stage=Stage.INTAKE, repository_path=workflow.repository_path,
-            authoritative_input_paths=(str(request_path),), authoritative_input_hashes=(request_digest,), instruction=instruction,
+            authoritative_input_paths=(str(request_path), *( (prior_contract.path,) if prior_contract else () )), authoritative_input_hashes=(request_digest, *( (prior_contract.sha256,) if prior_contract else () )), instruction=instruction,
             output_schema_path=str(root / "feature-contract.schema.json"), final_output_path=str(root / "final-output.json"), timeout_seconds=self.timeout_seconds,
             required_capabilities=("read_only",), progress_sink=progress_sink)
         try:
@@ -165,10 +213,12 @@ class IntakeOrchestrator:
             return self.store.get_workflow(workflow.id)
         status = {IntakeOutcome.READY: WorkflowStatus.READY, IntakeOutcome.NEEDS_CLARIFICATION: WorkflowStatus.NEEDS_CLARIFICATION, IntakeOutcome.REJECTED: WorkflowStatus.REJECTED}[contract.outcome]
         self.store.complete_generation(intent.operation.idempotency_key, content=json.dumps(contract.as_payload(), ensure_ascii=False, indent=2) + "\n",
-            artifact_path=self.store.workspace_path / "workflows" / workflow.id / "artifacts" / "001-feature-contract.json", stage=Stage.INTAKE, revision=1,
+            artifact_path=artifact_path, stage=Stage.INTAKE, revision=revision,
             terminal_result={"provider": result.provider, "final_payload": contract.as_payload(), "usage": dict(result.usage), "metadata": dict(result.metadata)},
             workflow_stage=Stage.INTAKE, workflow_status=status, approval_state=ApprovalState.NOT_REQUIRED,
-            completion_event_type="intake.completed", completion_event_payload={"outcome": contract.outcome.value, "question_count": len(contract.open_questions)})
+            completion_event_type="intake.completed", completion_event_payload={"outcome": contract.outcome.value, "question_count": len(contract.open_questions)},
+            result_clarification_id=clarification.id if clarification else None,
+            next_clarification_question=contract.open_questions[0] if contract.outcome is IntakeOutcome.NEEDS_CLARIFICATION else None)
         result_workflow = self.store.get_workflow(workflow.id)
         _emit_progress(progress_sink, Stage.INTAKE, "completed", self._monotonic() - started)
         return result_workflow

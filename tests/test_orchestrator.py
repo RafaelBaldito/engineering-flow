@@ -123,6 +123,72 @@ class OrchestratorTests(unittest.TestCase):
         self.assertEqual(len(completed), 1)
         self.assertEqual(completed[0].payload, {"outcome": "NEEDS_CLARIFICATION", "question_count": 1})
 
+    def test_one_answer_creates_immutable_second_contract_and_new_current_question(self):
+        def contract(workflow_id, outcome, questions):
+            return {"outcome": outcome, "feature": {"id": workflow_id, "goal": "Goal",
+                "requirements": [] if questions else ["Requirement"],
+                "acceptance_criteria": [] if questions else ["Criterion"], "constraints": [],
+                "out_of_scope": [], "assumptions": [], "open_questions": questions}}
+
+        class Runtime(FakeRuntime):
+            def execute_planning(self, request):
+                self.requests.append(request)
+                payload = contract(request.workflow_id, "NEEDS_CLARIFICATION", ["Q1", "Q2", "Q3"])
+                if len(self.requests) == 2:
+                    payload = contract(request.workflow_id, "NEEDS_CLARIFICATION", ["Q3", "Q4"])
+                return PlanningExecutionResult(self.provider, request.logical_session_id or "s", "thread", "turn",
+                    TerminalState.SUCCEEDED, payload)
+
+        runtime = Runtime()
+        intake = IntakeOrchestrator(self.store, runtime)
+        workflow = intake.run(self.root, "Ambiguous request")
+        source = self.store.list_artifacts(workflow.id, Stage.INTAKE)[0]
+        original = Path(source.path).read_bytes()
+        current = self.store.get_active_clarification(workflow.id)
+        self.assertEqual(current.question, "Q1")
+        workflow = intake.resume_answer(workflow.id, "A1")
+        artifacts = self.store.list_artifacts(workflow.id, Stage.INTAKE)
+        self.assertEqual([item.revision for item in artifacts], [1, 2])
+        self.assertEqual(Path(source.path).read_bytes(), original)
+        self.assertTrue(artifacts[1].path.endswith("001-feature-contract-r002.json"))
+        records = self.store.list_clarifications(workflow.id)
+        self.assertEqual((records[0].question, records[0].answer, records[0].result_feature_contract_artifact_id), ("Q1", "A1", artifacts[1].id))
+        self.assertEqual((records[1].question, records[1].answer), ("Q3", None))
+        self.assertEqual(len(runtime.requests), 2)
+        self.assertIn("A1", runtime.requests[1].instruction)
+
+    def test_answer_survives_failed_attempt_and_retry_uses_revision_two(self):
+        def payload(workflow_id):
+            return {"outcome": "NEEDS_CLARIFICATION", "feature": {"id": workflow_id, "goal": "Goal",
+                "requirements": [], "acceptance_criteria": [], "constraints": [], "out_of_scope": [],
+                "assumptions": [], "open_questions": ["Q1"]}}
+
+        class Runtime(FakeRuntime):
+            def execute_planning(self, request):
+                self.requests.append(request)
+                if len(self.requests) == 1:
+                    return PlanningExecutionResult(self.provider, "s", "thread", "turn", TerminalState.SUCCEEDED, payload(request.workflow_id))
+                if len(self.requests) == 2:
+                    return PlanningExecutionResult(self.provider, "s", "thread", "turn", TerminalState.FAILED, None,
+                        failure_classification=FailureClassification.PROVIDER, failure_detail="offline")
+                return PlanningExecutionResult(self.provider, "s", "thread", "turn", TerminalState.SUCCEEDED,
+                    {"outcome": "READY", "feature": {"id": request.workflow_id, "goal": "Goal", "requirements": ["R"],
+                    "acceptance_criteria": ["A"], "constraints": [], "out_of_scope": [], "assumptions": [], "open_questions": []}})
+
+        runtime = Runtime()
+        intake = IntakeOrchestrator(self.store, runtime)
+        workflow = intake.run(self.root, "Ambiguous")
+        failed = intake.resume_answer(workflow.id, "A1")
+        self.assertEqual(failed.status, WorkflowStatus.FAILED)
+        active = self.store.get_active_clarification(workflow.id)
+        self.assertEqual(active.answer, "A1")
+        self.assertEqual(len(self.store.list_artifacts(workflow.id, Stage.INTAKE)), 1)
+        ready = intake.resume_answer(workflow.id)
+        self.assertEqual(ready.status, WorkflowStatus.READY)
+        artifacts = self.store.list_artifacts(workflow.id, Stage.INTAKE)
+        self.assertEqual([item.revision for item in artifacts], [1, 2])
+        self.assertEqual(self.store.list_clarifications(workflow.id)[0].result_feature_contract_artifact_id, artifacts[1].id)
+
     def test_intake_emits_safe_progress_before_dispatch_and_preserves_result(self):
         observed = []
         clock = iter((10.0, 13.4))

@@ -343,6 +343,22 @@ class FeatureContract:
         }}
 
 
+@dataclass(frozen=True, slots=True)
+class Clarification:
+    """One durable, workflow-specific human clarification boundary."""
+    id: str
+    workflow_id: str
+    sequence: int
+    source_feature_contract_artifact_id: str
+    question: str
+    answer: str | None
+    actor: str | None
+    result_feature_contract_artifact_id: str | None
+    created_at: str
+    answered_at: str | None
+    completed_at: str | None
+
+
 def _plan_text(value: Any, name: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ValidationFailure(f"Plan {name} must be a non-empty string")

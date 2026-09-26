@@ -118,6 +118,7 @@ def build_parser() -> argparse.ArgumentParser:
             command.add_argument("--reason", required=name == "reject", metavar="TEXT")
         if name == "resume":
             command.add_argument("--regenerate", choices=("prd", "techspec", "task-plan"))
+            command.add_argument("--answer", metavar="TEXT")
         if name == "intervene":
             command.add_argument("--task", required=True, metavar="ID")
             command.add_argument("--reason", required=True, metavar="TEXT")
@@ -188,8 +189,18 @@ def _intake_payload(store: WorkflowStore, workflow: Workflow) -> dict[str, Any]:
         parsed = json.loads(store.read_artifact(artifact.id))
         contract = parsed if isinstance(parsed, dict) else {}
     feature = contract.get("feature", {}) if isinstance(contract.get("feature"), dict) else {}
+    records = store.list_clarifications(workflow.id)
+    active = store.get_active_clarification(workflow.id)
+    clarification_payload = [{"id": item.id, "sequence": item.sequence,
+                              "source_feature_contract_artifact_id": item.source_feature_contract_artifact_id,
+                              "question": item.question, "answer": item.answer, "actor": item.actor,
+                              "result_feature_contract_artifact_id": item.result_feature_contract_artifact_id,
+                              "created_at": item.created_at, "answered_at": item.answered_at,
+                              "completed_at": item.completed_at} for item in records]
     return {"intake": {"outcome": contract.get("outcome"), "feature_contract_artifact_id": artifact.id if artifact else None,
-                       "open_questions": feature.get("open_questions", [])}}
+                       "open_questions": feature.get("open_questions", []), "clarifications": clarification_payload,
+                       "current_clarification": ({"id": active.id, "sequence": active.sequence, "question": active.question,
+                                                  "answered": active.answer is not None} if active else None)}}
 
 
 def _plan_payload(store: WorkflowStore, workflow: Workflow, *, projection: Any = None) -> dict[str, Any]:
@@ -544,13 +555,13 @@ def _run_command(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
             if existing.lifecycle_version is LifecycleVersion.V2:
                 if args.regenerate:
                     raise ValidationFailure("--regenerate is V1-only")
-                workflow = plan_orchestrator.resume(
-                    existing.id,
-                    progress_sink=(None if args.json_output else create_progress_renderer(
-                        sys.stderr, no_color=args.no_color,
-                    )),
-                )
+                if args.answer is not None or (existing.stage is Stage.INTAKE and existing.status in {WorkflowStatus.NEEDS_CLARIFICATION, WorkflowStatus.FAILED, WorkflowStatus.HUMAN_ATTENTION}):
+                    workflow = intake_orchestrator.resume_answer(existing.id, args.answer, progress_sink=(None if args.json_output else create_progress_renderer(sys.stderr, no_color=args.no_color)))
+                else:
+                    workflow = plan_orchestrator.resume(existing.id, progress_sink=(None if args.json_output else create_progress_renderer(sys.stderr, no_color=args.no_color)))
             else:
+                if args.answer is not None:
+                    raise ValidationFailure("--answer is V2-only")
                 regenerate = {"prd": Stage.PRD, "techspec": Stage.TECHSPEC, "task-plan": Stage.TASK_PLAN}.get(args.regenerate)
                 workflow = orchestrator.resume(existing.id, regenerate=regenerate)
             if explicit and workflow.lifecycle_version is LifecycleVersion.V2:

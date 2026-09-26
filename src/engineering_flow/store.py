@@ -28,6 +28,7 @@ from .domain import (
     ExecutionLifecycle,
     FailureClassification,
     CapabilityOperation,
+    Clarification,
     CanonicalStage,
     GenerationIntent,
     GovernanceDecision,
@@ -274,6 +275,20 @@ class WorkflowStore:
             reason TEXT,
             created_at TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS clarifications (
+            id TEXT PRIMARY KEY,
+            workflow_id TEXT NOT NULL REFERENCES workflows(id),
+            sequence INTEGER NOT NULL CHECK(sequence > 0),
+            source_feature_contract_artifact_id TEXT NOT NULL UNIQUE REFERENCES artifacts(id),
+            question TEXT NOT NULL,
+            answer TEXT,
+            actor TEXT,
+            result_feature_contract_artifact_id TEXT UNIQUE REFERENCES artifacts(id),
+            created_at TEXT NOT NULL,
+            answered_at TEXT,
+            completed_at TEXT,
+            UNIQUE(workflow_id, sequence)
+        );
         CREATE TABLE IF NOT EXISTS operations (
             id TEXT PRIMARY KEY,
             idempotency_key TEXT NOT NULL UNIQUE,
@@ -440,6 +455,7 @@ class WorkflowStore:
             ON events(workflow_id, sequence);
         CREATE INDEX IF NOT EXISTS idx_artifacts_workflow_stage
             ON artifacts(workflow_id, stage, revision);
+        CREATE INDEX IF NOT EXISTS idx_clarifications_workflow ON clarifications(workflow_id, sequence);
         CREATE INDEX IF NOT EXISTS idx_tasks_workflow_ordinal
             ON tasks(workflow_id, ordinal);
         CREATE INDEX IF NOT EXISTS idx_task_cycles_task
@@ -786,6 +802,12 @@ class WorkflowStore:
             )
             if existing is None:
                 existing = conn.execute("SELECT * FROM operations WHERE idempotency_key = ?", (key,)).fetchone()
+            # A failed attempt has no canonical artifact.  A retry must retain
+            # the intended artifact revision while receiving a fresh execution.
+            prior_execution = (conn.execute("SELECT lifecycle FROM executions WHERE id = ?", (existing["related_record_id"],)).fetchone() if existing is not None else None)
+            if existing is not None and (existing["status"] == OperationStatus.UNKNOWN.value or (prior_execution is not None and prior_execution["lifecycle"] in (ExecutionLifecycle.FAILED.value, ExecutionLifecycle.UNKNOWN.value))):
+                existing = None
+                key = f"{key}:attempt:{uuid.uuid4()}"
             if existing is not None:
                 operation = self._operation_from_row(existing)
                 if operation.related_record_id is None:
@@ -864,6 +886,46 @@ class WorkflowStore:
         highest = max(row["artifact_revision"] or 0, row["intent_revision"] or 0)
         return max(highest + 1, 1)
 
+    def next_artifact_revision(self, workflow_id: str, stage: Stage | str) -> int:
+        stage = self._require_enum(stage, Stage)
+        row = self._connection.execute("SELECT COALESCE(MAX(revision), 0) FROM artifacts WHERE workflow_id = ? AND stage = ?", (workflow_id, stage.value)).fetchone()
+        return int(row[0]) + 1
+
+    def feature_contract_path(self, workflow_id: str, revision: int) -> Path:
+        name = "001-feature-contract.json" if revision == 1 else f"001-feature-contract-r{revision:03d}.json"
+        return self.workspace_path / "workflows" / workflow_id / "artifacts" / name
+
+    def list_clarifications(self, workflow_id: str) -> list[Clarification]:
+        rows = self._connection.execute("SELECT * FROM clarifications WHERE workflow_id = ? ORDER BY sequence", (workflow_id,)).fetchall()
+        return [self._clarification_from_row(row) for row in rows]
+
+    def get_active_clarification(self, workflow_id: str) -> Clarification | None:
+        rows = self._connection.execute("SELECT * FROM clarifications WHERE workflow_id = ? AND result_feature_contract_artifact_id IS NULL ORDER BY sequence", (workflow_id,)).fetchall()
+        if len(rows) > 1:
+            raise PersistenceFailure("workflow has multiple active clarifications")
+        return self._clarification_from_row(rows[0]) if rows else None
+
+    def answer_clarification(self, workflow_id: str, clarification_id: str, answer: str, *, actor: str = "human") -> Clarification:
+        if not isinstance(answer, str) or not answer.strip():
+            raise ValidationFailure("clarification answer must be non-empty")
+        with self._transaction() as conn:
+            row = conn.execute("SELECT * FROM clarifications WHERE id = ? AND workflow_id = ?", (clarification_id, workflow_id)).fetchone()
+            if row is None:
+                raise NotFoundFailure("clarification not found for workflow")
+            if row["result_feature_contract_artifact_id"] is not None:
+                raise ConflictFailure("clarification is already completed")
+            if row["answer"] is not None:
+                if row["answer"] == answer:
+                    return self._clarification_from_row(row)
+                raise ConflictFailure("clarification already has a different answer")
+            if conn.execute("SELECT COUNT(*) FROM clarifications WHERE workflow_id = ? AND result_feature_contract_artifact_id IS NULL", (workflow_id,)).fetchone()[0] != 1:
+                raise PersistenceFailure("workflow does not have exactly one active clarification")
+            now = _now()
+            conn.execute("UPDATE clarifications SET answer = ?, actor = ?, answered_at = ? WHERE id = ?", (answer, actor, now, clarification_id))
+            self._event_unlocked(conn, workflow_id, "clarification.answered", stage=Stage.INTAKE, payload={"clarification_id": clarification_id})
+            row = conn.execute("SELECT * FROM clarifications WHERE id = ?", (clarification_id,)).fetchone()
+        return self._clarification_from_row(row)
+
     def complete_generation(
         self,
         operation_key: str,
@@ -878,6 +940,8 @@ class WorkflowStore:
         approval_state: ApprovalState | str = ApprovalState.PENDING,
         completion_event_type: str | None = None,
         completion_event_payload: Mapping[str, Any] | None = None,
+        result_clarification_id: str | None = None,
+        next_clarification_question: str | None = None,
     ) -> Artifact:
         stage = self._require_enum(stage, Stage)
         if workflow_status is not None:
@@ -953,6 +1017,28 @@ class WorkflowStore:
             if workflow_status is not None:
                 conn.execute("UPDATE workflows SET stage = COALESCE(?, stage), status = ?, updated_at = ? WHERE id = ?",
                              (workflow_stage.value if workflow_stage else None, workflow_status.value, now, workflow_id))
+            if result_clarification_id is not None:
+                if stage is not Stage.INTAKE:
+                    raise ValidationFailure("clarification results require an Intake artifact")
+                clarification = conn.execute("SELECT * FROM clarifications WHERE id = ? AND workflow_id = ?", (result_clarification_id, workflow_id)).fetchone()
+                if clarification is None or clarification["answer"] is None or clarification["result_feature_contract_artifact_id"] is not None:
+                    raise ConflictFailure("clarification cannot be linked to an Intake result")
+                source_row = conn.execute("SELECT workflow_id, stage FROM artifacts WHERE id = ?", (clarification["source_feature_contract_artifact_id"],)).fetchone()
+                if source_row is None or source_row["workflow_id"] != workflow_id or source_row["stage"] != Stage.INTAKE.value:
+                    raise PersistenceFailure("clarification source artifact binding is invalid")
+                conn.execute("UPDATE clarifications SET result_feature_contract_artifact_id = ?, completed_at = ? WHERE id = ?", (artifact_id, now, result_clarification_id))
+                self._event_unlocked(conn, workflow_id, "clarification.completed", stage=Stage.INTAKE, artifact_id=artifact_id, payload={"clarification_id": result_clarification_id})
+            if next_clarification_question is not None:
+                if stage is not Stage.INTAKE:
+                    raise ValidationFailure("clarifications require an Intake artifact")
+                if not isinstance(next_clarification_question, str) or not next_clarification_question.strip():
+                    raise ValidationFailure("clarification question must be non-empty")
+                if conn.execute("SELECT COUNT(*) FROM clarifications WHERE workflow_id = ? AND result_feature_contract_artifact_id IS NULL", (workflow_id,)).fetchone()[0]:
+                    raise ConflictFailure("workflow already has an active clarification")
+                sequence = conn.execute("SELECT COALESCE(MAX(sequence), 0) + 1 FROM clarifications WHERE workflow_id = ?", (workflow_id,)).fetchone()[0]
+                clarification_id = str(uuid.uuid4())
+                conn.execute("INSERT INTO clarifications (id, workflow_id, sequence, source_feature_contract_artifact_id, question, created_at) VALUES (?, ?, ?, ?, ?, ?)", (clarification_id, workflow_id, sequence, artifact_id, next_clarification_question, now))
+                self._event_unlocked(conn, workflow_id, "clarification.created", stage=Stage.INTAKE, artifact_id=artifact_id, payload={"clarification_id": clarification_id, "sequence": sequence})
             if completion_event_type:
                 self._event_unlocked(conn, workflow_id, completion_event_type, stage=stage,
                                      artifact_id=artifact_id, execution_id=execution_id,
@@ -2764,6 +2850,9 @@ class WorkflowStore:
     def _approval_from_row(self, row: sqlite3.Row) -> Approval:
         return Approval(row["id"], row["workflow_id"], row["artifact_id"], ApprovalDecision(row["decision"]),
                         row["actor"], row["reason"], row["created_at"])
+
+    def _clarification_from_row(self, row: sqlite3.Row) -> Clarification:
+        return Clarification(row["id"], row["workflow_id"], row["sequence"], row["source_feature_contract_artifact_id"], row["question"], row["answer"], row["actor"], row["result_feature_contract_artifact_id"], row["created_at"], row["answered_at"], row["completed_at"])
 
     def _operation_from_row(self, row: sqlite3.Row) -> Operation:
         return Operation(row["id"], row["idempotency_key"], row["kind"], row["workflow_id"],
