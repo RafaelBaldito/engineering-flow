@@ -182,8 +182,10 @@ def _plan_payload(store: WorkflowStore, workflow: Workflow) -> dict[str, Any]:
         return {"plan": None}
     artifact = artifacts[-1]
     plan = json.loads(store.read_artifact(artifact.id))
+    approval = store.get_approval_for_artifact(artifact.id)
     return {"plan": {"artifact_id": artifact.id, "sha256": artifact.sha256, "revision": artifact.revision,
-                      "approval_state": artifact.approval_state.value, **plan}}
+                      "approval_state": artifact.approval_state.value,
+                      "decision_reason": approval.reason if approval else None, **plan}}
 
 
 def _task_evidence(store: WorkflowStore, artifact_id: str | None, *, kind: str) -> dict[str, Any] | None:
@@ -300,6 +302,10 @@ def _print_result(document: dict[str, Any], json_output: bool) -> None:
         elif document.get("status") == WorkflowStatus.PLAN_APPROVED.value:
             print("Plan approved.")
             print("No implementation has started.")
+        elif document.get("status") == WorkflowStatus.REJECTED.value:
+            print("Plan rejected.")
+            if plan.get("decision_reason"):
+                print("Rejection reason recorded.")
     if document.get("artifacts") is not None:
         for artifact in document["artifacts"]:
             print(f"artifact: {artifact['id']} {artifact['stage']} revision={artifact['revision']} approval={artifact['approval_state']}")
@@ -451,7 +457,11 @@ def _run_command(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
             else:
                 workflow = orchestrator.approve(args.workflow, args.artifact, reason=args.reason)
         elif command == "reject":
-            workflow = orchestrator.reject(args.workflow, args.artifact, reason=args.reason)
+            existing = store.get_workflow(args.workflow)
+            if existing.lifecycle_version is LifecycleVersion.V2:
+                workflow = plan_orchestrator.reject(args.workflow, args.artifact, reason=args.reason)
+            else:
+                workflow = orchestrator.reject(args.workflow, args.artifact, reason=args.reason)
         elif command == "resume":
             existing = store.get_workflow(args.workflow)
             if existing.lifecycle_version is LifecycleVersion.V2:
@@ -473,7 +483,7 @@ def _run_command(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
             raise ValidationFailure(f"unsupported command: {command}")
         code, exit_code = _failure_for_workflow(store, workflow)
         payload = (_workflow_payload(store, workflow)
-                   if command in ("resume", "approve") and workflow.lifecycle_version is LifecycleVersion.V2
+                   if command in ("resume", "approve", "reject") and workflow.lifecycle_version is LifecycleVersion.V2
                    else None)
         return _result_document(command, workflow=workflow, error_code=code, data=payload), exit_code
     finally:

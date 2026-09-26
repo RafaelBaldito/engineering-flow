@@ -225,6 +225,29 @@ class V2PlanOrchestrator:
     def approve(self, workflow_id: str, artifact_id: str, *, actor: str = "human",
                 reason: str | None = None) -> Workflow:
         """Approve exactly the verified current V2 Plan and stop at its gate."""
+        workflow, artifact, plan = self._validate_current_plan_decision(workflow_id, artifact_id)
+        self.store.record_approval(
+            workflow.id, artifact.id, ApprovalDecision.APPROVED, actor=actor, reason=reason,
+            workflow_stage=Stage.PLAN, workflow_status=WorkflowStatus.PLAN_APPROVED,
+            transition_event_type="plan.approved",
+            transition_payload={"plan_id": plan.id, "revision": plan.revision},
+        )
+        return self.store.get_workflow(workflow.id)
+
+    def reject(self, workflow_id: str, artifact_id: str, *, actor: str = "human",
+               reason: str | None = None) -> Workflow:
+        """Reject exactly the verified current V2 Plan and stop at its gate."""
+        workflow, artifact, plan = self._validate_current_plan_decision(workflow_id, artifact_id)
+        self.store.record_approval(
+            workflow.id, artifact.id, ApprovalDecision.REJECTED, actor=actor, reason=reason,
+            workflow_stage=Stage.PLAN, workflow_status=WorkflowStatus.REJECTED,
+            transition_event_type="plan.rejected",
+            transition_payload={"plan_id": plan.id, "revision": plan.revision},
+        )
+        return self.store.get_workflow(workflow.id)
+
+    def _validate_current_plan_decision(self, workflow_id: str, artifact_id: str) -> tuple[Workflow, Any, Plan]:
+        """Verify the immutable Plan boundary shared by both human decisions."""
         workflow = self.store.get_workflow(workflow_id)
         if workflow.lifecycle_version is not LifecycleVersion.V2:
             raise ConflictFailure("workflow is not V2")
@@ -275,13 +298,7 @@ class V2PlanOrchestrator:
             feature_contract_sha256=feature_artifact.sha256,
             repository_path=workflow.repository_path,
         )
-        self.store.record_approval(
-            workflow.id, artifact.id, ApprovalDecision.APPROVED, actor=actor, reason=reason,
-            workflow_stage=Stage.PLAN, workflow_status=WorkflowStatus.PLAN_APPROVED,
-            transition_event_type="plan.approved",
-            transition_payload={"plan_id": plan.id, "revision": plan.revision},
-        )
-        return self.store.get_workflow(workflow.id)
+        return workflow, artifact, plan
 
     @staticmethod
     def _progress(sink: Any, kind: str, elapsed: float) -> None:

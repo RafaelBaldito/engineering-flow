@@ -232,6 +232,36 @@ class CliTests(unittest.TestCase):
         self.assertEqual(store.list_tasks(workflow_id), [])
         store.close()
 
+    def test_v2_reject_routes_to_plan_gate_and_reports_persisted_reason(self):
+        class PlanRuntime(FakeRuntime):
+            def verify_planning_capabilities(self, repository):
+                return CapabilityReport("fake", "fake", str(repository), True, {"read_only": True}, True)
+
+            def execute(self, request):
+                self.requests.append(request)
+                artifact_id, sha256 = re.search(r"artifact UUID ([^,]+), sha256 ([^)]+)", request.instruction).groups()
+                return PlanningExecutionResult("fake", request.logical_session_id or "session", "thread", "turn", TerminalState.SUCCEEDED,
+                    {"plan": {"id": f"{request.workflow_id}:plan:r1", "workflow_id": request.workflow_id, "revision": 1,
+                    "feature_contract": {"artifact_id": artifact_id, "sha256": sha256}, "strategy": "Change source.", "assumptions": [], "verification_strategy": ["tests"], "tasks": [{"id": "T1", "objective": "Change source.", "context": {"relevant_files": ["source.py"], "existing_patterns": []}, "requirements": ["Update behavior."], "acceptance_criteria": ["Works."], "verification": ["tests"], "constraints": [], "depends_on": [], "complexity": "low", "risk": "high"}]}})
+
+        workflow_id = self.ready_v2_workflow()
+        with patch("engineering_flow.cli.CodexCliRuntime", PlanRuntime):
+            self.assertEqual(main(["resume", "--repo", str(self.repository), "--workflow", workflow_id]), 0)
+        store = WorkflowStore(self.repository / ".engineering-flow" / "workflows.sqlite3")
+        plan = store.list_artifacts(workflow_id, Stage.PLAN)[0]
+        store.close()
+        code, output = self.invoke(["reject", "--repo", str(self.repository), "--workflow", workflow_id,
+                                    "--artifact", plan.id, "--reason", "Revise boundaries."])
+        self.assertEqual(code, 0)
+        self.assertIn("Plan rejected.\nRejection reason recorded.", output)
+        code, status = self.invoke(["status", "--repo", str(self.repository), "--workflow", workflow_id, "--json"])
+        self.assertEqual(code, 0)
+        self.assertEqual((status["stage"], status["status"], status["plan"]["approval_state"], status["plan"]["decision_reason"]),
+                         ("plan", "rejected", "rejected", "Revise boundaries."))
+        code, failed = self.invoke(["approve", "--repo", str(self.repository), "--workflow", workflow_id, "--artifact", plan.id])
+        self.assertEqual(code, 4)
+        self.assertIn("error: conflict:", failed)
+
     def test_v2_feature_contract_tampering_is_detected_after_reopen(self):
         class IntakeRuntime(FakeRuntime):
             def execute_planning(self, request):

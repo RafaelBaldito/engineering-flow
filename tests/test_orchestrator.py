@@ -983,6 +983,73 @@ class V2PlanApprovalTests(unittest.TestCase):
         self.assertEqual(len(self.store.list_events(workflow.id)), event_count)
         self.assertEqual(self.store.get_artifact(plan.id).approval_state, ApprovalState.APPROVED)
 
+    def test_reject_persists_stop_survives_reopen_and_blocks_future_decisions(self):
+        workflow, plan, _feature, runtime = self.pending_plan()
+        orchestrator = V2PlanOrchestrator(self.store, runtime)
+        executions_before = len(runtime.requests)
+        rejected = orchestrator.reject(workflow.id, plan.id, reason="Revise task boundaries.")
+
+        self.assertEqual((rejected.stage, rejected.status), (Stage.PLAN, WorkflowStatus.REJECTED))
+        self.assertEqual(self.store.get_artifact(plan.id).approval_state, ApprovalState.REJECTED)
+        approval = self.store.get_approval_for_artifact(plan.id)
+        self.assertEqual((approval.decision, approval.reason), (ApprovalDecision.REJECTED, "Revise task boundaries."))
+        self.assertTrue(any(event.type == "plan.rejected" for event in self.store.list_events(workflow.id)))
+        self.assertEqual(len(self.store.list_artifacts(workflow.id, Stage.PLAN)), 1)
+
+        self.store.close()
+        self.store = WorkflowStore(self.root / ".engineering-flow" / "workflows.sqlite3")
+        reopened = self.store.get_workflow(workflow.id)
+        self.assertEqual((reopened.stage, reopened.status), (Stage.PLAN, WorkflowStatus.REJECTED))
+        self.assertEqual(V2PlanOrchestrator(self.store, runtime).resume(workflow.id).status, WorkflowStatus.REJECTED)
+        self.assertEqual(len(runtime.requests), executions_before)
+        self.assertEqual(len(self.store.list_artifacts(workflow.id, Stage.PLAN)), 1)
+
+        before = self._decision_snapshot(workflow.id, plan.id)
+        with self.assertRaises(ConflictFailure):
+            V2PlanOrchestrator(self.store, runtime).reject(workflow.id, plan.id, reason="again")
+        self.assertEqual(self._decision_snapshot(workflow.id, plan.id), before)
+        with self.assertRaises(ConflictFailure):
+            V2PlanOrchestrator(self.store, runtime).approve(workflow.id, plan.id)
+        self.assertEqual(self._decision_snapshot(workflow.id, plan.id), before)
+
+    def test_rejection_guards_fail_closed_for_wrong_stale_and_tampered_inputs(self):
+        workflow, plan, feature, runtime = self.pending_plan()
+        orchestrator = V2PlanOrchestrator(self.store, runtime)
+        for artifact_id in (feature.id, self.pending_plan()[1].id):
+            before = self._decision_snapshot(workflow.id, plan.id)
+            with self.assertRaises(ConflictFailure):
+                orchestrator.reject(workflow.id, artifact_id, reason="no")
+            self.assertEqual(self._decision_snapshot(workflow.id, plan.id), before)
+
+        Path(plan.path).write_text("tampered", encoding="utf-8")
+        before = self._decision_snapshot(workflow.id, plan.id)
+        with self.assertRaises(ArtifactCorruptionFailure):
+            orchestrator.reject(workflow.id, plan.id, reason="no")
+        self.assertEqual(self._decision_snapshot(workflow.id, plan.id), before)
+
+        original = json.dumps({"plan": {"id": f"{workflow.id}:plan:r1", "workflow_id": workflow.id,
+            "revision": 1, "feature_contract": {"artifact_id": feature.id, "sha256": feature.sha256},
+            "strategy": "Change source.", "assumptions": [], "verification_strategy": ["unit tests"],
+            "tasks": [{"id": "T1", "objective": "Change source.",
+            "context": {"relevant_files": ["source.py"], "existing_patterns": []},
+            "requirements": ["Update behavior."], "acceptance_criteria": ["Works."],
+            "verification": ["tests"], "constraints": [], "depends_on": [], "complexity": "low", "risk": "high"}]}})
+        Path(plan.path).write_text(original, encoding="utf-8")
+        self.store._connection.execute("UPDATE artifacts SET sha256 = ? WHERE id = ?", (hashlib.sha256(original.encode()).hexdigest(), plan.id))
+        self.store._connection.execute("UPDATE workflows SET current_artifact_revision = 2 WHERE id = ?", (workflow.id,))
+        before = self._decision_snapshot(workflow.id, plan.id)
+        with self.assertRaises(ConflictFailure):
+            orchestrator.reject(workflow.id, plan.id, reason="no")
+        self.assertEqual(self._decision_snapshot(workflow.id, plan.id), before)
+
+    def _decision_snapshot(self, workflow_id, artifact_id):
+        workflow = self.store.get_workflow(workflow_id)
+        artifact = self.store.get_artifact(artifact_id)
+        return (workflow.stage, workflow.status, workflow.current_artifact_revision,
+                artifact.approval_state, self.store.get_approval_for_artifact(artifact_id),
+                len(self.store.list_events(workflow_id)),
+                self.store._connection.execute("SELECT COUNT(*) FROM operations WHERE workflow_id = ?", (workflow_id,)).fetchone()[0])
+
 
 if __name__ == "__main__":
     unittest.main()
