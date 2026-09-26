@@ -75,6 +75,28 @@ class CliTests(unittest.TestCase):
             self.assertEqual(code, 0)
             self.assertTrue(all(event["sequence"] > 1 for event in logs["events"]))
 
+    def test_run_input_modes_are_mutually_exclusive_and_required(self):
+        for argv in (
+            ["run", "--repo", str(self.repository), "--request", "inline", "--feature-file", str(self.feature)],
+            ["run", "--repo", str(self.repository)],
+        ):
+            self.assertEqual(main(argv), 2)
+
+    def test_explicit_repo_and_feature_file_keep_the_v1_prd_route(self):
+        with patch("engineering_flow.cli.CodexCliRuntime", FakeRuntime):
+            code, text = self.invoke([
+                "run", "--repo", str(self.repository), "--feature-file", str(self.feature),
+            ])
+        self.assertEqual(code, 0)
+        workflow_id = next(line.split(": ", 1)[1] for line in text.splitlines() if line.startswith("workflow:"))
+        status_code, status = self.invoke([
+            "status", "--repo", str(self.repository), "--workflow", workflow_id, "--json",
+        ])
+        self.assertEqual(status_code, 0)
+        self.assertEqual((status["repository_path"], status["lifecycle_version"], status["stage"]),
+                         (str(self.repository.resolve()), "historical", "prd"))
+        self.assertNotIn("intake", status)
+
     def test_inline_request_persists_ready_intake_and_status_reopens_it(self):
         class IntakeRuntime(FakeRuntime):
             def execute_planning(self, request):
@@ -103,6 +125,46 @@ class CliTests(unittest.TestCase):
         self.assertEqual(len(status["artifacts"]), 1)
         self.assertEqual(status["artifacts"][0]["approval_state"], "not_required")
         self.assertEqual(status["tasks"], [])
+        self.assertEqual([artifact["stage"] for artifact in status["artifacts"]], ["intake"])
+        code, logs = self.invoke(["logs", "--repo", str(self.repository), "--workflow", workflow_id, "--json"])
+        self.assertEqual(code, 0)
+        self.assertEqual(logs["lifecycle_version"], "v2")
+        self.assertEqual(logs["intake"]["outcome"], "READY")
+        self.assertTrue(any(event["type"] == "intake.completed" for event in logs["events"]))
+
+    def test_v2_feature_contract_tampering_is_detected_after_reopen(self):
+        class IntakeRuntime(FakeRuntime):
+            def execute_planning(self, request):
+                return PlanningExecutionResult(
+                    "codex-cli", request.logical_session_id or "session", "thread", request.execution_id,
+                    TerminalState.SUCCEEDED, {"outcome": "READY", "feature": {
+                        "id": request.workflow_id, "goal": "Cancel pending orders.",
+                        "requirements": ["Only PENDING orders may be cancelled."],
+                        "acceptance_criteria": ["A pending order can be cancelled."],
+                        "constraints": [], "out_of_scope": [], "assumptions": [], "open_questions": [],
+                    }},
+                )
+
+        with patch("engineering_flow.cli.CodexCliRuntime", IntakeRuntime):
+            _, text = self.invoke(["run", "--repo", str(self.repository), "--request", "Cancel pending orders."])
+        workflow_id = next(line.split(": ", 1)[1] for line in text.splitlines() if line.startswith("workflow:"))
+        store = WorkflowStore(self.repository / ".engineering-flow" / "workflows.sqlite3")
+        artifact = store.list_artifacts(workflow_id, Stage.INTAKE)[0]
+        Path(artifact.path).write_text("tampered", encoding="utf-8")
+        store.close()
+        code, result = self.invoke(["status", "--repo", str(self.repository), "--workflow", workflow_id, "--json"])
+        self.assertEqual((code, result["error_code"]), (7, "persistence"))
+
+    def test_status_projection_uses_persisted_lifecycle_version(self):
+        store = WorkflowStore(self.repository / ".engineering-flow" / "workflows.sqlite3")
+        workflow = store.create_workflow(self.repository)
+        store._connection.execute("UPDATE workflows SET lifecycle_version = ? WHERE id = ?", ("v2", workflow.id))
+        store.close()
+
+        code, status = self.invoke(["status", "--repo", str(self.repository), "--workflow", workflow.id, "--json"])
+        self.assertEqual(code, 0)
+        self.assertEqual(status["lifecycle_version"], "v2")
+        self.assertIn("intake", status)
 
     def test_inline_request_displays_and_reopens_needs_clarification(self):
         class ClarifyingRuntime(FakeRuntime):

@@ -45,6 +45,30 @@ class StoreTests(unittest.TestCase):
         }
         self.assertTrue({"workflows", "artifacts", "approvals", "sessions", "executions", "operations", "events"} <= names)
 
+    def test_opening_pre_lifecycle_database_backfills_historical_default(self):
+        legacy_path = Path(self.temp_dir.name) / "legacy.sqlite3"
+        connection = sqlite3.connect(legacy_path)
+        connection.execute("""CREATE TABLE workflows (
+            id TEXT PRIMARY KEY, repository_path TEXT NOT NULL, provider TEXT NOT NULL,
+            stage TEXT NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL, configuration_snapshot TEXT NOT NULL,
+            current_artifact_revision INTEGER, feature_input_path TEXT,
+            feature_input_sha256 TEXT
+        )""")
+        connection.execute(
+            "INSERT INTO workflows VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ("legacy-workflow", "/repo", "fake", "prd", "awaiting_approval", "then", "then", "{}", None, None, None),
+        )
+        connection.commit()
+        connection.close()
+
+        legacy_store = WorkflowStore(legacy_path)
+        self.addCleanup(legacy_store.close)
+        self.assertEqual(legacy_store.get_workflow("legacy-workflow").lifecycle_version,
+                         LifecycleVersion.HISTORICAL)
+        columns = {row["name"] for row in legacy_store._connection.execute("PRAGMA table_info(workflows)")}
+        self.assertIn("lifecycle_version", columns)
+
     def test_generation_intent_and_approval_replay_are_idempotent(self):
         workflow = self.store.create_workflow("/repo", configuration_snapshot={"secret": "TOP-SECRET"})
         first = self.store.create_generation_intent(workflow.id, Stage.PRD, request_hash="request-hash")
