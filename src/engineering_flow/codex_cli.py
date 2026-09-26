@@ -865,6 +865,21 @@ class CodexCliRuntime(AgentRuntime):
             timed_out, stderr_text = self._stream_process(
                 process, request.timeout_seconds, state, events, request
             )
+        except KeyboardInterrupt:
+            # The process belongs to this invocation.  Stop it before allowing
+            # orchestration to persist an unknown outcome and the CLI to exit.
+            try:
+                process.terminate()
+            except (AttributeError, OSError):
+                pass
+            try:
+                process.communicate(timeout=0.5)
+            except (AttributeError, OSError, subprocess.TimeoutExpired):
+                try:
+                    process.kill()
+                except (AttributeError, OSError):
+                    pass
+            raise
         except subprocess.TimeoutExpired as exc:
             timed_out = True
             try:

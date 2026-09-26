@@ -128,6 +128,16 @@ class IntakeOrchestrator:
             # Keep the public compatibility entry point: it delegates to the
             # generalized runtime contract and carries the same transient sink.
             result = self.runtime.execute_planning(runtime_request)
+        except KeyboardInterrupt:
+            # Cancellation cannot establish whether the provider completed.
+            # Preserve that uncertainty durably; the CLI will report exit 130.
+            self.store.mark_operation_unknown(intent.operation.idempotency_key, detail="interrupted by user")
+            self.store.set_workflow_state(workflow.id, stage=Stage.INTAKE,
+                                          status=WorkflowStatus.HUMAN_ATTENTION,
+                                          event_type="workflow.human_attention",
+                                          payload={"reason": "provider operation interrupted"})
+            _emit_progress(progress_sink, Stage.INTAKE, "interrupted", self._monotonic() - started)
+            raise
         except Exception as exc:
             self.store.mark_operation_unknown(intent.operation.idempotency_key, detail=str(exc))
             result_workflow = self.store.set_workflow_state(workflow.id, stage=Stage.INTAKE, status=WorkflowStatus.HUMAN_ATTENTION, event_type="workflow.human_attention", payload={"reason": "provider operation outcome is unknown"})
@@ -221,6 +231,16 @@ class V2PlanOrchestrator:
         request = RuntimeExecutionRequest(workflow_id=workflow.id, execution_id=intent.execution.id, logical_session_id=intent.execution.session_id, role=Role.PLANNER, stage=Stage.PLAN, repository_path=workflow.repository_path, authoritative_input_paths=(feature_artifact.path,), authoritative_input_hashes=(feature_artifact.sha256,), instruction=instruction, output_schema_path=str(root / "plan.schema.json"), final_output_path=str(root / "final-output.json"), timeout_seconds=self.timeout_seconds, required_capabilities=("read_only",), progress_sink=progress_sink)
         try:
             result = self.runtime.execute(request)
+        except KeyboardInterrupt:
+            # A cancelled provider invocation has an unknowable remote outcome.
+            # Do not retry, fabricate a Plan, or leave a running intent behind.
+            self.store.mark_operation_unknown(intent.operation.idempotency_key, detail="interrupted by user")
+            self.store.set_workflow_state(workflow.id, stage=Stage.PLAN,
+                                          status=WorkflowStatus.HUMAN_ATTENTION,
+                                          event_type="workflow.human_attention",
+                                          payload={"reason": "provider operation interrupted"})
+            _emit_progress(progress_sink, Stage.PLAN, "interrupted", self._monotonic() - started)
+            raise
         except Exception as exc:
             self.store.mark_operation_unknown(intent.operation.idempotency_key, detail=str(exc))
             result_workflow = self.store.set_workflow_state(workflow.id, stage=Stage.PLAN, status=WorkflowStatus.HUMAN_ATTENTION, event_type="workflow.human_attention", payload={"reason": "provider operation outcome is unknown"})

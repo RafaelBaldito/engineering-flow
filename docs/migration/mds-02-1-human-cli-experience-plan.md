@@ -779,3 +779,21 @@ engineering-flow intervene --workflow <uuid> --task <uuid> --reason "..."
 ```
 
 The visible interface becomes intent-oriented while the existing workflow UUIDs, artifact UUIDs, immutable JSON, SHA verification, source binding, revision checks, persistence, and recovery controls remain fully intact.
+
+## Closure
+
+Implemented:
+
+- presentation modes and workflow-wide progress;
+- deterministic, derived Plan Markdown projection;
+- persisted selected-workflow context and current pending Plan resolution;
+- one-command V2 Intake-to-Plan human decision boundary;
+- recovery and compatibility hardening, including interrupted provider calls.
+
+Validation:
+
+- 166 unit tests pass.
+
+Known follow-up:
+
+- Repeated live smoke tests observed Planner output violating contiguous Task ID validation. Validation intentionally remains fail-closed. Planner structured-output/prompt reliability should be investigated separately before MDS #3.

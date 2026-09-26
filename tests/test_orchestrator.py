@@ -150,6 +150,33 @@ class OrchestratorTests(unittest.TestCase):
         ])
         self.assertAlmostEqual(observed[-1].elapsed_seconds, 3.4)
 
+    def test_interrupted_intake_preserves_unknown_operation_without_artifact(self):
+        class InterruptingRuntime(FakeRuntime):
+            def execute_planning(runtime_self, request):
+                runtime_self.requests.append(request)
+                raise KeyboardInterrupt
+
+        observed = []
+        with self.assertRaises(KeyboardInterrupt):
+            IntakeOrchestrator(self.store, InterruptingRuntime()).run(
+                self.root, "Interrupt this request.", progress_sink=observed.append,
+            )
+        workflow_id = self.store.get_selected_workflow_id()
+        self.assertIsNotNone(workflow_id)
+        workflow = self.store.get_workflow(workflow_id)
+        self.assertEqual((workflow.stage, workflow.status),
+                         (Stage.INTAKE, WorkflowStatus.HUMAN_ATTENTION))
+        self.assertEqual(self.store.list_artifacts(workflow.id), [])
+        self.assertEqual(self.store.reconcile_operations(workflow.id), [])
+        execution = self.store.get_latest_execution(workflow.id)
+        self.assertEqual(execution.lifecycle.value, "unknown")
+        self.assertEqual([event.kind for event in observed], ["started", "interrupted"])
+        self.store.close()
+        self.store = WorkflowStore(self.root / ".engineering-flow" / "workflows.sqlite3")
+        resumed = V2PlanOrchestrator(self.store, InterruptingRuntime()).resume(workflow.id)
+        self.assertEqual((resumed.stage, resumed.status),
+                         (Stage.INTAKE, WorkflowStatus.HUMAN_ATTENTION))
+
 
     def test_required_workflow_is_sequential_and_context_is_scoped(self):
         feature = "Build a durable planning control plane.\n"

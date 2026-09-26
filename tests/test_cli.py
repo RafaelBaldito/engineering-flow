@@ -159,6 +159,29 @@ class CliTests(unittest.TestCase):
         self.assertEqual(logs["intake"]["outcome"], "READY")
         self.assertTrue(any(event["type"] == "intake.completed" for event in logs["events"]))
 
+    def test_keyboard_interrupt_is_traceback_free_and_preserves_v2_recovery_state(self):
+        class InterruptingRuntime(FakeRuntime):
+            def verify_planning_capabilities(self, repository):
+                return CapabilityReport("fake", "fake", str(repository), True, {"read_only": True}, True)
+
+            def execute_planning(self, request):
+                raise KeyboardInterrupt
+
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with patch("engineering_flow.cli.CodexCliRuntime", InterruptingRuntime), \
+                contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            code = main(["run", "--repo", str(self.repository), "--request", "Interrupt safely."])
+        self.assertEqual(code, 130)
+        self.assertNotIn("Traceback", stdout.getvalue() + stderr.getvalue())
+        self.assertIn("interrupted", stdout.getvalue())
+        store = WorkflowStore(self.repository / ".engineering-flow" / "workflows.sqlite3")
+        workflow_id = store.get_selected_workflow_id()
+        workflow = store.get_workflow(workflow_id)
+        self.assertEqual((workflow.stage, workflow.status),
+                         (Stage.INTAKE, WorkflowStatus.HUMAN_ATTENTION))
+        self.assertEqual(store.list_artifacts(workflow.id), [])
+        store.close()
+
     def test_interactive_run_approves_the_displayed_plan_without_starting_tasks(self):
         class Runtime(FakeRuntime):
             def execute_planning(self, request):

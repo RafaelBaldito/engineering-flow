@@ -369,6 +369,15 @@ class ProgressRenderer:
             self._live.stop()
             self._live = None
 
+    def close(self) -> None:
+        """Restore a live terminal after an external cancellation."""
+
+        try:
+            self._stop_live()
+        except Exception:
+            # Presentation cleanup must never mask the original interruption.
+            pass
+
     def __call__(self, event: Any) -> None:
         try:
             kind = getattr(event, "kind", None)

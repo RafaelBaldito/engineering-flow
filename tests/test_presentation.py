@@ -120,6 +120,24 @@ class PresentationTests(unittest.TestCase):
         self.assertIn("INTAKE failed", output.getvalue())
         self.assertNotIn("provider prose", output.getvalue())
 
+    def test_tty_progress_close_restores_live_renderer_after_interruption(self):
+        output = Tty()
+        instances = []
+
+        class FakeLive:
+            def __init__(self, *args, **kwargs):
+                self.stopped = False
+                instances.append(self)
+            def start(self): pass
+            def update(self, *args, **kwargs): pass
+            def stop(self): self.stopped = True
+
+        progress = ProgressRenderer(output, no_color=True, live_factory=FakeLive)
+        progress(RuntimeProgressEvent("started", Stage.PLAN, 0.0))
+        progress.close()
+        self.assertEqual(len(instances), 1)
+        self.assertTrue(instances[0].stopped)
+
     def test_stage_neutral_progress_uses_bounded_non_tty_lifecycle_lines(self):
         output = io.StringIO()
         progress = create_progress_renderer(output, environ={"TERM": "xterm-256color"})

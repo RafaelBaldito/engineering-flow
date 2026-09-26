@@ -49,6 +49,7 @@ EXIT_PROVIDER = 5
 EXIT_AUTHENTICATION = 6
 EXIT_PERSISTENCE = 7
 EXIT_HUMAN_ATTENTION = 8
+EXIT_INTERRUPTED = 130
 
 ERROR_CODES = {
     "usage": "usage",
@@ -594,6 +595,15 @@ def main(argv: list[str] | None = None) -> int:
     try:
         args = parser.parse_args(raw_argv)
         document, exit_code = _run_command(args)
+    except KeyboardInterrupt:
+        # Orchestrators have already durably marked an in-flight provider call
+        # unknown.  Prompt cancellation has no authority transition at all.
+        document = _result_document(
+            getattr(locals().get("args", None), "command", _requested_command(raw_argv)),
+            error_code="human_attention",
+            message="interrupted; persisted workflow state remains available via status or resume",
+        )
+        exit_code = EXIT_INTERRUPTED
     except _ParserUsageError as exc:
         if not _requested_json_output(raw_argv):
             parser.print_usage(sys.stderr)
