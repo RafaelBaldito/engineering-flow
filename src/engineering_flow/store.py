@@ -20,6 +20,7 @@ from .domain import (
     Approval,
     ApprovalDecision,
     ApprovalState,
+    ApprovedV2PlanAuthority,
     Artifact,
     ArtifactCorruptionFailure,
     ConflictFailure,
@@ -57,6 +58,11 @@ from .domain import (
     TaskDefinition,
     TaskOperationIntent,
     TaskStatus,
+    TaskImplementationState,
+    TaskImplementationStatus,
+    FeatureContract,
+    IntakeOutcome,
+    Plan,
     WorkKind,
     ValidationFailure,
     Workflow,
@@ -303,6 +309,18 @@ class WorkflowStore:
             completed_at TEXT,
             UNIQUE(workflow_id, sequence)
         );
+        CREATE TABLE IF NOT EXISTS task_implementation_states (
+            id TEXT PRIMARY KEY,
+            workflow_id TEXT NOT NULL REFERENCES workflows(id),
+            plan_artifact_id TEXT NOT NULL REFERENCES artifacts(id),
+            plan_sha256 TEXT NOT NULL CHECK(length(plan_sha256) = 64),
+            task_contract_id TEXT NOT NULL,
+            task_contract_sha256 TEXT NOT NULL CHECK(length(task_contract_sha256) = 64),
+            status TEXT NOT NULL CHECK(status IN ('pending', 'implementing', 'implementation_completed', 'implementation_failed', 'implementation_unknown', 'verified')),
+            selected_at TEXT,
+            updated_at TEXT NOT NULL,
+            UNIQUE(workflow_id, plan_artifact_id, task_contract_id)
+        );
         CREATE TABLE IF NOT EXISTS operations (
             id TEXT PRIMARY KEY,
             idempotency_key TEXT NOT NULL UNIQUE,
@@ -471,6 +489,8 @@ class WorkflowStore:
             ON artifacts(workflow_id, stage, revision);
         CREATE INDEX IF NOT EXISTS idx_clarifications_workflow ON clarifications(workflow_id, sequence);
         CREATE INDEX IF NOT EXISTS idx_plan_change_requests_workflow ON plan_change_requests(workflow_id, sequence);
+        CREATE INDEX IF NOT EXISTS idx_task_implementation_states_plan
+            ON task_implementation_states(workflow_id, plan_artifact_id, task_contract_id);
         CREATE INDEX IF NOT EXISTS idx_tasks_workflow_ordinal
             ON tasks(workflow_id, ordinal);
         CREATE INDEX IF NOT EXISTS idx_task_cycles_task
@@ -948,6 +968,120 @@ class WorkflowStore:
         if len(rows) > 1:
             raise PersistenceFailure("workflow has multiple open Plan change requests")
         return self._plan_change_request_from_row(rows[0]) if rows else None
+
+    def load_approved_v2_plan_authority(self, workflow_id: str) -> ApprovedV2PlanAuthority:
+        """Load the exact, currently approved V2 authority for task selection.
+
+        This is intentionally a read-only projection: task definitions remain
+        in the immutable Plan artifact and no caller-provided hash is trusted.
+        """
+        workflow = self.get_workflow(workflow_id)
+        if (workflow.lifecycle_version is not LifecycleVersion.V2
+                or workflow.stage is not Stage.PLAN
+                or workflow.status is not WorkflowStatus.PLAN_APPROVED):
+            raise ConflictFailure("workflow is not at V2 PLAN_APPROVED authority")
+        plans = self.list_artifacts(workflow.id, Stage.PLAN)
+        if not plans:
+            raise ValidationFailure("approved Plan artifact is required")
+        highest_revision = max(item.revision for item in plans)
+        current = [item for item in plans if item.revision == highest_revision]
+        if len(current) != 1:
+            raise PersistenceFailure("workflow has ambiguous current Plan authority")
+        plan_artifact = current[0]
+        if plan_artifact.approval_state is not ApprovalState.APPROVED:
+            raise ConflictFailure("current Plan artifact is not approved")
+        approval = self.get_approval_for_artifact(plan_artifact.id)
+        if (approval is None or approval.workflow_id != workflow.id
+                or approval.artifact_id != plan_artifact.id
+                or approval.decision is not ApprovalDecision.APPROVED):
+            raise PersistenceFailure("current Plan approval is missing or invalid")
+        if self.get_open_plan_change_request(workflow.id) is not None:
+            raise ConflictFailure("Plan authority has an unresolved change request")
+
+        features = self.list_artifacts(workflow.id, Stage.INTAKE)
+        if not features:
+            raise ValidationFailure("READY Feature Contract artifact is required")
+        feature_artifact = features[-1]
+        if feature_artifact.approval_state is not ApprovalState.NOT_REQUIRED:
+            raise ValidationFailure("current Feature Contract is not an Intake authority")
+        try:
+            feature_payload = json.loads(self.read_artifact(feature_artifact.id))
+        except json.JSONDecodeError as exc:
+            raise ValidationFailure("Feature Contract artifact is not valid JSON") from exc
+        feature = FeatureContract.parse(feature_payload, workflow_id=workflow.id)
+        if feature.outcome is not IntakeOutcome.READY or not feature.requirements or not feature.acceptance_criteria or feature.open_questions:
+            raise ValidationFailure("current Feature Contract is not READY")
+        try:
+            plan_payload = json.loads(self.read_artifact(plan_artifact.id))
+        except json.JSONDecodeError as exc:
+            raise ValidationFailure("Plan artifact is not valid JSON") from exc
+        plan = Plan.parse(plan_payload, workflow_id=workflow.id, revision=plan_artifact.revision,
+                          feature_contract_artifact_id=feature_artifact.id,
+                          feature_contract_sha256=feature_artifact.sha256,
+                          repository_path=workflow.repository_path)
+        return ApprovedV2PlanAuthority(workflow, feature_artifact, feature,
+                                       plan_artifact, plan, approval)
+
+    def list_task_implementation_states(
+        self, workflow_id: str, plan_artifact_id: str
+    ) -> list[TaskImplementationState]:
+        rows = self._connection.execute(
+            """SELECT * FROM task_implementation_states
+               WHERE workflow_id = ? AND plan_artifact_id = ? ORDER BY task_contract_id""",
+            (workflow_id, plan_artifact_id),
+        ).fetchall()
+        return [self._task_implementation_state_from_row(row) for row in rows]
+
+    def put_task_implementation_state(
+        self, workflow_id: str, plan_artifact_id: str, plan_sha256: str,
+        task_contract_id: str, task_contract_sha256: str,
+        status: TaskImplementationStatus | str, *, selected_at: str | None = None,
+    ) -> TaskImplementationState:
+        """Persist an operational state only (used by later lifecycle slices/tests)."""
+        status = self._require_enum(status, TaskImplementationStatus)
+        self._require_sha256(plan_sha256, "plan_sha256")
+        self._require_sha256(task_contract_sha256, "task_contract_sha256")
+        if not task_contract_id:
+            raise ValidationFailure("task_contract_id is required")
+        with self._transaction() as conn:
+            workflow = conn.execute(
+                "SELECT lifecycle_version FROM workflows WHERE id = ?", (workflow_id,)
+            ).fetchone()
+            if workflow is None or workflow["lifecycle_version"] != LifecycleVersion.V2.value:
+                raise ConflictFailure("task implementation states are V2-only")
+            artifact = conn.execute(
+                "SELECT * FROM artifacts WHERE id = ? AND workflow_id = ?",
+                (plan_artifact_id, workflow_id),
+            ).fetchone()
+            if artifact is None or artifact["stage"] != Stage.PLAN.value:
+                raise ValidationFailure("task implementation state requires a workflow Plan artifact")
+            if artifact["sha256"] != plan_sha256:
+                raise ValidationFailure("task implementation state Plan hash does not match artifact")
+            now = _now()
+            existing = conn.execute(
+                """SELECT * FROM task_implementation_states WHERE workflow_id = ?
+                   AND plan_artifact_id = ? AND task_contract_id = ?""",
+                (workflow_id, plan_artifact_id, task_contract_id),
+            ).fetchone()
+            if existing is None:
+                state_id = str(uuid.uuid4())
+                conn.execute(
+                    """INSERT INTO task_implementation_states
+                    (id, workflow_id, plan_artifact_id, plan_sha256, task_contract_id,
+                     task_contract_sha256, status, selected_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (state_id, workflow_id, plan_artifact_id, plan_sha256, task_contract_id,
+                     task_contract_sha256, status.value, selected_at, now),
+                )
+            else:
+                state_id = existing["id"]
+                conn.execute(
+                    """UPDATE task_implementation_states SET plan_sha256 = ?,
+                       task_contract_sha256 = ?, status = ?, selected_at = ?, updated_at = ? WHERE id = ?""",
+                    (plan_sha256, task_contract_sha256, status.value, selected_at, now, state_id),
+                )
+            row = conn.execute("SELECT * FROM task_implementation_states WHERE id = ?", (state_id,)).fetchone()
+        return self._task_implementation_state_from_row(row)
 
     def request_plan_changes(self, workflow_id: str, target_plan_artifact_id: str, feedback: str, *, actor: str = "human") -> PlanChangeRequest:
         if not isinstance(feedback, str) or not feedback.strip():
@@ -2914,6 +3048,13 @@ class WorkflowStore:
     def _artifact_from_row(self, row: sqlite3.Row) -> Artifact:
         return Artifact(row["id"], row["workflow_id"], Stage(row["stage"]), row["revision"], row["path"],
                         row["sha256"], row["source_execution_id"], ApprovalState(row["approval_state"]), row["created_at"])
+
+    def _task_implementation_state_from_row(self, row: sqlite3.Row) -> TaskImplementationState:
+        return TaskImplementationState(
+            row["id"], row["workflow_id"], row["plan_artifact_id"], row["plan_sha256"],
+            row["task_contract_id"], row["task_contract_sha256"],
+            TaskImplementationStatus(row["status"]), row["selected_at"], row["updated_at"],
+        )
 
     def _scope_from_row(self, row: sqlite3.Row) -> WorkflowScope:
         return WorkflowScope(row["id"], row["workflow_id"], ScopeKind(row["kind"]), row["external_key"], row["parent_scope_id"], row["created_at"])

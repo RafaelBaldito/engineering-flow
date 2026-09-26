@@ -214,6 +214,20 @@ def _plan_payload(store: WorkflowStore, workflow: Workflow, *, projection: Any =
         return {"plan": None}
     artifact = artifacts[-1]
     plan = json.loads(store.read_artifact(artifact.id))
+    if workflow.status is WorkflowStatus.PLAN_APPROVED:
+        # The authoritative selection projection remains read-only.  Absent
+        # operational rows deliberately render as pending.
+        authority = store.load_approved_v2_plan_authority(workflow.id)
+        states = {
+            state.task_contract_id: state.status.value
+            for state in store.list_task_implementation_states(workflow.id, authority.plan_artifact.id)
+        }
+        raw_plan = plan.get("plan") if isinstance(plan, dict) else None
+        raw_tasks = raw_plan.get("tasks") if isinstance(raw_plan, dict) else None
+        if isinstance(raw_tasks, list):
+            for task in raw_tasks:
+                if isinstance(task, dict) and isinstance(task.get("id"), str):
+                    task["implementation_status"] = states.get(task["id"], "pending")
     approval = store.get_approval_for_artifact(artifact.id)
     projection_data: dict[str, Any] = {}
     if projection is not None:

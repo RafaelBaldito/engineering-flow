@@ -159,6 +159,8 @@ def render_plan_summary(console: Console, document: Mapping[str, Any], plan: Map
                 if index:
                     console.print()
                 render_task_summary(console, task)
+                if task.get("implementation_status"):
+                    console.print(Text(f"      implementation: {task['implementation_status']}"))
 
     status = document.get("status")
     console.print()

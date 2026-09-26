@@ -33,6 +33,9 @@ from .domain import (
     FeatureContract,
     IntakeOutcome,
     Plan,
+    TaskSelection,
+    TaskImplementationStatus,
+    select_executable_task,
 )
 from .runtime import (
     AgentRuntime,
@@ -69,6 +72,41 @@ _RETRIABLE_FAILURES = frozenset({
     FailureClassification.AGENT_EXECUTION,
     FailureClassification.TOOL,
 })
+
+
+class ImplementationSelectionOrchestrator:
+    """Read-only Slice 1 boundary from approved authority to one candidate.
+
+    It intentionally has no runtime dependency: no provider call, attempt,
+    lease, repository inspection, or workflow transition is possible here.
+    """
+
+    def __init__(self, store: WorkflowStore) -> None:
+        self.store = store
+
+    def select_once(self, workflow_id: str) -> TaskSelection:
+        authority = self.store.load_approved_v2_plan_authority(workflow_id)
+        states = self.store.list_task_implementation_states(
+            authority.workflow.id, authority.plan_artifact.id
+        )
+        state_by_task: dict[str, TaskImplementationStatus] = {}
+        task_by_id = {task.id: task for task in authority.plan.tasks}
+        for state in states:
+            if state.task_contract_id in state_by_task:
+                raise PersistenceFailure("duplicate operational task state")
+            if (state.workflow_id != authority.workflow.id
+                    or state.plan_artifact_id != authority.plan_artifact.id
+                    or state.plan_sha256 != authority.plan_artifact.sha256):
+                raise PersistenceFailure("operational task state authority binding is invalid")
+            task = task_by_id.get(state.task_contract_id)
+            if task is None:
+                raise ValidationFailure("operational state refers to a missing Task Contract")
+            if state.task_contract_sha256 != task.payload_sha256():
+                raise PersistenceFailure("operational task state payload hash does not match Plan")
+            state_by_task[task.id] = state.status
+        # Slice 1 has no implementation_attempts table, hence no retry-safe
+        # evidence can be supplied and IMPLEMENTATION_FAILED stays blocked.
+        return select_executable_task(authority.plan, state_by_task)
 
 
 class IntakeOrchestrator:

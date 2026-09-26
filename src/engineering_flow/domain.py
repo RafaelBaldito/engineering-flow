@@ -5,6 +5,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Mapping
+import hashlib
+import json
+import re
 from pathlib import Path, PurePosixPath
 
 
@@ -129,6 +132,23 @@ class TaskStatus(_ValueEnum):
     ACCEPTED = "accepted"
     COMPLETED = "accepted"
     HUMAN_ATTENTION = "human_attention"
+
+
+class TaskImplementationStatus(_ValueEnum):
+    """V2 operational state; this is deliberately separate from V1 tasks."""
+
+    PENDING = "pending"
+    IMPLEMENTING = "implementing"
+    IMPLEMENTATION_COMPLETED = "implementation_completed"
+    IMPLEMENTATION_FAILED = "implementation_failed"
+    IMPLEMENTATION_UNKNOWN = "implementation_unknown"
+    VERIFIED = "verified"
+
+
+class TaskSelectionOutcome(_ValueEnum):
+    SELECTED = "selected"
+    AWAITING_VERIFICATION = "awaiting_verification"
+    NO_EXECUTABLE_TASK = "no_executable_task"
 
 
 class TaskArtifactType(_ValueEnum):
@@ -421,6 +441,111 @@ class TaskContract:
     def as_payload(self) -> dict[str, Any]:
         return {"id": self.id, "objective": self.objective, "context": {"relevant_files": list(self.relevant_files), "existing_patterns": list(self.existing_patterns)}, "requirements": list(self.requirements), "acceptance_criteria": list(self.acceptance_criteria), "verification": list(self.verification), "constraints": list(self.constraints), "depends_on": list(self.depends_on), "complexity": self.complexity, "risk": self.risk}
 
+    def payload_sha256(self) -> str:
+        """Hash the exact canonical Task Contract representation."""
+        encoded = json.dumps(
+            self.as_payload(), sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+
+@dataclass(frozen=True, slots=True)
+class TaskImplementationState:
+    """Operational identity/state only; never a copied Task Contract."""
+
+    id: str
+    workflow_id: str
+    plan_artifact_id: str
+    plan_sha256: str
+    task_contract_id: str
+    task_contract_sha256: str
+    status: TaskImplementationStatus
+    selected_at: str | None
+    updated_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class TaskSelection:
+    outcome: TaskSelectionOutcome
+    task: TaskContract | None = None
+
+
+def task_id_number(task_id: str) -> int:
+    """Return the contractual numeric ordering component of ``T<N>``."""
+    match = re.fullmatch(r"T([1-9][0-9]*)", task_id)
+    if match is None:
+        raise ValidationFailure("Task Contract ID must be T<N>")
+    return int(match.group(1))
+
+
+def select_executable_task(
+    plan: "Plan", states: Mapping[str, TaskImplementationStatus], *,
+    retry_safe_failed_task_ids: frozenset[str] = frozenset(),
+) -> TaskSelection:
+    """Pure deterministic V2 task selection.
+
+    Slice 1 has no attempt evidence, so callers leave ``retry_safe_failed_task_ids``
+    empty and failed tasks cannot be selected.
+    """
+    tasks = tuple(plan.tasks)
+    by_id: dict[str, TaskContract] = {}
+    for task in tasks:
+        number = task_id_number(task.id)
+        if task.id in by_id or task.id != f"T{number}":
+            raise ValidationFailure("Plan has duplicate or invalid Task Contract IDs")
+        by_id[task.id] = task
+    if {task_id_number(task_id) for task_id in by_id} != set(range(1, len(by_id) + 1)):
+        raise ValidationFailure("Plan Task Contract IDs must be contiguous")
+    if set(states) - set(by_id):
+        raise ValidationFailure("operational state refers to a missing Task Contract")
+    for task in tasks:
+        if (len(set(task.depends_on)) != len(task.depends_on)
+                or any(dep not in by_id or task_id_number(dep) >= task_id_number(task.id)
+                       for dep in task.depends_on)):
+            raise ValidationFailure("Plan has an invalid Task Contract dependency")
+    try:
+        states = {task_id: TaskImplementationStatus(status) for task_id, status in states.items()}
+    except (TypeError, ValueError) as exc:
+        raise ValidationFailure("Plan has an invalid operational Task Contract state") from exc
+
+    visiting: set[str] = set()
+    visited: set[str] = set()
+    def visit(task_id: str) -> None:
+        if task_id in visiting:
+            raise ValidationFailure("Plan Task Contract graph contains a cycle")
+        if task_id in visited:
+            return
+        visiting.add(task_id)
+        for dependency in by_id[task_id].depends_on:
+            visit(dependency)
+        visiting.remove(task_id)
+        visited.add(task_id)
+    for task_id in sorted(by_id, key=task_id_number):
+        visit(task_id)
+
+    def status(task_id: str) -> TaskImplementationStatus:
+        return states.get(task_id, TaskImplementationStatus.PENDING)
+    candidates = [
+        task for task in tasks
+        if status(task.id) is TaskImplementationStatus.PENDING
+        or (status(task.id) is TaskImplementationStatus.IMPLEMENTATION_FAILED
+            and task.id in retry_safe_failed_task_ids)
+    ]
+    executable = [
+        task for task in candidates
+        if all(status(dependency) is TaskImplementationStatus.VERIFIED for dependency in task.depends_on)
+    ]
+    if executable:
+        return TaskSelection(TaskSelectionOutcome.SELECTED, min(executable, key=lambda task: task_id_number(task.id)))
+    dependency_blocked = any(
+        task in candidates and any(status(dep) is not TaskImplementationStatus.VERIFIED for dep in task.depends_on)
+        for task in tasks
+    )
+    if (any(status(task.id) is TaskImplementationStatus.IMPLEMENTATION_COMPLETED for task in tasks)
+            and (dependency_blocked or all(status(task.id) is TaskImplementationStatus.IMPLEMENTATION_COMPLETED for task in tasks))):
+        return TaskSelection(TaskSelectionOutcome.AWAITING_VERIFICATION)
+    return TaskSelection(TaskSelectionOutcome.NO_EXECUTABLE_TASK)
+
 
 @dataclass(frozen=True, slots=True)
 class Plan:
@@ -610,6 +735,18 @@ class Approval:
     actor: str
     reason: str | None
     created_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class ApprovedV2PlanAuthority:
+    """The minimum immutable authority required for V2 task selection."""
+
+    workflow: Workflow
+    feature_contract_artifact: Artifact
+    feature_contract: FeatureContract
+    plan_artifact: Artifact
+    plan: Plan
+    approval: Approval
 
 
 @dataclass(frozen=True, slots=True)
