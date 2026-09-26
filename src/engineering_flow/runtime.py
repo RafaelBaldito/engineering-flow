@@ -7,7 +7,17 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Mapping, Protocol, Sequence
 
-from .domain import FailureClassification, Role, Stage, WorkKind
+from .domain import (
+    CanonicalStage,
+    CapabilityId,
+    DomainCapability,
+    FailureClassification,
+    HumanPolicyPlacement,
+    LifecycleVersion,
+    Role,
+    Stage,
+    WorkKind,
+)
 
 
 class TerminalState(str, Enum):
@@ -17,6 +27,90 @@ class TerminalState(str, Enum):
     FAILED = "failed"
     TIMED_OUT = "timed_out"
     UNKNOWN = "unknown"
+
+
+class CapabilityResolutionStatus(str, Enum):
+    RESOLVED = "resolved"
+    UNKNOWN_CAPABILITY = "unknown_capability"
+    INCOMPATIBLE = "incompatible"
+    UNSUPPORTED_PROVIDER = "unsupported_provider"
+
+
+class ExecutionContract(str, Enum):
+    """Whether a request uses the historical or canonical capability boundary."""
+
+    LEGACY = "legacy"
+    CANONICAL = "canonical"
+
+
+@dataclass(frozen=True, slots=True)
+class CapabilityBinding:
+    """A resolved provider/runtime target, without a native mechanism."""
+
+    capability: DomainCapability
+    runtime: str
+    provider: str
+
+
+@dataclass(frozen=True, slots=True)
+class CapabilityResolution:
+    status: CapabilityResolutionStatus
+    binding: CapabilityBinding | None = None
+    detail: str | None = None
+
+
+def _capability(
+    id: CapabilityId, role: Role, stage: CanonicalStage,
+    *, policy: HumanPolicyPlacement = HumanPolicyPlacement.AFTER
+) -> DomainCapability:
+    return DomainCapability(
+        id, "1", (LifecycleVersion.CANONICAL_V1,), (stage,), role,
+        ("authoritative_inputs",), ("structured_result",), ("provider_evidence",), policy,
+    )
+
+
+CANONICAL_CAPABILITIES: tuple[DomainCapability, ...] = (
+    _capability(CapabilityId.PRD, Role.PRD, CanonicalStage.PRD),
+    _capability(CapabilityId.DELIVERY_PLANNING, Role.PLANNER, CanonicalStage.DELIVERY_PLAN),
+    _capability(CapabilityId.ARCHITECTURE_OVERVIEW, Role.ARCHITECT, CanonicalStage.ARCHITECTURE),
+    _capability(CapabilityId.TECHSPEC, Role.ARCHITECT, CanonicalStage.TECHSPEC),
+    _capability(CapabilityId.TASK_PLANNING, Role.PLANNER, CanonicalStage.TASK_PLAN),
+    _capability(CapabilityId.TASK_EXECUTION, Role.DEVELOPER, CanonicalStage.TASK_EXECUTION),
+    _capability(CapabilityId.TASK_REVIEW, Role.REVIEWER, CanonicalStage.TASK_EXECUTION),
+    _capability(CapabilityId.TASK_FIX, Role.DEVELOPER, CanonicalStage.TASK_EXECUTION),
+    _capability(CapabilityId.WAVE_REVIEW, Role.REVIEWER, CanonicalStage.WAVE_REVIEW),
+    _capability(CapabilityId.WAVE_REMEDIATION, Role.DEVELOPER, CanonicalStage.WAVE_REVIEW),
+    _capability(CapabilityId.FINAL_REVIEW, Role.REVIEWER, CanonicalStage.FINAL_REVIEW),
+    _capability(CapabilityId.FINAL_REMEDIATION, Role.DEVELOPER, CanonicalStage.FINAL_REVIEW),
+    _capability(CapabilityId.DELIVERY_PREPARATION, Role.PLANNER, CanonicalStage.DELIVERY_PREPARATION, policy=HumanPolicyPlacement.BEFORE),
+)
+
+
+class CapabilityRegistry:
+    """Deterministic registry with no fallback or provider routing."""
+
+    def __init__(self, capabilities: Sequence[DomainCapability] = CANONICAL_CAPABILITIES):
+        identifiers = [capability.id.value for capability in capabilities]
+        if len(identifiers) != len(set(identifiers)):
+            raise ValueError("capability registry contains duplicate capability IDs")
+        self._capabilities = {capability.id.value: capability for capability in capabilities}
+
+    def resolve(
+        self, *, lifecycle_version: LifecycleVersion, stage: CanonicalStage,
+        capability_id: str | CapabilityId, role: Role, runtime: str, provider: str,
+        repository_constraints: Mapping[str, Any], supported_providers: Mapping[str, str],
+        schema_version: str = "1",
+    ) -> CapabilityResolution:
+        del repository_constraints  # Constraint policy is owned by the later orchestrator.
+        capability = self._capabilities.get(str(capability_id))
+        if capability is None:
+            return CapabilityResolution(CapabilityResolutionStatus.UNKNOWN_CAPABILITY, detail="unknown capability")
+        if (lifecycle_version not in capability.supported_lifecycle_versions or stage not in capability.supported_stages
+                or schema_version != capability.schema_version or role is not capability.role):
+            return CapabilityResolution(CapabilityResolutionStatus.INCOMPATIBLE, detail="capability contract is incompatible")
+        if supported_providers.get(runtime) != provider:
+            return CapabilityResolution(CapabilityResolutionStatus.UNSUPPORTED_PROVIDER, detail="configured provider is unsupported")
+        return CapabilityResolution(CapabilityResolutionStatus.RESOLVED, CapabilityBinding(capability, runtime, provider))
 
 
 @dataclass(frozen=True, slots=True)
@@ -89,6 +183,11 @@ class RuntimeExecutionRequest:
     continuity_bundle: Mapping[str, Any] = field(default_factory=dict)
     resume_provider_session_id: str | None = None
     developer_logical_session_id: str | None = None
+    capability_id: str | None = None
+    capability_schema_version: str | None = None
+    runtime_name: str | None = None
+    provider_name: str | None = None
+    execution_contract: ExecutionContract = ExecutionContract.LEGACY
 
     def __post_init__(self) -> None:
         if not self.workflow_id or not self.execution_id:
@@ -117,6 +216,13 @@ class RuntimeExecutionRequest:
             raise ValueError("continuity bundle has unsupported fields")
         if self.role is not Role.DEVELOPER and self.continuity_bundle:
             raise ValueError("only Developer requests may carry continuity")
+        capability_fields = (self.capability_id, self.capability_schema_version, self.runtime_name, self.provider_name)
+        if any(capability_fields) and not all(capability_fields):
+            raise ValueError("capability, schema, runtime, and provider must be specified together")
+        if self.execution_contract is ExecutionContract.CANONICAL and not all(capability_fields):
+            raise ValueError("canonical requests require a complete capability binding")
+        if self.execution_contract is ExecutionContract.LEGACY and any(capability_fields):
+            raise ValueError("legacy requests cannot carry a canonical capability binding")
 
     @property
     def repository(self) -> Path:
@@ -138,6 +244,8 @@ class RuntimeExecutionResult:
     metadata: Mapping[str, Any] = field(default_factory=dict)
     failure_classification: FailureClassification | None = None
     failure_detail: str | None = None
+    capability_id: str | None = None
+    capability_schema_version: str | None = None
 
     @property
     def success(self) -> bool:

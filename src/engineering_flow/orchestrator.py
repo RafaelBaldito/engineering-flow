@@ -24,6 +24,13 @@ from .domain import (
     WorkKind,
     Workflow,
     WorkflowStatus,
+    CanonicalStage,
+    CapabilityId,
+    GovernanceDecisionType,
+    HumanAttentionOutcome,
+    LifecycleVersion,
+    FeatureContract,
+    IntakeOutcome,
 )
 from .runtime import (
     AgentRuntime,
@@ -32,6 +39,8 @@ from .runtime import (
     PlanningExecutionResult,
     TaskExecutionRequest,
     TerminalState,
+    CapabilityRegistry,
+    CapabilityResolutionStatus,
 )
 from .store import WorkflowStore
 
@@ -57,12 +66,261 @@ _RETRIABLE_FAILURES = frozenset({
 })
 
 
+class IntakeOrchestrator:
+    """The bounded V2 Intake lifecycle; it deliberately has no successor stage."""
+
+    def __init__(self, store: WorkflowStore, runtime: AgentRuntime, *, timeout_seconds: float = 1800) -> None:
+        self.store, self.runtime, self.timeout_seconds = store, runtime, timeout_seconds
+
+    def run(self, repository_path: str | Path, request: str, *, provider: str | None = None,
+            configuration_snapshot: Mapping[str, Any] | None = None) -> Workflow:
+        if not isinstance(request, str) or not request.strip():
+            raise ValidationFailure("request must be non-empty")
+        workflow_id = str(uuid.uuid4())
+        workflow = self.store.create_workflow(repository_path, provider=provider or getattr(self.runtime, "provider", "provider"),
+            configuration_snapshot=configuration_snapshot, workflow_id=workflow_id, feature_content=request.encode("utf-8"),
+            feature_path=self.store.workspace_path / "workflows" / workflow_id / "input" / "request.txt",
+            lifecycle_version=LifecycleVersion.V2, stage=Stage.INTAKE)
+        return self._intake(workflow)
+
+    def status(self, workflow_id: str) -> Workflow:
+        return self.store.get_workflow(workflow_id)
+
+    def _intake(self, workflow: Workflow) -> Workflow:
+        request_path = Path(workflow.feature_input_path or "")
+        raw = request_path.read_bytes()
+        request_digest = hashlib.sha256(raw).hexdigest()
+        instruction = (
+            f"You are the Intake agent. The raw user request is the authoritative UTF-8 file {request_path} (sha256: {request_digest}); read it before responding. "
+            f"Read the repository only when facts are discoverable; record safe engineering assumptions; "
+            f"ask open questions instead of inventing material product or business decisions. Do not implement, plan, mutate files, or progress beyond Intake. "
+            f"Return only the Feature Contract schema. feature.id must be {workflow.id}. "
+            "Set outcome READY only when requirements and acceptance_criteria are non-empty and open_questions is empty. "
+            "If any material product or business question remains, set outcome NEEDS_CLARIFICATION and include it in open_questions."
+        )
+        request_hash = hashlib.sha256(json.dumps({"raw_request_sha256": request_digest, "stage": "intake", "instruction": instruction, "output": "feature-contract-v1"}, sort_keys=True).encode()).hexdigest()
+        report = self.runtime.verify_planning_capabilities(workflow.repository_path)
+        intent = self.store.create_generation_intent(workflow.id, Stage.INTAKE, request_hash=request_hash, provider=workflow.provider,
+            role=Role.INTAKE, revision=1, artifact_path=self.store.workspace_path / "workflows" / workflow.id / "artifacts" / "001-feature-contract.json", capability_report=_json_mapping(report))
+        if intent.reused:
+            return self.store.get_workflow(workflow.id)
+        if not report.available or not report.read_only_planning:
+            self.store.fail_generation(intent.operation.idempotency_key, FailureClassification.PROVIDER, report.failure_detail or "Intake runtime is unavailable")
+            return self.store.get_workflow(workflow.id)
+        self.store.set_workflow_state(workflow.id, stage=Stage.INTAKE, status=WorkflowStatus.RUNNING, event_type="workflow.running", payload={"execution_id": intent.execution.id})
+        root = self.store.workspace_path / "workflows" / workflow.id / "runtime" / intent.execution.id
+        runtime_request = PlanningExecutionRequest(workflow_id=workflow.id, execution_id=intent.execution.id, logical_session_id=intent.execution.session_id,
+            role=Role.INTAKE, stage=Stage.INTAKE, repository_path=workflow.repository_path,
+            authoritative_input_paths=(str(request_path),), authoritative_input_hashes=(request_digest,), instruction=instruction,
+            output_schema_path=str(root / "feature-contract.schema.json"), final_output_path=str(root / "final-output.json"), timeout_seconds=self.timeout_seconds,
+            required_capabilities=("read_only",))
+        try:
+            result = self.runtime.execute_planning(runtime_request)
+        except Exception as exc:
+            self.store.mark_operation_unknown(intent.operation.idempotency_key, detail=str(exc))
+            return self.store.set_workflow_state(workflow.id, stage=Stage.INTAKE, status=WorkflowStatus.HUMAN_ATTENTION, event_type="workflow.human_attention", payload={"reason": "provider operation outcome is unknown"})
+        self.store.start_execution(intent.execution.id, provider_execution_id=result.provider_execution_id)
+        for event in result.events:
+            self.store.append_event(workflow.id, f"agent.runtime.{event.type}", stage=Stage.INTAKE,
+                execution_id=intent.execution.id, payload={"provider_event_id": event.provider_event_id,
+                "timestamp": event.timestamp, **dict(event.payload)})
+        if result.terminal_state is TerminalState.UNKNOWN:
+            self.store.mark_operation_unknown(intent.operation.idempotency_key, detail=result.failure_detail or "unknown provider outcome")
+            return self.store.set_workflow_state(workflow.id, stage=Stage.INTAKE, status=WorkflowStatus.HUMAN_ATTENTION, event_type="workflow.human_attention", payload={"reason": "provider operation outcome is unknown"})
+        if not result.success or not isinstance(result.final_payload, Mapping):
+            self.store.fail_generation(intent.operation.idempotency_key, result.failure_classification or FailureClassification.AGENT_EXECUTION, result.failure_detail or "Intake runtime failed")
+            return self.store.get_workflow(workflow.id)
+        try:
+            contract = FeatureContract.parse(result.final_payload, workflow_id=workflow.id)
+        except ValidationFailure as exc:
+            self.store.fail_generation(intent.operation.idempotency_key, FailureClassification.AGENT_EXECUTION, str(exc))
+            return self.store.get_workflow(workflow.id)
+        status = {IntakeOutcome.READY: WorkflowStatus.READY, IntakeOutcome.NEEDS_CLARIFICATION: WorkflowStatus.NEEDS_CLARIFICATION, IntakeOutcome.REJECTED: WorkflowStatus.REJECTED}[contract.outcome]
+        self.store.complete_generation(intent.operation.idempotency_key, content=json.dumps(contract.as_payload(), ensure_ascii=False, indent=2) + "\n",
+            artifact_path=self.store.workspace_path / "workflows" / workflow.id / "artifacts" / "001-feature-contract.json", stage=Stage.INTAKE, revision=1,
+            terminal_result={"provider": result.provider, "final_payload": contract.as_payload(), "usage": dict(result.usage), "metadata": dict(result.metadata)},
+            workflow_stage=Stage.INTAKE, workflow_status=status, approval_state=ApprovalState.NOT_REQUIRED,
+            completion_event_type="intake.completed", completion_event_payload={"outcome": contract.outcome.value, "question_count": len(contract.open_questions)})
+        return self.store.get_workflow(workflow.id)
+
+
 def _json_mapping(value: Any) -> dict[str, Any]:
     if is_dataclass(value):
         return asdict(value)
     if isinstance(value, Mapping):
         return dict(value)
     return {}
+
+
+class CanonicalLifecycleOrchestrator:
+    """Policy-only driver for records created under ``canonical-v1``.
+
+    The legacy ``PlanningOrchestrator`` remains readable and continues to own
+    the Wave 2 task loop.  This narrow companion deliberately accepts an
+    already-normalized provider result: it resolves the requested capability,
+    checks persisted authority, and is the sole component that selects the
+    successor stage.
+    """
+
+    _CAPABILITY_BY_STAGE = {
+        CanonicalStage.PRD: CapabilityId.PRD,
+        CanonicalStage.DELIVERY_PLAN: CapabilityId.DELIVERY_PLANNING,
+        CanonicalStage.ARCHITECTURE: CapabilityId.ARCHITECTURE_OVERVIEW,
+        CanonicalStage.TECHSPEC: CapabilityId.TECHSPEC,
+        CanonicalStage.TASK_PLAN: CapabilityId.TASK_PLANNING,
+        CanonicalStage.WAVE_REVIEW: CapabilityId.WAVE_REVIEW,
+        CanonicalStage.FINAL_REVIEW: CapabilityId.FINAL_REVIEW,
+        CanonicalStage.DELIVERY_PREPARATION: CapabilityId.DELIVERY_PREPARATION,
+    }
+    _ROLE_BY_CAPABILITY = {
+        CapabilityId.PRD: Role.PRD, CapabilityId.DELIVERY_PLANNING: Role.PLANNER,
+        CapabilityId.ARCHITECTURE_OVERVIEW: Role.ARCHITECT, CapabilityId.TECHSPEC: Role.ARCHITECT,
+        CapabilityId.TASK_PLANNING: Role.PLANNER, CapabilityId.WAVE_REVIEW: Role.REVIEWER,
+        CapabilityId.FINAL_REVIEW: Role.REVIEWER, CapabilityId.DELIVERY_PREPARATION: Role.PLANNER,
+    }
+
+    # These are gates for *leaving* a stage.  They deliberately live beside
+    # the lifecycle policy rather than in an adapter: provider output is never
+    # allowed to select either an authority type or a successor.
+    _AUTHORITY_BY_STAGE = {
+        CanonicalStage.DELIVERY_PLAN: GovernanceDecisionType.APPROVAL,
+        CanonicalStage.ARCHITECTURE: GovernanceDecisionType.APPROVAL,
+        CanonicalStage.TECHSPEC: GovernanceDecisionType.APPROVAL,
+        CanonicalStage.TASK_PLAN: GovernanceDecisionType.APPROVAL,
+        CanonicalStage.TASK_EXECUTION: GovernanceDecisionType.WAVE_START_AUTHORIZATION,
+        CanonicalStage.WAVE_REVIEW: GovernanceDecisionType.WAVE_ACCEPTANCE,
+        CanonicalStage.FINAL_REVIEW: GovernanceDecisionType.RELEASE_ACCEPTANCE,
+        CanonicalStage.DELIVERY_PREPARATION: GovernanceDecisionType.DELIVERY_AUTHORIZATION,
+    }
+
+    def __init__(self, store: WorkflowStore, *, registry: CapabilityRegistry | None = None,
+                 runtime_name: str = "codex", architecture_required: bool | None = None) -> None:
+        self.store = store
+        self.registry = registry or CapabilityRegistry()
+        self.runtime_name = runtime_name
+        # Kept only as a compatibility argument.  Branching is derived from
+        # the persisted delivery-plan result below, never this process-local
+        # value.
+        self.architecture_required = architecture_required
+
+    def _attention(self, workflow_id: str, scope_id: str, operation_key: str,
+                   fingerprint: str, outcome: HumanAttentionOutcome, detail: str) -> LifecycleState:
+        return self.store.record_canonical_transition(
+            workflow_id, operation_key=operation_key, request_fingerprint=fingerprint,
+            scope_id=scope_id, lifecycle_version=LifecycleVersion.CANONICAL_V1,
+            stage=self.store.get_lifecycle_state(workflow_id).stage if self.store.get_lifecycle_state(workflow_id) else None,
+            status=WorkflowStatus.HUMAN_ATTENTION, result={"detail": detail}, attention_outcome=outcome,
+        )
+
+    def advance(self, workflow_id: str, *, scope_id: str, operation_key: str,
+                request_fingerprint: str, normalized_result: Mapping[str, Any],
+                evidence_reference: str, evidence_sha256: str,
+                supported_providers: Mapping[str, str],
+                repository_constraints: Mapping[str, Any] | None = None) -> LifecycleState:
+        """Commit one legal successor, or durably pause for human attention.
+
+        ``normalized_result`` is evidence only. Its ``outcome`` must be
+        ``success`` and its capability identifier/schema must match the
+        persisted current stage; it never supplies a destination stage.
+        """
+        state = self.store.get_lifecycle_state(workflow_id)
+        if state is None or state.lifecycle_version is not LifecycleVersion.CANONICAL_V1 or state.stage is None:
+            return self._attention(workflow_id, scope_id, operation_key, request_fingerprint,
+                                   HumanAttentionOutcome.INVALID_STATE, "canonical lifecycle state is missing or incompatible")
+        # Wave 2 owns task execution.  Its accepted-task evidence is the only
+        # input accepted here; task-plan PENDING cells are not interpreted.
+        if state.stage is CanonicalStage.TASK_EXECUTION:
+            if not self.store.has_accepted_task_evidence(
+                workflow_id, scope_id, normalized_result.get("accepted_task_evidence", {})
+            ):
+                return self._attention(workflow_id, scope_id, operation_key, request_fingerprint,
+                                       HumanAttentionOutcome.INVALID_EVIDENCE,
+                                       "accepted Wave 2 task evidence is required for Wave review")
+            capability_id = None
+        else:
+            capability_id = self._CAPABILITY_BY_STAGE.get(state.stage)
+        if capability_id is None and state.stage is not CanonicalStage.TASK_EXECUTION:
+            return self._attention(workflow_id, scope_id, operation_key, request_fingerprint,
+                                   HumanAttentionOutcome.INVALID_STATE, "stage has no dispatchable canonical capability")
+        resolution = None
+        if capability_id is not None:
+            resolution = self.registry.resolve(
+            lifecycle_version=state.lifecycle_version, stage=state.stage, capability_id=capability_id,
+            role=self._ROLE_BY_CAPABILITY[capability_id], runtime=self.runtime_name,
+            provider=self.store.get_workflow(workflow_id).provider,
+            repository_constraints=repository_constraints or {}, supported_providers=supported_providers,
+            )
+        if resolution is not None and resolution.status is not CapabilityResolutionStatus.RESOLVED:
+            return self._attention(workflow_id, scope_id, operation_key, request_fingerprint,
+                                   HumanAttentionOutcome.UNSUPPORTED_CAPABILITY, resolution.detail or "capability is unresolved")
+        if not isinstance(normalized_result, Mapping):
+            return self._attention(workflow_id, scope_id, operation_key, request_fingerprint,
+                                   HumanAttentionOutcome.INVALID_CAPABILITY_RESULT, "normalized result is not structured")
+        outcome = normalized_result.get("outcome")
+        if outcome in {"permission_denied", "unknown"}:
+            return self._attention(workflow_id, scope_id, operation_key, request_fingerprint,
+                                   HumanAttentionOutcome.PERMISSION_DENIED if outcome == "permission_denied" else HumanAttentionOutcome.UNKNOWN_OUTCOME,
+                                   "provider result requires human attention")
+        if (outcome != "success"
+                or (capability_id is not None and (
+                    normalized_result.get("capability_id") != capability_id.value
+                    or normalized_result.get("schema_version") != resolution.binding.capability.schema_version))):
+            return self._attention(workflow_id, scope_id, operation_key, request_fingerprint,
+                                   HumanAttentionOutcome.INVALID_CAPABILITY_RESULT, "normalized result does not satisfy capability contract")
+        if (state.stage is CanonicalStage.DELIVERY_PLAN
+                and not isinstance(normalized_result.get("architecture_required"), bool)):
+            return self._attention(workflow_id, scope_id, operation_key, request_fingerprint,
+                                   HumanAttentionOutcome.INVALID_EVIDENCE,
+                                   "delivery-plan result lacks persisted architecture policy evidence")
+        required_authority = self._AUTHORITY_BY_STAGE.get(state.stage)
+        if required_authority is not None:
+            authority = self.store.evaluate_active_authority(
+                workflow_id, scope_id=scope_id, lifecycle_version=state.lifecycle_version,
+                decision_type=required_authority,
+                approval_target_stage=state.stage if required_authority is GovernanceDecisionType.APPROVAL else None,
+            )
+            if not authority.active:
+                return self._attention(workflow_id, scope_id, operation_key, request_fingerprint,
+                                       HumanAttentionOutcome.AMBIGUOUS_AUTHORITY if authority.attention_required else HumanAttentionOutcome.MISSING_AUTHORITY,
+                                       authority.reason or "required authority is unavailable")
+        successor = self._successor(state.stage, normalized_result)
+        return self.store.record_canonical_transition(
+            workflow_id, operation_key=operation_key, request_fingerprint=request_fingerprint,
+            scope_id=scope_id, lifecycle_version=state.lifecycle_version, stage=successor,
+            status=WorkflowStatus.CREATED, result=dict(normalized_result),
+            evidence_reference=evidence_reference, evidence_sha256=evidence_sha256,
+            expected_predecessor=state.stage, required_authority=required_authority,
+            required_approval_target_stage=state.stage if required_authority is GovernanceDecisionType.APPROVAL else None,
+        )
+
+    def _successor(self, stage: CanonicalStage, result: Mapping[str, Any]) -> CanonicalStage:
+        if stage is CanonicalStage.DELIVERY_PLAN:
+            required = result.get("architecture_required")
+            if not isinstance(required, bool):
+                # The policy fact is retained in this same result transaction,
+                # making reopen/reconciliation deterministic.
+                raise ValidationFailure("delivery-plan result must include boolean architecture_required policy fact")
+            if not required:
+                return CanonicalStage.TECHSPEC
+        successors = {
+            CanonicalStage.PRD: CanonicalStage.DELIVERY_PLAN,
+            CanonicalStage.DELIVERY_PLAN: CanonicalStage.ARCHITECTURE,
+            CanonicalStage.ARCHITECTURE: CanonicalStage.TECHSPEC,
+            CanonicalStage.TECHSPEC: CanonicalStage.TASK_PLAN,
+            CanonicalStage.TASK_PLAN: CanonicalStage.TASK_EXECUTION,
+            CanonicalStage.TASK_EXECUTION: CanonicalStage.WAVE_REVIEW,
+            CanonicalStage.WAVE_REVIEW: CanonicalStage.FINAL_REVIEW,
+            CanonicalStage.FINAL_REVIEW: CanonicalStage.DELIVERY_PREPARATION,
+            CanonicalStage.DELIVERY_PREPARATION: CanonicalStage.DELIVERY_PREPARATION,
+        }
+        return successors[stage]
+
+    def resume(self, workflow_id: str) -> LifecycleState:
+        """Return durable canonical state without re-dispatching provider work."""
+        state = self.store.get_lifecycle_state(workflow_id)
+        if state is None:
+            raise ValidationFailure("canonical lifecycle state is missing")
+        return state
 
 
 class PlanningOrchestrator:

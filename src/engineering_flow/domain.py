@@ -13,12 +13,56 @@ class _ValueEnum(str, Enum):
 
 
 class Stage(_ValueEnum):
+    INTAKE = "intake"
     PRD = "prd"
     TECHSPEC = "techspec"
     TASK_PLAN = "task_plan"
     READY_FOR_WAVE_2 = "ready_for_wave_2"
     TASK_EXECUTION = "task_execution"
     TASKS_READY_FOR_WAVE_REVIEW = "tasks_ready_for_wave_review"
+
+
+class LifecycleVersion(_ValueEnum):
+    """The explicitly recorded contract under which a workflow is read."""
+
+    HISTORICAL = "historical"
+    CANONICAL_V1 = "canonical-v1"
+    V2 = "v2"
+
+
+class CanonicalStage(_ValueEnum):
+    """Provider-neutral stages for workflows created under a canonical contract."""
+
+    PRD = "prd"
+    DELIVERY_PLAN = "delivery_plan"
+    ARCHITECTURE = "architecture"
+    TECHSPEC = "techspec"
+    TASK_PLAN = "task_plan"
+    TASK_EXECUTION = "task_execution"
+    WAVE_REVIEW = "wave_review"
+    FINAL_REVIEW = "final_review"
+    DELIVERY_PREPARATION = "delivery_preparation"
+
+
+class ScopeKind(_ValueEnum):
+    WORKFLOW = "workflow"
+    RELEASE = "release"
+    WAVE = "wave"
+    TASK = "task"
+
+
+class HumanAttentionOutcome(_ValueEnum):
+    UNKNOWN_OUTCOME = "unknown_outcome"
+    INVALID_EVIDENCE = "invalid_evidence"
+    AMBIGUOUS_MIGRATION = "ambiguous_migration"
+    PARTIAL_MIGRATION = "partial_migration"
+    MIGRATION_FAILED = "migration_failed"
+    INVALID_STATE = "invalid_state"
+    MISSING_AUTHORITY = "missing_authority"
+    AMBIGUOUS_AUTHORITY = "ambiguous_authority"
+    UNSUPPORTED_CAPABILITY = "unsupported_capability"
+    INVALID_CAPABILITY_RESULT = "invalid_capability_result"
+    PERMISSION_DENIED = "permission_denied"
 
 
 class WorkflowStatus(_ValueEnum):
@@ -30,6 +74,8 @@ class WorkflowStatus(_ValueEnum):
     CANCELLED = "cancelled"
     HUMAN_ATTENTION = "human_attention"
     COMPLETED = "completed"
+    READY = "ready"
+    NEEDS_CLARIFICATION = "needs_clarification"
 
 
 class ApprovalPolicy(_ValueEnum):
@@ -49,6 +95,7 @@ class ApprovalState(_ValueEnum):
     APPROVED = "approved"
     REJECTED = "rejected"
     AUTO_APPROVED = "auto_approved"
+    NOT_REQUIRED = "not_required"
 
 
 class TaskStatus(_ValueEnum):
@@ -81,11 +128,72 @@ class WorkKind(_ValueEnum):
 
 
 class Role(_ValueEnum):
+    INTAKE = "intake"
     PRD = "prd"
     ARCHITECT = "architect"
     PLANNER = "planner"
     DEVELOPER = "developer"
     REVIEWER = "reviewer"
+
+
+class CapabilityId(_ValueEnum):
+    """Stable, provider-neutral work the lifecycle can request."""
+
+    PRD = "prd"
+    DELIVERY_PLANNING = "delivery-planning"
+    ARCHITECTURE_OVERVIEW = "architecture-overview"
+    TECHSPEC = "techspec"
+    TASK_PLANNING = "task-planning"
+    TASK_EXECUTION = "task-execution"
+    TASK_REVIEW = "task-review"
+    TASK_FIX = "task-fix"
+    WAVE_REVIEW = "wave-review"
+    WAVE_REMEDIATION = "wave-remediation"
+    FINAL_REVIEW = "final-review"
+    FINAL_REMEDIATION = "final-remediation"
+    DELIVERY_PREPARATION = "delivery-preparation"
+
+
+class HumanPolicyPlacement(_ValueEnum):
+    BEFORE = "before"
+    AFTER = "after"
+
+
+class GovernanceDecisionType(_ValueEnum):
+    """Immutable governance facts used to gate canonical lifecycle work."""
+
+    APPROVAL = "approval"
+    REJECTION = "rejection"
+    WAVE_ACCEPTANCE = "wave_acceptance"
+    RELEASE_ACCEPTANCE = "release_acceptance"
+    WAVE_START_AUTHORIZATION = "wave_start_authorization"
+    DELIVERY_AUTHORIZATION = "delivery_authorization"
+    REVOCATION = "revocation"
+    SUPERSESSION = "supersession"
+
+
+class GovernanceDecision(_ValueEnum):
+    APPROVED = "approved"
+    REJECTED = "rejected"
+    ACCEPTED = "accepted"
+    AUTHORIZED = "authorized"
+    REVOKED = "revoked"
+    SUPERSEDED = "superseded"
+
+
+@dataclass(frozen=True, slots=True)
+class DomainCapability:
+    """Canonical contract; deliberately contains no provider-native details."""
+
+    id: CapabilityId
+    schema_version: str
+    supported_lifecycle_versions: tuple[LifecycleVersion, ...]
+    supported_stages: tuple[CanonicalStage, ...]
+    role: Role
+    required_inputs: tuple[str, ...]
+    required_outputs: tuple[str, ...]
+    required_evidence: tuple[str, ...]
+    human_policy_placement: HumanPolicyPlacement
 
 
 class FailureClassification(_ValueEnum):
@@ -104,6 +212,13 @@ class OperationStatus(_ValueEnum):
     PENDING = "pending"
     COMPLETED = "completed"
     UNKNOWN = "unknown"
+
+
+class MigrationOutcome(_ValueEnum):
+    COMPLETED = "completed"
+    AMBIGUOUS = "ambiguous"
+    PARTIAL = "partial"
+    FAILED = "failed"
 
 
 class ExecutionLifecycle(_ValueEnum):
@@ -161,6 +276,158 @@ class Workflow:
     current_artifact_revision: int | None = None
     feature_input_path: str | None = None
     feature_input_sha256: str | None = None
+    lifecycle_version: LifecycleVersion = LifecycleVersion.HISTORICAL
+
+
+class IntakeOutcome(_ValueEnum):
+    READY = "READY"
+    NEEDS_CLARIFICATION = "NEEDS_CLARIFICATION"
+    REJECTED = "REJECTED"
+
+
+@dataclass(frozen=True, slots=True)
+class FeatureContract:
+    outcome: IntakeOutcome
+    feature_id: str
+    goal: str
+    requirements: tuple[str, ...]
+    acceptance_criteria: tuple[str, ...]
+    constraints: tuple[str, ...]
+    out_of_scope: tuple[str, ...]
+    assumptions: tuple[str, ...]
+    open_questions: tuple[str, ...]
+
+    @classmethod
+    def parse(cls, value: Mapping[str, Any], *, workflow_id: str) -> "FeatureContract":
+        if not isinstance(value, Mapping) or set(value) != {"outcome", "feature"}:
+            raise ValidationFailure("Feature Contract must contain only outcome and feature")
+        try:
+            outcome = IntakeOutcome(value["outcome"])
+        except (TypeError, ValueError) as exc:
+            raise ValidationFailure("Feature Contract has an invalid outcome") from exc
+        feature = value["feature"]
+        expected = {"id", "goal", "requirements", "acceptance_criteria", "constraints", "out_of_scope", "assumptions", "open_questions"}
+        if not isinstance(feature, Mapping) or set(feature) != expected:
+            raise ValidationFailure("Feature Contract feature has an invalid shape")
+        def text(name: str) -> str:
+            item = feature[name]
+            if not isinstance(item, str) or not item.strip():
+                raise ValidationFailure(f"Feature Contract {name} must be a non-empty string")
+            return item
+        def texts(name: str) -> tuple[str, ...]:
+            item = feature[name]
+            if not isinstance(item, list) or not all(isinstance(entry, str) and entry.strip() for entry in item):
+                raise ValidationFailure(f"Feature Contract {name} must be a list of non-empty strings")
+            return tuple(item)
+        feature_id, goal = text("id"), text("goal")
+        if feature_id != workflow_id:
+            raise ValidationFailure("Feature Contract feature.id must equal the workflow ID")
+        contract = cls(outcome, feature_id, goal, *(texts(name) for name in (
+            "requirements", "acceptance_criteria", "constraints", "out_of_scope", "assumptions", "open_questions"
+        )))
+        if outcome is IntakeOutcome.READY and (not contract.requirements or not contract.acceptance_criteria or contract.open_questions):
+            raise ValidationFailure("READY Feature Contract requires requirements and acceptance criteria with no open questions")
+        if outcome is IntakeOutcome.NEEDS_CLARIFICATION and not contract.open_questions:
+            raise ValidationFailure("NEEDS_CLARIFICATION Feature Contract requires open questions")
+        return contract
+
+    def as_payload(self) -> dict[str, Any]:
+        return {"outcome": self.outcome.value, "feature": {
+            "id": self.feature_id, "goal": self.goal, "requirements": list(self.requirements),
+            "acceptance_criteria": list(self.acceptance_criteria), "constraints": list(self.constraints),
+            "out_of_scope": list(self.out_of_scope), "assumptions": list(self.assumptions),
+            "open_questions": list(self.open_questions),
+        }}
+
+
+@dataclass(frozen=True, slots=True)
+class LifecycleState:
+    workflow_id: str
+    lifecycle_version: LifecycleVersion
+    stage: CanonicalStage | None
+    status: WorkflowStatus
+    scope_id: str | None
+    operation_key: str
+    created_at: str
+    updated_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class WorkflowScope:
+    id: str
+    workflow_id: str
+    kind: ScopeKind
+    external_key: str
+    parent_scope_id: str | None
+    created_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class EvidenceReference:
+    id: str
+    workflow_id: str
+    scope_id: str | None
+    reference: str
+    sha256: str
+    operation_key: str
+    created_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class GovernanceRecord:
+    id: str
+    workflow_id: str
+    scope_id: str
+    lifecycle_version: LifecycleVersion
+    operation_key: str
+    decision_type: GovernanceDecisionType
+    decision: GovernanceDecision
+    actor: str
+    evidence: tuple[tuple[str, str], ...]
+    approval_target_stage: CanonicalStage | None
+    predecessor_ids: tuple[str, ...]
+    affected_ids: tuple[str, ...]
+    created_at: str
+
+    @property
+    def operation_id(self) -> str:
+        """Durable operation identity (named operation_key at the store boundary)."""
+        return self.operation_key
+
+
+@dataclass(frozen=True, slots=True)
+class AuthorityEvaluation:
+    active: bool
+    attention_required: bool
+    reason: str | None
+    record: GovernanceRecord | None
+
+
+@dataclass(frozen=True, slots=True)
+class CapabilityOperation:
+    id: str
+    workflow_id: str
+    scope_id: str | None
+    operation_key: str
+    request_fingerprint: str
+    status: OperationStatus
+    result: Mapping[str, Any] | None
+    attention_outcome: HumanAttentionOutcome | None
+    evidence_id: str | None
+    created_at: str
+    updated_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class MigrationReceipt:
+    id: str
+    workflow_id: str
+    operation_key: str
+    source_version: LifecycleVersion
+    target_version: LifecycleVersion
+    outcome: MigrationOutcome
+    detail: str | None
+    created_at: str
 
 
 @dataclass(frozen=True, slots=True)

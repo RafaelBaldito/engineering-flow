@@ -75,6 +75,35 @@ class CliTests(unittest.TestCase):
             self.assertEqual(code, 0)
             self.assertTrue(all(event["sequence"] > 1 for event in logs["events"]))
 
+    def test_inline_request_persists_ready_intake_and_status_reopens_it(self):
+        class IntakeRuntime(FakeRuntime):
+            def execute_planning(self, request):
+                self.requests.append(request)
+                return PlanningExecutionResult(
+                    "codex-cli", request.logical_session_id or "session", "thread", request.execution_id,
+                    TerminalState.SUCCEEDED, {"outcome": "READY", "feature": {
+                        "id": request.workflow_id, "goal": "Allow cancellation before shipment.",
+                        "requirements": ["Only PENDING orders may be cancelled."],
+                        "acceptance_criteria": ["A PENDING order can be cancelled."],
+                        "constraints": ["SHIPPED orders cannot be cancelled."], "out_of_scope": [],
+                        "assumptions": [], "open_questions": [],
+                    }},
+                )
+        request = "Allow users to cancel an order before shipment. Only PENDING orders may be cancelled. SHIPPED orders cannot be cancelled."
+        with patch("engineering_flow.cli.CodexCliRuntime", IntakeRuntime):
+            code, text = self.invoke(["run", "--repo", str(self.repository), "--request", request])
+        self.assertEqual(code, 0)
+        self.assertIn("Intake: READY", text)
+        workflow_id = next(line.split(": ", 1)[1] for line in text.splitlines() if line.startswith("workflow:"))
+        code, status = self.invoke(["status", "--repo", str(self.repository), "--workflow", workflow_id, "--json"])
+        self.assertEqual(code, 0)
+        self.assertEqual((status["lifecycle_version"], status["stage"], status["status"]), ("v2", "intake", "ready"))
+        self.assertEqual(status["intake"]["outcome"], "READY")
+        self.assertEqual(status["intake"]["open_questions"], [])
+        self.assertEqual(len(status["artifacts"]), 1)
+        self.assertEqual(status["artifacts"][0]["approval_state"], "not_required")
+        self.assertEqual(status["tasks"], [])
+
     def test_cli_fake_runtime_reaches_wave_two_after_three_exact_approvals(self):
         with patch("engineering_flow.cli.CodexCliRuntime", FakeRuntime):
             _, text = self.invoke(["run", "--repo", str(self.repository), "--feature-file", str(self.feature)])

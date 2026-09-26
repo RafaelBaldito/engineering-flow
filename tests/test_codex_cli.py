@@ -9,9 +9,11 @@ from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 
-from engineering_flow.codex_cli import CodexCliRuntime, FINAL_OUTPUT_SCHEMA, REVIEWER_OUTPUT_SCHEMA  # noqa: E402
+from engineering_flow.codex_cli import CodexCliRuntime, CodexMechanismDescriptor, FINAL_OUTPUT_SCHEMA, REVIEWER_OUTPUT_SCHEMA  # noqa: E402
 from engineering_flow.domain import FailureClassification, Role, Stage, ValidationFailure, WorkKind  # noqa: E402
-from engineering_flow.runtime import PlanningExecutionRequest, TaskExecutionRequest, TerminalState  # noqa: E402
+from engineering_flow.runtime import (  # noqa: E402
+    ExecutionContract, PlanningExecutionRequest, TaskExecutionRequest, TerminalState,
+)
 
 
 class FakeProcess:
@@ -48,6 +50,64 @@ class StreamingProcess:
 
 
 class CodexCliTests(unittest.TestCase):
+    def test_materialization_rejects_non_equivalent_native_contract(self):
+        request = self.task_request(
+            Role.DEVELOPER, WorkKind.DEVELOP, capability_id="task-execution",
+            capability_schema_version="1", runtime_name="codex-cli", provider_name="codex-cli",
+            execution_contract=ExecutionContract.CANONICAL,
+        )
+        descriptor = CodexMechanismDescriptor(
+            "skill", ".codex/skills/execute-task/SKILL.md", "1", "digest", "task-execution", "1", Role.REVIEWER,
+        )
+        runtime = self.runtime(mechanisms={"task-execution": descriptor})
+        with self.assertRaisesRegex(ValidationFailure, "normalized contract"):
+            runtime.execute(request)
+
+    def test_materialization_accepts_equivalent_adapter_local_descriptor(self):
+        request = self.task_request(
+            Role.DEVELOPER, WorkKind.DEVELOP, capability_id="task-execution",
+            capability_schema_version="1", runtime_name="codex-cli", provider_name="codex-cli",
+            execution_contract=ExecutionContract.CANONICAL,
+        )
+        descriptor = CodexMechanismDescriptor(
+            "prompt_template", "templates/task-execution.md", "1", "digest", "task-execution", "1", Role.DEVELOPER,
+        )
+        self.assertEqual(
+            self.runtime(mechanisms={"task-execution": descriptor}).materialize_capability(request), descriptor
+        )
+
+    def test_canonical_dispatch_materializes_configured_native_mechanism(self):
+        request = self.task_request(
+            Role.DEVELOPER, WorkKind.DEVELOP, capability_id="task-execution",
+            capability_schema_version="1", runtime_name="codex-cli", provider_name="codex-cli",
+            execution_contract=ExecutionContract.CANONICAL,
+        )
+        descriptor = CodexMechanismDescriptor(
+            "prompt_template", "templates/task-execution.md", "1", "digest-123",
+            "task-execution", "1", Role.DEVELOPER,
+        )
+
+        self.runtime(
+            allow_workspace_write=True, mechanisms={"task-execution": descriptor},
+        ).execute(request)
+
+        self.assertEqual(len(self.calls), 1)
+        instruction = self.calls[0][0][-1]
+        self.assertIn("mechanism_kind: prompt_template", instruction)
+        self.assertIn("mechanism_reference: templates/task-execution.md", instruction)
+        self.assertIn("mechanism_version: 1", instruction)
+        self.assertIn("mechanism_digest: digest-123", instruction)
+        self.assertTrue(instruction.endswith("Perform only the approved task."))
+
+    def test_canonical_dispatch_without_descriptor_never_starts_subprocess(self):
+        request = self.task_request(
+            Role.DEVELOPER, WorkKind.DEVELOP, capability_id="task-execution",
+            capability_schema_version="1", runtime_name="codex-cli", provider_name="codex-cli",
+            execution_contract=ExecutionContract.CANONICAL,
+        )
+        with self.assertRaisesRegex(ValidationFailure, "no Codex mechanism"):
+            self.runtime().execute(request)
+        self.assertEqual(self.calls, [])
     def setUp(self):
         self.tempdir = tempfile.TemporaryDirectory()
         self.root = Path(self.tempdir.name)

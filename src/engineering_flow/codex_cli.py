@@ -11,14 +11,16 @@ import threading
 import time
 from collections import deque
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from queue import Empty, Queue
 from pathlib import Path
 from typing import Any
 
-from .domain import FailureClassification, Role, ValidationFailure
+from .domain import CapabilityId, FailureClassification, Role, ValidationFailure
 from .runtime import (
     AgentRuntime,
     CapabilityReport,
+    ExecutionContract,
     NormalizedEvent,
     PlanningExecutionRequest,
     PlanningExecutionResult,
@@ -97,6 +99,19 @@ REVIEWER_OUTPUT_SCHEMA: dict[str, Any] = {
     },
 }
 
+INTAKE_OUTPUT_SCHEMA: dict[str, Any] = {
+    "$schema": "https://json-schema.org/draft/2020-12/schema", "type": "object",
+    "additionalProperties": False, "required": ["outcome", "feature"], "properties": {
+        "outcome": {"enum": ["READY", "NEEDS_CLARIFICATION", "REJECTED"]},
+        "feature": {"type": "object", "additionalProperties": False,
+            "required": ["id", "goal", "requirements", "acceptance_criteria", "constraints", "out_of_scope", "assumptions", "open_questions"],
+            "properties": {"id": {"type": "string"}, "goal": {"type": "string"},
+                **{name: {"type": "array", "items": {"type": "string"}} for name in
+                   ("requirements", "acceptance_criteria", "constraints", "out_of_scope", "assumptions", "open_questions")}},
+        },
+    },
+}
+
 _AUTHENTICATION_ERROR = re.compile(
     r"(?i)(authentication|unauthori[sz]ed|invalid\s+(?:api\s*)?key|"
     r"login required|missing credentials|not logged in|\b401\b|credential)"
@@ -114,6 +129,28 @@ _FAILURE_EVENTS = frozenset({
     "response.failed",
     "task.failed",
 })
+
+
+@dataclass(frozen=True, slots=True)
+class CodexMechanismDescriptor:
+    """Adapter-local native reference and its declared normalized contract."""
+
+    kind: str  # ``skill`` or ``prompt_template``
+    reference: str
+    version: str
+    digest: str
+    capability_id: str
+    schema_version: str
+    role: Role
+    required_inputs: tuple[str, ...] = ("authoritative_inputs",)
+    required_outputs: tuple[str, ...] = ("structured_result",)
+    required_evidence: tuple[str, ...] = ("provider_evidence",)
+
+    def __post_init__(self) -> None:
+        if self.kind not in {"skill", "prompt_template"}:
+            raise ValueError("Codex mechanism kind must be skill or prompt_template")
+        if not all((self.reference, self.version, self.digest, self.capability_id, self.schema_version)):
+            raise ValueError("Codex mechanism descriptor fields are required")
 
 
 def _minimal_environment(source: Mapping[str, str] | None = None) -> dict[str, str]:
@@ -169,6 +206,7 @@ class CodexCliRuntime(AgentRuntime):
         git_runner: Callable[..., Any] = subprocess.run,
         environment: Mapping[str, str] | None = None,
         secret_values: tuple[str, ...] = (),
+        mechanisms: Mapping[str, CodexMechanismDescriptor] | None = None,
     ) -> None:
         if not command:
             raise ValueError("Codex executable command is required")
@@ -184,6 +222,29 @@ class CodexCliRuntime(AgentRuntime):
         self._git_runner = git_runner
         self._environment = dict(environment) if environment is not None else None
         self._secret_values = tuple(secret_values)
+        self._mechanisms = dict(mechanisms or {})
+
+    def materialize_capability(self, request: RuntimeExecutionRequest) -> CodexMechanismDescriptor:
+        """Validate the configured native descriptor before it can dispatch."""
+
+        if not request.capability_id:
+            raise ValidationFailure("a canonical capability is required for Codex materialization")
+        descriptor = self._mechanisms.get(request.capability_id)
+        if descriptor is None:
+            raise ValidationFailure("no Codex mechanism is configured for capability")
+        if request.provider_name != self.provider or request.runtime_name != self.provider:
+            raise ValidationFailure("Codex binding provider/runtime is incompatible")
+        expected = (
+            request.capability_id, request.capability_schema_version, request.role,
+            ("authoritative_inputs",), ("structured_result",), ("provider_evidence",),
+        )
+        actual = (
+            descriptor.capability_id, descriptor.schema_version, descriptor.role,
+            descriptor.required_inputs, descriptor.required_outputs, descriptor.required_evidence,
+        )
+        if actual != expected:
+            raise ValidationFailure("Codex mechanism normalized contract is incompatible")
+        return descriptor
 
     def _resolved_executable(self) -> str | None:
         command_path = Path(self.command).expanduser()
@@ -374,6 +435,8 @@ class CodexCliRuntime(AgentRuntime):
 
     @staticmethod
     def _schema_for(request: RuntimeExecutionRequest) -> Mapping[str, Any]:
+        if request.role is Role.INTAKE:
+            return INTAKE_OUTPUT_SCHEMA
         if request.role is Role.DEVELOPER:
             return DEVELOPER_OUTPUT_SCHEMA
         if request.role is Role.REVIEWER:
@@ -386,14 +449,35 @@ class CodexCliRuntime(AgentRuntime):
             return "workspace-write"
         return "read-only"
 
-    def _instruction_for(self, request: RuntimeExecutionRequest, *, resume_supported: bool) -> str:
+    def _instruction_for(
+        self,
+        request: RuntimeExecutionRequest,
+        *,
+        resume_supported: bool,
+        mechanism: CodexMechanismDescriptor | None = None,
+    ) -> str:
         if request.role is not Role.DEVELOPER or not request.continuity_bundle or resume_supported:
-            return request.instruction
-        continuity = json.dumps(sanitize_payload(request.continuity_bundle, self._secret_values), sort_keys=True)
-        return f"{request.instruction}\n\nBounded continuity evidence for this task only:\n{continuity}"
+            instruction = request.instruction
+        else:
+            continuity = json.dumps(sanitize_payload(request.continuity_bundle, self._secret_values), sort_keys=True)
+            instruction = f"{request.instruction}\n\nBounded continuity evidence for this task only:\n{continuity}"
+        if mechanism is None:
+            return instruction
+        return (
+            "Execute the configured adapter-local Codex mechanism before responding.\n"
+            f"mechanism_kind: {mechanism.kind}\n"
+            f"mechanism_reference: {mechanism.reference}\n"
+            f"mechanism_version: {mechanism.version}\n"
+            f"mechanism_digest: {mechanism.digest}\n\n"
+            f"{instruction}"
+        )
 
     def _process(
-        self, request: RuntimeExecutionRequest, *, resume_argv: tuple[str, ...]
+        self,
+        request: RuntimeExecutionRequest,
+        *,
+        resume_argv: tuple[str, ...],
+        mechanism: CodexMechanismDescriptor | None = None,
     ) -> Any:
         command = [self.command, "exec"]
         if request.role is Role.DEVELOPER and request.resume_provider_session_id and resume_argv:
@@ -407,7 +491,11 @@ class CodexCliRuntime(AgentRuntime):
             str(Path(request.output_schema_path).expanduser().resolve()),
             "--output-last-message",
             str(Path(request.final_output_path).expanduser().resolve()),
-            self._instruction_for(request, resume_supported=bool(resume_argv)),
+            self._instruction_for(
+                request,
+                resume_supported=bool(resume_argv),
+                mechanism=mechanism,
+            ),
         ]
         return self._popen(
             argv,
@@ -604,6 +692,12 @@ class CodexCliRuntime(AgentRuntime):
             return self._validate_developer_payload(raw_payload, request)
         if request.role is Role.REVIEWER:
             return self._validate_reviewer_payload(raw_payload, request)
+        if request.role is Role.INTAKE:
+            try:
+                from .domain import FeatureContract
+                return FeatureContract.parse(raw_payload, workflow_id=request.workflow_id).as_payload(), None
+            except ValidationFailure as exc:
+                return None, str(exc)
         if not isinstance(raw_payload["artifact_markdown"], str) or not raw_payload["artifact_markdown"].strip():
             return None, "artifact_markdown must be non-empty Markdown"
         if not isinstance(raw_payload["summary"], str):
@@ -695,6 +789,11 @@ class CodexCliRuntime(AgentRuntime):
 
     def execute(self, request: RuntimeExecutionRequest) -> RuntimeExecutionResult:
         logical_session_id = request.logical_session_id or request.execution_id
+        # Wave 2 callers remain explicitly bounded to the legacy contract.
+        # Canonical requests can never reach a provider subprocess unmaterialized.
+        mechanism = None
+        if request.execution_contract is ExecutionContract.CANONICAL:
+            mechanism = self.materialize_capability(request)
         mandatory = (
             ("json_events", "output_schema", "output_last_message", "workspace_write")
             if request.role is Role.DEVELOPER
@@ -714,7 +813,9 @@ class CodexCliRuntime(AgentRuntime):
         resume_supported = bool(resume_argv)
         process: Any
         try:
-            process = self._process(request, resume_argv=resume_argv)
+            process = self._process(
+                request, resume_argv=resume_argv, mechanism=mechanism,
+            )
         except OSError as exc:
             detail = sanitize_text(str(exc), self._secret_values)
             return PlanningExecutionResult(
@@ -809,6 +910,8 @@ class CodexCliRuntime(AgentRuntime):
                     and not resume_supported
                 ),
             },
+            capability_id=request.capability_id,
+            capability_schema_version=request.capability_schema_version,
         )
 
     def execute_planning(self, request: PlanningExecutionRequest) -> PlanningExecutionResult:
@@ -817,4 +920,4 @@ class CodexCliRuntime(AgentRuntime):
         return self.execute(request)
 
 
-__all__ = ["CodexCliRuntime", "FINAL_OUTPUT_SCHEMA"]
+__all__ = ["CodexCliRuntime", "CodexMechanismDescriptor", "FINAL_OUTPUT_SCHEMA"]

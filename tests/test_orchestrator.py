@@ -14,6 +14,9 @@ from engineering_flow.domain import (  # noqa: E402
     ApprovalState,
     ConflictFailure,
     FailureClassification,
+    CanonicalStage,
+    HumanAttentionOutcome,
+    LifecycleVersion,
     PersistenceFailure,
     Role,
     Stage,
@@ -21,7 +24,7 @@ from engineering_flow.domain import (  # noqa: E402
     WorkKind,
     WorkflowStatus,
 )
-from engineering_flow.orchestrator import PlanningOrchestrator  # noqa: E402
+from engineering_flow.orchestrator import CanonicalLifecycleOrchestrator, PlanningOrchestrator  # noqa: E402
 from engineering_flow.runtime import (  # noqa: E402
     CapabilityReport,
     PlanningExecutionResult,
@@ -82,6 +85,7 @@ class OrchestratorTests(unittest.TestCase):
     def approve_current(self, workflow):
         artifact = self.store.list_artifacts(workflow.id, workflow.stage)[-1]
         return self.orchestrator.approve(workflow.id, artifact.id, "reviewer")
+
 
     def test_required_workflow_is_sequential_and_context_is_scoped(self):
         feature = "Build a durable planning control plane.\n"
@@ -753,6 +757,45 @@ class TaskExecutionOrchestrationTests(unittest.TestCase):
         self.assertEqual(runtime.requests[2].continuity_bundle["review_findings"][0]["id"], "F-1")
         self.assertNotEqual(runtime.requests[1].logical_session_id, runtime.requests[3].logical_session_id)
         self.assertEqual(self.store.get_task(task.id).current_review_window, 2)
+
+class CanonicalLifecycleOrchestratorTests(unittest.TestCase):
+    def setUp(self):
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.store = WorkflowStore(Path(self.tempdir.name) / "workflows.sqlite3")
+        self.workflow = self.store.create_workflow("/repo", provider="fake")
+        self.scope = self.store.create_scope(self.workflow.id, "wave", "1")
+        self.store.record_lifecycle_state(
+            self.workflow.id, lifecycle_version=LifecycleVersion.CANONICAL_V1,
+            stage=CanonicalStage.PRD, status=WorkflowStatus.CREATED,
+            scope_id=self.scope.id, operation_key="initial", request_fingerprint=hashlib.sha256(b"initial").hexdigest(),
+        )
+        self.orchestrator = CanonicalLifecycleOrchestrator(self.store, runtime_name="codex")
+
+    def tearDown(self):
+        self.store.close()
+        self.tempdir.cleanup()
+
+    def test_only_policy_selects_successor_and_records_result_atomically(self):
+        state = self.orchestrator.advance(
+            self.workflow.id, scope_id=self.scope.id, operation_key="prd-result",
+            request_fingerprint=hashlib.sha256(b"prd-result").hexdigest(),
+            normalized_result={"outcome": "success", "capability_id": "prd", "schema_version": "1"},
+            evidence_reference="docs/prd.md", evidence_sha256=hashlib.sha256(b"prd").hexdigest(),
+            supported_providers={"codex": "fake"},
+        )
+        self.assertEqual((state.stage, state.status), (CanonicalStage.DELIVERY_PLAN, WorkflowStatus.CREATED))
+        self.assertEqual(self.store.get_capability_operation("prd-result").status.value, "completed")
+        self.assertEqual(self.store.list_events(self.workflow.id)[-1].type, "canonical.transition.recorded")
+        paused = self.orchestrator.advance(
+            self.workflow.id, scope_id=self.scope.id, operation_key="delivery-result",
+            request_fingerprint=hashlib.sha256(b"delivery-result").hexdigest(),
+            normalized_result={"outcome": "success", "capability_id": "delivery-planning", "schema_version": "1", "architecture_required": True},
+            evidence_reference="docs/plan.md", evidence_sha256=hashlib.sha256(b"plan").hexdigest(),
+            supported_providers={"codex": "fake"},
+        )
+        self.assertEqual(paused.status, WorkflowStatus.HUMAN_ATTENTION)
+        self.assertEqual(self.store.get_capability_operation("delivery-result").attention_outcome,
+                         HumanAttentionOutcome.MISSING_AUTHORITY)
 
 
 if __name__ == "__main__":

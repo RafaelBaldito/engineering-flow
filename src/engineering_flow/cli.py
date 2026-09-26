@@ -30,8 +30,9 @@ from .domain import (
     ValidationFailure,
     Workflow,
     WorkflowStatus,
+    LifecycleVersion,
 )
-from .orchestrator import PlanningOrchestrator
+from .orchestrator import IntakeOrchestrator, PlanningOrchestrator
 from .sanitization import sanitize_payload, sanitize_text
 from .store import WorkflowStore
 
@@ -88,8 +89,10 @@ def build_parser() -> argparse.ArgumentParser:
     init.add_argument("--repo", required=True, metavar="PATH")
 
     run = commands.add_parser("run", help="start a planning workflow")
-    run.add_argument("--repo", required=True, metavar="PATH")
-    run.add_argument("--feature-file", required=True, metavar="PATH")
+    run.add_argument("--repo", default=".", metavar="PATH")
+    input_mode = run.add_mutually_exclusive_group(required=True)
+    input_mode.add_argument("--feature-file", metavar="PATH")
+    input_mode.add_argument("--request", metavar="TEXT")
     run.add_argument("--provider", choices=("codex-cli",), default="codex-cli")
 
     for name in ("status", "approve", "reject", "resume", "intervene", "logs"):
@@ -154,7 +157,21 @@ def _workflow_payload(store: WorkflowStore, workflow: Workflow) -> dict[str, Any
         "latest_execution": execution,
         "tasks": tasks,
         "active_task": active_task,
+        "lifecycle_version": workflow.lifecycle_version.value,
+        **(_intake_payload(store, workflow) if workflow.lifecycle_version is LifecycleVersion.V2 else {}),
     }
+
+
+def _intake_payload(store: WorkflowStore, workflow: Workflow) -> dict[str, Any]:
+    artifacts = store.list_artifacts(workflow.id, Stage.INTAKE)
+    artifact = artifacts[-1] if artifacts else None
+    contract: dict[str, Any] = {}
+    if artifact:
+        parsed = json.loads(store.read_artifact(artifact.id))
+        contract = parsed if isinstance(parsed, dict) else {}
+    feature = contract.get("feature", {}) if isinstance(contract.get("feature"), dict) else {}
+    return {"intake": {"outcome": contract.get("outcome"), "feature_contract_artifact_id": artifact.id if artifact else None,
+                       "open_questions": feature.get("open_questions", [])}}
 
 
 def _task_evidence(store: WorkflowStore, artifact_id: str | None, *, kind: str) -> dict[str, Any] | None:
@@ -248,6 +265,13 @@ def _print_result(document: dict[str, Any], json_output: bool) -> None:
         print(f"status: {document['status']}")
     if document.get("stage"):
         print(f"stage: {document['stage']}")
+    intake = document.get("intake")
+    if intake:
+        print(f"Intake: {intake.get('outcome')}")
+        if intake.get("open_questions"):
+            print("\nOpen questions:")
+            for question in intake["open_questions"]:
+                print(f"- {question}")
     if document.get("artifacts") is not None:
         for artifact in document["artifacts"]:
             print(f"artifact: {artifact['id']} {artifact['stage']} revision={artifact['revision']} approval={artifact['approval_state']}")
@@ -300,7 +324,7 @@ def _validate_feature_file(value: str | Path) -> Path:
     return path
 
 
-def _services(config: FlowConfig) -> tuple[WorkflowStore, PlanningOrchestrator]:
+def _services(config: FlowConfig) -> tuple[WorkflowStore, PlanningOrchestrator, IntakeOrchestrator]:
     store = WorkflowStore(config.database_path)
     runtime = CodexCliRuntime(
         config.provider_command,
@@ -315,7 +339,7 @@ def _services(config: FlowConfig) -> tuple[WorkflowStore, PlanningOrchestrator]:
         timeout_seconds=config.timeout_seconds,
         max_review_cycles=config.max_review_cycles,
     )
-    return store, orchestrator
+    return store, orchestrator, IntakeOrchestrator(store, runtime, timeout_seconds=config.timeout_seconds)
 
 
 def _init(repository_value: str) -> dict[str, Any]:
@@ -363,14 +387,15 @@ def _run_command(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
     if command == "init":
         return _init(args.repo), EXIT_SUCCESS
     config = load_config(args.repo)
-    store, orchestrator = _services(config)
+    store, orchestrator, intake_orchestrator = _services(config)
     try:
         if command == "run":
+            if args.request is not None:
+                workflow = intake_orchestrator.run(config.repository_path, args.request, provider=config.provider_name, configuration_snapshot=config.snapshot)
+                payload = _workflow_payload(store, workflow)
+                return _result_document(command, workflow=workflow, data=payload), EXIT_SUCCESS
             feature_file = _validate_feature_file(args.feature_file)
-            workflow = orchestrator.run(
-                config.repository_path, feature_file=feature_file,
-                provider=config.provider_name, configuration_snapshot=config.snapshot,
-            )
+            workflow = orchestrator.run(config.repository_path, feature_file=feature_file, provider=config.provider_name, configuration_snapshot=config.snapshot)
         elif command == "status":
             workflow = orchestrator.status(args.workflow)
             payload = _workflow_payload(store, workflow)
