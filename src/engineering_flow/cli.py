@@ -35,7 +35,8 @@ from .domain import (
 )
 from .orchestrator import IntakeOrchestrator, PlanningOrchestrator, V2HappyPathCoordinator, V2PlanOrchestrator
 from .presentation import (OutputMode, create_progress_renderer, interactive_prompt_eligible,
-                           prompt_for_plan_decision, render_plan_decision_result,
+                           prompt_for_clarification, prompt_for_plan_decision,
+                           render_clarification_recovery_instruction, render_plan_decision_result,
                            render_recovery_instruction, render_result)
 from .sanitization import sanitize_payload, sanitize_text
 from .store import WorkflowStore
@@ -50,6 +51,7 @@ EXIT_AUTHENTICATION = 6
 EXIT_PERSISTENCE = 7
 EXIT_HUMAN_ATTENTION = 8
 EXIT_INTERRUPTED = 130
+MAX_INTAKE_CALLS_PER_INVOCATION = 5
 
 ERROR_CODES = {
     "usage": "usage",
@@ -371,6 +373,59 @@ def _services(config: FlowConfig) -> tuple[WorkflowStore, PlanningOrchestrator, 
     return store, orchestrator, IntakeOrchestrator(store, runtime, timeout_seconds=config.timeout_seconds), V2PlanOrchestrator(store, runtime, timeout_seconds=config.timeout_seconds)
 
 
+def _close_progress(progress_sink: Any) -> None:
+    close = getattr(progress_sink, "close", None)
+    if callable(close):
+        close()
+
+
+def _continue_v2_clarifications(
+    workflow: Workflow,
+    *,
+    intake: IntakeOrchestrator,
+    plan: V2PlanOrchestrator,
+    progress_sink: Any,
+    interactive: bool,
+    initial_intake_calls: int = 0,
+    no_color: bool = False,
+) -> tuple[Workflow, bool]:
+    """Coordinate terminal interaction around persisted Step 1 boundaries.
+
+    This function deliberately owns no answer state.  Each turn resolves the
+    current clarification from SQLite, sends a single submitted answer through
+    ``resume_answer()``, and then reads persisted state again.
+    """
+
+    calls = initial_intake_calls
+    coordinator = V2HappyPathCoordinator(intake, plan)
+    while workflow.stage is Stage.INTAKE:
+        if workflow.status is WorkflowStatus.READY:
+            return coordinator.continue_ready_to_plan(workflow.id, progress_sink=progress_sink), False
+        if workflow.status not in {WorkflowStatus.NEEDS_CLARIFICATION, WorkflowStatus.FAILED, WorkflowStatus.HUMAN_ATTENTION}:
+            return workflow, False
+        current = intake.store.get_active_clarification(workflow.id)
+        if current is None:
+            return workflow, False
+        if current.answer is not None:
+            if calls >= MAX_INTAKE_CALLS_PER_INVOCATION:
+                return workflow, False
+            workflow = intake.resume_answer(workflow.id, progress_sink=progress_sink)
+            calls += 1
+            continue
+        if not interactive or calls >= MAX_INTAKE_CALLS_PER_INVOCATION:
+            return workflow, False
+        _close_progress(progress_sink)
+        answer = prompt_for_clarification(current.question, sys.stdin, sys.stdout, no_color=no_color)
+        if answer is None:
+            render_clarification_recovery_instruction(sys.stdout, no_color=no_color)
+            return workflow, True
+        # This is the sole answer operation; it persists before dispatching
+        # the provider and is identical to explicit ``resume --answer``.
+        workflow = intake.resume_answer(workflow.id, answer, progress_sink=progress_sink)
+        calls += 1
+    return workflow, False
+
+
 def _resolve_v2_workflow(store: WorkflowStore, explicit_workflow_id: str | None) -> tuple[Workflow, bool]:
     """Resolve explicit V2 context or the persisted selected V2 workflow.
 
@@ -465,6 +520,7 @@ def _run_command(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
     config = load_config(args.repo)
     store, orchestrator, intake_orchestrator, plan_orchestrator = _services(config)
     try:
+        eof_at_clarification = False
         def payload_for(workflow: Workflow) -> dict[str, Any]:
             projection = None
             if (workflow.lifecycle_version is LifecycleVersion.V2 and workflow.stage is Stage.PLAN
@@ -486,9 +542,19 @@ def _run_command(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
                     configuration_snapshot=config.snapshot,
                     progress_sink=progress_sink,
                 )
+                if not args.json_output and workflow.stage is Stage.INTAKE:
+                    workflow, eof_at_clarification = _continue_v2_clarifications(
+                        workflow, intake=intake_orchestrator, plan=plan_orchestrator,
+                        progress_sink=progress_sink,
+                        interactive=interactive_prompt_eligible(sys.stdin, sys.stdout, sys.stderr),
+                        initial_intake_calls=1, no_color=args.no_color,
+                    )
                 payload = payload_for(workflow)
                 code, exit_code = _failure_for_workflow(store, workflow)
                 document = _result_document(command, workflow=workflow, error_code=code, data=payload)
+                if eof_at_clarification:
+                    document["_already_rendered"] = True
+                    return document, exit_code
                 if args.json_output or workflow.stage is not Stage.PLAN or workflow.status is not WorkflowStatus.AWAITING_APPROVAL:
                     return document, exit_code
 
@@ -555,8 +621,16 @@ def _run_command(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
             if existing.lifecycle_version is LifecycleVersion.V2:
                 if args.regenerate:
                     raise ValidationFailure("--regenerate is V1-only")
-                if args.answer is not None or (existing.stage is Stage.INTAKE and existing.status in {WorkflowStatus.NEEDS_CLARIFICATION, WorkflowStatus.FAILED, WorkflowStatus.HUMAN_ATTENTION}):
+                if args.answer is not None:
                     workflow = intake_orchestrator.resume_answer(existing.id, args.answer, progress_sink=(None if args.json_output else create_progress_renderer(sys.stderr, no_color=args.no_color)))
+                elif existing.stage is Stage.INTAKE and existing.status in {WorkflowStatus.NEEDS_CLARIFICATION, WorkflowStatus.FAILED, WorkflowStatus.HUMAN_ATTENTION, WorkflowStatus.READY}:
+                    progress_sink = (None if args.json_output else create_progress_renderer(sys.stderr, no_color=args.no_color))
+                    workflow, eof_at_clarification = _continue_v2_clarifications(
+                        existing, intake=intake_orchestrator, plan=plan_orchestrator,
+                        progress_sink=progress_sink,
+                        interactive=(not args.json_output and interactive_prompt_eligible(sys.stdin, sys.stdout, sys.stderr)),
+                        no_color=args.no_color,
+                    )
                 else:
                     workflow = plan_orchestrator.resume(existing.id, progress_sink=(None if args.json_output else create_progress_renderer(sys.stderr, no_color=args.no_color)))
             else:
@@ -582,7 +656,33 @@ def _run_command(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
                    else (_workflow_payload(store, workflow)
                          if command in ("approve", "reject") and workflow.lifecycle_version is LifecycleVersion.V2
                          else None))
-        return _result_document(command, workflow=workflow, error_code=code, data=payload), exit_code
+        document = _result_document(command, workflow=workflow, error_code=code, data=payload)
+        if eof_at_clarification:
+            document["_already_rendered"] = True
+            return document, exit_code
+        if (command == "resume" and not args.json_output
+                and workflow.lifecycle_version is LifecycleVersion.V2
+                and workflow.stage is Stage.PLAN and workflow.status is WorkflowStatus.AWAITING_APPROVAL
+                and interactive_prompt_eligible(sys.stdin, sys.stdout, sys.stderr)):
+            projection = payload.get("plan", {}).get("projection_error") if isinstance(payload, dict) and isinstance(payload.get("plan"), dict) else None
+            if not projection:
+                artifact_id = plan_orchestrator.resolve_current_pending_plan_artifact(workflow.id)
+                render_result(document, mode=OutputMode.VERBOSE if args.verbose else OutputMode.HUMAN,
+                              stream=sys.stdout, no_color=args.no_color)
+                decision = prompt_for_plan_decision(sys.stdin, sys.stdout, no_color=args.no_color)
+                if decision is None:
+                    render_recovery_instruction(sys.stdout, no_color=args.no_color)
+                    document["_already_rendered"] = True
+                    return document, exit_code
+                action, reason = decision
+                workflow = (plan_orchestrator.approve(workflow.id, artifact_id)
+                            if action == "approve"
+                            else plan_orchestrator.reject(workflow.id, artifact_id, reason=reason))
+                result = _result_document(command, workflow=workflow, data=_workflow_payload(store, workflow))
+                render_plan_decision_result(sys.stdout, action, no_color=args.no_color)
+                result["_already_rendered"] = True
+                return result, EXIT_SUCCESS
+        return document, exit_code
     finally:
         store.close()
 

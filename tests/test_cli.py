@@ -408,6 +408,86 @@ class CliTests(unittest.TestCase):
         self.assertEqual(status["tasks"], [])
         self.assertEqual([artifact["stage"] for artifact in status["artifacts"]], ["intake"])
 
+    def test_interactive_clarifications_re_evaluate_current_question_and_plan_uses_latest_ready_contract(self):
+        class Runtime(FakeRuntime):
+            instances = []
+
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.__class__.instances.append(self)
+
+            def verify_planning_capabilities(self, repository):
+                return CapabilityReport("fake", "fake", str(repository), True, {"read_only": True}, True)
+
+            def execute_planning(self, request):
+                self.requests.append(request)
+                questions = (["Q1", "Q2", "Q3"] if len(self.requests) == 1 else
+                             ["Q4", "Q3"] if len(self.requests) == 2 else [])
+                return PlanningExecutionResult("fake", request.logical_session_id or "s", "thread", request.execution_id,
+                    TerminalState.SUCCEEDED, {"outcome": "NEEDS_CLARIFICATION" if questions else "READY", "feature": {
+                        "id": request.workflow_id, "goal": "Goal", "requirements": [] if questions else ["Requirement"],
+                        "acceptance_criteria": [] if questions else ["Criterion"], "constraints": [], "out_of_scope": [],
+                        "assumptions": [], "open_questions": questions}})
+
+            def execute(self, request):
+                self.requests.append(request)
+                artifact_id, sha256 = re.search(r"artifact UUID ([^,]+), sha256 ([^)]+)", request.instruction).groups()
+                return PlanningExecutionResult("fake", request.logical_session_id or "s", "thread", "turn", TerminalState.SUCCEEDED,
+                    {"plan": {"id": f"{request.workflow_id}:plan:r1", "workflow_id": request.workflow_id, "revision": 1,
+                     "feature_contract": {"artifact_id": artifact_id, "sha256": sha256}, "strategy": "Strategy", "assumptions": [],
+                     "verification_strategy": ["tests"], "tasks": [{"id": "T1", "objective": "Change feature.",
+                     "context": {"relevant_files": ["feature.md"], "existing_patterns": []}, "requirements": ["Requirement"],
+                     "acceptance_criteria": ["Criterion"], "verification": ["tests"], "constraints": [], "depends_on": [],
+                     "complexity": "low", "risk": "low"}]}})
+
+        class Tty(io.StringIO):
+            def isatty(self): return True
+
+        stdout, stderr, stdin = Tty(), Tty(), Tty("A1\nA2\n\n")
+        with patch("engineering_flow.cli.CodexCliRuntime", Runtime), patch("engineering_flow.cli.sys.stdin", stdin), \
+                patch("engineering_flow.cli.sys.stdout", stdout), patch("engineering_flow.cli.sys.stderr", stderr):
+            self.assertEqual(main(["run", "--repo", str(self.repository), "--request", "Ambiguous request"]), 0)
+        self.assertIn("? Q1", stdout.getvalue())
+        self.assertIn("? Q4", stdout.getvalue())
+        self.assertNotIn("? Q2", stdout.getvalue())
+        store = WorkflowStore(self.repository / ".engineering-flow" / "workflows.sqlite3")
+        workflow = store.get_workflow(store.get_selected_workflow_id())
+        records = store.list_clarifications(workflow.id)
+        contracts = store.list_artifacts(workflow.id, Stage.INTAKE)
+        plan = store.list_artifacts(workflow.id, Stage.PLAN)[0]
+        plan_payload = json.loads(store.read_artifact(plan.id))["plan"]
+        self.assertEqual([(item.question, item.answer) for item in records], [("Q1", "A1"), ("Q4", "A2")])
+        self.assertEqual([item.revision for item in contracts], [1, 2, 3])
+        self.assertEqual(plan_payload["feature_contract"], {"artifact_id": contracts[-1].id, "sha256": contracts[-1].sha256})
+        store.close()
+
+    def test_interactive_clarification_eof_does_not_persist_or_dispatch(self):
+        class Runtime(FakeRuntime):
+            instances = []
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.__class__.instances.append(self)
+            def verify_planning_capabilities(self, repository):
+                return CapabilityReport("fake", "fake", str(repository), True, {"read_only": True}, True)
+            def execute_planning(self, request):
+                self.requests.append(request)
+                return PlanningExecutionResult("fake", request.logical_session_id or "s", "thread", request.execution_id,
+                    TerminalState.SUCCEEDED, {"outcome": "NEEDS_CLARIFICATION", "feature": {"id": request.workflow_id,
+                    "goal": "Goal", "requirements": [], "acceptance_criteria": [], "constraints": [], "out_of_scope": [],
+                    "assumptions": [], "open_questions": ["Q1"]}})
+        class Tty(io.StringIO):
+            def isatty(self): return True
+        stdout, stderr, stdin = Tty(), Tty(), Tty("")
+        with patch("engineering_flow.cli.CodexCliRuntime", Runtime), patch("engineering_flow.cli.sys.stdin", stdin), \
+                patch("engineering_flow.cli.sys.stdout", stdout), patch("engineering_flow.cli.sys.stderr", stderr):
+            self.assertEqual(main(["run", "--repo", str(self.repository), "--request", "Ambiguous request"]), 0)
+        self.assertIn("resume --repo . --answer", stdout.getvalue())
+        self.assertEqual(len(Runtime.instances[0].requests), 1)
+        store = WorkflowStore(self.repository / ".engineering-flow" / "workflows.sqlite3")
+        workflow = store.get_workflow(store.get_selected_workflow_id())
+        self.assertIsNone(store.get_active_clarification(workflow.id).answer)
+        store.close()
+
     def test_cli_fake_runtime_reaches_wave_two_after_three_exact_approvals(self):
         with patch("engineering_flow.cli.CodexCliRuntime", FakeRuntime):
             _, text = self.invoke(["run", "--repo", str(self.repository), "--feature-file", str(self.feature)])

@@ -309,11 +309,47 @@ def prompt_for_plan_decision(
         console.print("Please enter y or n.", style="yellow")
 
 
+def prompt_for_clarification(
+    question: str,
+    input_stream: TextIO,
+    output_stream: TextIO,
+    *,
+    no_color: bool = False,
+    environ: Mapping[str, str] | None = None,
+) -> str | None:
+    """Read one non-empty clarification answer at the human boundary.
+
+    ``None`` is reserved for EOF.  Blank input is not an answer, but unlike
+    EOF it is safe to explain and reprompt without changing durable state.
+    """
+
+    console = build_console(output_stream, no_color=no_color, environ=environ)
+    console.print(Text(f"? {question}", style="cyan"))
+    while True:
+        console.print(">", end=" ")
+        answer = input_stream.readline()
+        if answer == "":
+            return None
+        answer = answer.strip()
+        if answer:
+            return answer
+        console.print("Please enter a non-empty answer.", style="yellow")
+
+
 def render_recovery_instruction(output_stream: TextIO, *, no_color: bool = False,
                                 environ: Mapping[str, str] | None = None) -> None:
     console = build_console(output_stream, no_color=no_color, environ=environ)
     console.print("Plan is awaiting approval.", style="yellow")
     console.print("Run `engineering-flow approve --repo .` or `engineering-flow reject --repo . --reason \"...\"`.")
+
+
+def render_clarification_recovery_instruction(output_stream: TextIO, *, no_color: bool = False,
+                                              environ: Mapping[str, str] | None = None) -> None:
+    """Render the bounded recovery seam for an unanswered clarification."""
+
+    console = build_console(output_stream, no_color=no_color, environ=environ)
+    console.print("Clarification remains unanswered.", style="yellow")
+    console.print("Run `engineering-flow resume --repo . --answer \"...\"`.")
 
 
 def render_plan_decision_result(output_stream: TextIO, decision: str, *, no_color: bool = False,
@@ -434,9 +470,11 @@ __all__ = [
     "ProgressRenderer",
     "create_progress_renderer",
     "interactive_prompt_eligible",
+    "prompt_for_clarification",
     "prompt_for_plan_decision",
     "render_plan_decision_result",
     "render_recovery_instruction",
+    "render_clarification_recovery_instruction",
     "render_human",
     "render_plan_summary",
     "render_result",

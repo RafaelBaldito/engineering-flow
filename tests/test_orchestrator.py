@@ -1095,10 +1095,10 @@ class V2PlanApprovalTests(unittest.TestCase):
         self.assertEqual(self.store.get_artifact(plan.id).approval_state, ApprovalState.PENDING)
         self.assertIsNone(self.store.get_approval_for_artifact(plan.id))
 
-        # The Step-2 slice has only revision 1; a mismatched projection is a
-        # representable non-current decision and must also leave it pending.
+        # The cross-stage legacy projection is not V2 Plan authority.  The
+        # malformed canonical binding remains fail-closed regardless of it.
         self.store._connection.execute("UPDATE workflows SET current_artifact_revision = 2 WHERE id = ?", (workflow.id,))
-        with self.assertRaises(ConflictFailure):
+        with self.assertRaises(ValidationFailure):
             orchestrator.approve(workflow.id, plan.id)
         self.assertEqual(self.store.get_artifact(plan.id).approval_state, ApprovalState.PENDING)
 
@@ -1165,11 +1165,12 @@ class V2PlanApprovalTests(unittest.TestCase):
             "verification": ["tests"], "constraints": [], "depends_on": [], "complexity": "low", "risk": "high"}]}})
         Path(plan.path).write_text(original, encoding="utf-8")
         self.store._connection.execute("UPDATE artifacts SET sha256 = ? WHERE id = ?", (hashlib.sha256(original.encode()).hexdigest(), plan.id))
+        # V2 uses the latest Plan in its own stage, not the legacy global
+        # revision (which now points at a different Intake revision in real
+        # clarification workflows).
         self.store._connection.execute("UPDATE workflows SET current_artifact_revision = 2 WHERE id = ?", (workflow.id,))
-        before = self._decision_snapshot(workflow.id, plan.id)
-        with self.assertRaises(ConflictFailure):
-            orchestrator.reject(workflow.id, plan.id, reason="no")
-        self.assertEqual(self._decision_snapshot(workflow.id, plan.id), before)
+        rejected = orchestrator.reject(workflow.id, plan.id, reason="no")
+        self.assertEqual(rejected.status, WorkflowStatus.REJECTED)
 
     def _decision_snapshot(self, workflow_id, artifact_id):
         workflow = self.store.get_workflow(workflow_id)

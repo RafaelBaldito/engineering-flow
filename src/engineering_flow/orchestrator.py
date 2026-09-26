@@ -245,16 +245,7 @@ class V2PlanOrchestrator:
             raise ConflictFailure("workflow is not V2")
         if workflow.stage is Stage.PLAN or not (workflow.stage is Stage.INTAKE and workflow.status is WorkflowStatus.READY):
             return workflow
-        source = self.store.list_artifacts(workflow.id, Stage.INTAKE)
-        if len(source) != 1:
-            raise ValidationFailure("READY Feature Contract artifact is required")
-        feature_artifact = source[0]
-        if feature_artifact.revision != 1 or feature_artifact.approval_state is not ApprovalState.NOT_REQUIRED:
-            raise ValidationFailure("Feature Contract artifact is not a READY Intake artifact")
-        feature_payload = json.loads(self.store.read_artifact(feature_artifact.id))
-        feature = FeatureContract.parse(feature_payload, workflow_id=workflow.id)
-        if feature.outcome is not IntakeOutcome.READY or feature.open_questions:
-            raise ValidationFailure("Feature Contract must be READY")
+        feature_artifact, feature = self._latest_ready_feature_contract(workflow)
         revision = self.store.next_generation_revision(workflow.id, Stage.PLAN)
         plan_id = f"{workflow.id}:plan:r{revision}"
         instruction = (
@@ -373,8 +364,7 @@ class V2PlanOrchestrator:
             raise ConflictFailure("workflow is not awaiting Plan approval")
         candidates = [
             artifact for artifact in self.store.list_artifacts(workflow.id, Stage.PLAN)
-            if artifact.revision == workflow.current_artifact_revision
-            and artifact.approval_state is ApprovalState.PENDING
+            if artifact.approval_state is ApprovalState.PENDING
         ]
         if len(candidates) != 1:
             raise ConflictFailure("could not resolve a unique current pending Plan artifact; specify --artifact")
@@ -403,8 +393,7 @@ class V2PlanOrchestrator:
         artifact = plans[-1]
         if artifact.id != artifact_id:
             raise ConflictFailure("approval targets a stale artifact")
-        if (workflow.current_artifact_revision != artifact.revision
-                or artifact.revision != max(item.revision for item in plans)):
+        if artifact.revision != max(item.revision for item in plans):
             raise ConflictFailure("approval targets a noncurrent Plan artifact")
         if artifact.approval_state is not ApprovalState.PENDING:
             raise ConflictFailure("artifact approval has already been decided")
@@ -417,20 +406,7 @@ class V2PlanOrchestrator:
             payload = json.loads(self.store.read_artifact(artifact.id))
         except json.JSONDecodeError as exc:
             raise ValidationFailure("Plan artifact is not valid JSON") from exc
-        source = self.store.list_artifacts(workflow.id, Stage.INTAKE)
-        if len(source) != 1:
-            raise ValidationFailure("exact READY Feature Contract artifact is required")
-        feature_artifact = source[0]
-        if (feature_artifact.revision != 1
-                or feature_artifact.approval_state is not ApprovalState.NOT_REQUIRED):
-            raise ValidationFailure("Feature Contract artifact is not a READY Intake artifact")
-        try:
-            feature_payload = json.loads(self.store.read_artifact(feature_artifact.id))
-        except json.JSONDecodeError as exc:
-            raise ValidationFailure("Feature Contract artifact is not valid JSON") from exc
-        feature = FeatureContract.parse(feature_payload, workflow_id=workflow.id)
-        if feature.outcome is not IntakeOutcome.READY or feature.open_questions:
-            raise ValidationFailure("Feature Contract must be READY")
+        feature_artifact, feature = self._latest_ready_feature_contract(workflow)
         plan = Plan.parse(
             payload, workflow_id=workflow.id, revision=artifact.revision,
             feature_contract_artifact_id=feature_artifact.id,
@@ -453,20 +429,7 @@ class V2PlanOrchestrator:
             payload = json.loads(self.store.read_artifact(artifact.id))
         except json.JSONDecodeError as exc:
             raise ValidationFailure("Plan artifact is not valid JSON") from exc
-        source = self.store.list_artifacts(workflow.id, Stage.INTAKE)
-        if len(source) != 1:
-            raise ValidationFailure("exact READY Feature Contract artifact is required")
-        feature_artifact = source[0]
-        if (feature_artifact.revision != 1
-                or feature_artifact.approval_state is not ApprovalState.NOT_REQUIRED):
-            raise ValidationFailure("Feature Contract artifact is not a READY Intake artifact")
-        try:
-            feature_payload = json.loads(self.store.read_artifact(feature_artifact.id))
-        except json.JSONDecodeError as exc:
-            raise ValidationFailure("Feature Contract artifact is not valid JSON") from exc
-        feature = FeatureContract.parse(feature_payload, workflow_id=workflow.id)
-        if feature.outcome is not IntakeOutcome.READY or feature.open_questions:
-            raise ValidationFailure("Feature Contract must be READY")
+        feature_artifact, feature = self._latest_ready_feature_contract(workflow)
         plan = Plan.parse(
             payload, workflow_id=workflow.id, revision=artifact.revision,
             feature_contract_artifact_id=feature_artifact.id,
@@ -474,6 +437,24 @@ class V2PlanOrchestrator:
             repository_path=workflow.repository_path,
         )
         return workflow, artifact, plan
+
+    def _latest_ready_feature_contract(self, workflow: Workflow) -> tuple[Any, FeatureContract]:
+        """Resolve the stage-local Feature Contract authority for V2 Plan work."""
+
+        artifacts = self.store.list_artifacts(workflow.id, Stage.INTAKE)
+        if not artifacts:
+            raise ValidationFailure("READY Feature Contract artifact is required")
+        artifact = artifacts[-1]
+        if artifact.approval_state is not ApprovalState.NOT_REQUIRED:
+            raise ValidationFailure("Feature Contract artifact is not a READY Intake artifact")
+        try:
+            payload = json.loads(self.store.read_artifact(artifact.id))
+        except json.JSONDecodeError as exc:
+            raise ValidationFailure("Feature Contract artifact is not valid JSON") from exc
+        feature = FeatureContract.parse(payload, workflow_id=workflow.id)
+        if feature.outcome is not IntakeOutcome.READY or feature.open_questions:
+            raise ValidationFailure("Feature Contract must be READY")
+        return artifact, feature
 
 
 class V2HappyPathCoordinator:
@@ -515,6 +496,14 @@ class V2HappyPathCoordinator:
         # Intake owns creation, so any other stage is an invariant violation,
         # not a reason to infer a successor.
         raise ConflictFailure("Intake reached an unexpected stage; refusing to continue")
+
+    def continue_ready_to_plan(self, workflow_id: str, *, progress_sink: Any = None) -> Workflow:
+        """Advance only a persisted READY Intake boundary into the existing Plan path."""
+
+        workflow = self.intake.status(workflow_id)
+        if workflow.stage is Stage.INTAKE and workflow.status is WorkflowStatus.READY:
+            return self.plan.resume(workflow.id, progress_sink=progress_sink)
+        return workflow
 
 def _emit_progress(sink: Any, stage: Stage, kind: str, elapsed: float) -> None:
     """Emit safe transient stage progress without coupling it to lifecycle work."""
