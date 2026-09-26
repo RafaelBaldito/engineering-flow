@@ -294,6 +294,27 @@ class V2PlanOrchestrator:
         )
         return self.store.get_workflow(workflow.id)
 
+    def resolve_current_pending_plan_artifact(self, workflow_id: str) -> str:
+        """Resolve only the exact V2 Plan that the existing gate can decide."""
+        workflow = self.store.get_workflow(workflow_id)
+        if workflow.lifecycle_version is not LifecycleVersion.V2:
+            raise ConflictFailure("workflow is not V2")
+        if workflow.stage is not Stage.PLAN or workflow.status is not WorkflowStatus.AWAITING_APPROVAL:
+            raise ConflictFailure("workflow is not awaiting Plan approval")
+        candidates = [
+            artifact for artifact in self.store.list_artifacts(workflow.id, Stage.PLAN)
+            if artifact.revision == workflow.current_artifact_revision
+            and artifact.approval_state is ApprovalState.PENDING
+        ]
+        if len(candidates) != 1:
+            raise ConflictFailure("could not resolve a unique current pending Plan artifact; specify --artifact")
+        # Reuse every strict authority check (including bytes, source binding,
+        # revision, ownership, and approval state) before returning an ID.
+        _workflow, artifact, _plan = self._validate_current_plan_decision(
+            workflow.id, candidates[0].id
+        )
+        return artifact.id
+
     def _validate_current_plan_decision(self, workflow_id: str, artifact_id: str) -> tuple[Workflow, Any, Plan]:
         """Verify the immutable Plan boundary shared by both human decisions."""
         workflow = self.store.get_workflow(workflow_id)

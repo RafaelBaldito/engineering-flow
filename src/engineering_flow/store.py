@@ -218,6 +218,10 @@ class WorkflowStore:
             feature_input_sha256 TEXT
             ,lifecycle_version TEXT NOT NULL DEFAULT 'historical'
         );
+        CREATE TABLE IF NOT EXISTS repository_state (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
         CREATE TABLE IF NOT EXISTS sessions (
             id TEXT PRIMARY KEY,
             workflow_id TEXT NOT NULL REFERENCES workflows(id),
@@ -632,6 +636,12 @@ class WorkflowStore:
                  stage.value, WorkflowStatus.CREATED.value, now, now, _json(snapshot),
                  str(retained_feature_path) if retained_feature_path else None, feature_sha256, lifecycle_version.value),
             )
+            if lifecycle_version is LifecycleVersion.V2:
+                conn.execute(
+                    """INSERT INTO repository_state (key, value) VALUES ('selected_workflow_id', ?)
+                    ON CONFLICT(key) DO UPDATE SET value = excluded.value""",
+                    (workflow_id,),
+                )
             self._event_unlocked(conn, workflow_id, "workflow.created", stage=stage,
                                  payload={
                                      "provider": provider, "lifecycle_version": lifecycle_version.value,
@@ -641,6 +651,32 @@ class WorkflowStore:
                                      } if retained_feature_path else {}),
                                  })
         return self.get_workflow(workflow_id)
+
+    def get_selected_workflow_id(self) -> str | None:
+        """Return the repository-local selected workflow pointer, if present.
+
+        Interpretation and validation of the stored value are deliberately a
+        CLI/service concern so a stale pointer is never silently repaired.
+        """
+        row = self._connection.execute(
+            "SELECT value FROM repository_state WHERE key = 'selected_workflow_id'"
+        ).fetchone()
+        return row["value"] if row is not None else None
+
+    def set_selected_workflow_id(self, workflow_id: str) -> None:
+        """Atomically select an existing workflow in this repository database."""
+        try:
+            uuid.UUID(workflow_id)
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise ValidationFailure("invalid workflow id") from exc
+        with self._transaction() as conn:
+            if conn.execute("SELECT 1 FROM workflows WHERE id = ?", (workflow_id,)).fetchone() is None:
+                raise NotFoundFailure(f"workflow not found: {workflow_id}")
+            conn.execute(
+                """INSERT INTO repository_state (key, value) VALUES ('selected_workflow_id', ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value""",
+                (workflow_id,),
+            )
 
     def get_workflow(self, workflow_id: str) -> Workflow:
         row = self._connection.execute("SELECT * FROM workflows WHERE id = ?", (workflow_id,)).fetchone()

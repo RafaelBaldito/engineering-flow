@@ -21,6 +21,7 @@ from engineering_flow.domain import (  # noqa: E402
     WorkflowStatus,
     GovernanceDecision,
     GovernanceDecisionType,
+    NotFoundFailure,
 )
 from engineering_flow.store import WorkflowStore  # noqa: E402
 
@@ -44,6 +45,17 @@ class StoreTests(unittest.TestCase):
             )
         }
         self.assertTrue({"workflows", "artifacts", "approvals", "sessions", "executions", "operations", "events"} <= names)
+        self.assertIn("repository_state", names)
+
+    def test_selected_workflow_context_is_atomic_and_replaces_only_with_valid_workflow(self):
+        self.assertIsNone(self.store.get_selected_workflow_id())
+        first = self.store.create_workflow("/repo", lifecycle_version=LifecycleVersion.V2, stage=Stage.INTAKE)
+        self.assertEqual(self.store.get_selected_workflow_id(), first.id)
+        second = self.store.create_workflow("/repo", lifecycle_version=LifecycleVersion.V2, stage=Stage.INTAKE)
+        self.assertEqual(self.store.get_selected_workflow_id(), second.id)
+        with self.assertRaises(NotFoundFailure):
+            self.store.set_selected_workflow_id("00000000-0000-0000-0000-000000000000")
+        self.assertEqual(self.store.get_selected_workflow_id(), second.id)
 
     def test_opening_pre_lifecycle_database_backfills_historical_default(self):
         legacy_path = Path(self.temp_dir.name) / "legacy.sqlite3"
@@ -68,6 +80,7 @@ class StoreTests(unittest.TestCase):
                          LifecycleVersion.HISTORICAL)
         columns = {row["name"] for row in legacy_store._connection.execute("PRAGMA table_info(workflows)")}
         self.assertIn("lifecycle_version", columns)
+        self.assertIsNone(legacy_store.get_selected_workflow_id())
 
     def test_generation_intent_and_approval_replay_are_idempotent(self):
         workflow = self.store.create_workflow("/repo", configuration_snapshot={"secret": "TOP-SECRET"})

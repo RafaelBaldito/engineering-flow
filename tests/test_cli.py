@@ -134,7 +134,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn("Intake: READY", text)
         workflow_id = next(line.split(": ", 1)[1] for line in text.splitlines() if line.startswith("workflow:"))
-        code, status = self.invoke(["status", "--repo", str(self.repository), "--workflow", workflow_id, "--json"])
+        code, status = self.invoke(["status", "--repo", str(self.repository), "--json"])
         self.assertEqual(code, 0)
         self.assertEqual((status["lifecycle_version"], status["stage"], status["status"]), ("v2", "intake", "ready"))
         self.assertEqual(status["intake"]["outcome"], "READY")
@@ -171,7 +171,7 @@ class CliTests(unittest.TestCase):
         workflow_id = self.ready_v2_workflow()
         stdout, stderr = io.StringIO(), Tty()
         with patch("engineering_flow.cli.CodexCliRuntime", PlanRuntime), contextlib.redirect_stdout(stdout), patch("engineering_flow.cli.sys.stderr", stderr):
-            self.assertEqual(main(["resume", "--repo", str(self.repository), "--workflow", workflow_id]), 0, stdout.getvalue())
+            self.assertEqual(main(["resume", "--repo", str(self.repository)]), 0, stdout.getvalue())
         self.assertNotIn("Codex running", stderr.getvalue())
         self.assertIn("✓ PLAN completed", stderr.getvalue())
         self.assertNotIn("Codex running", stdout.getvalue())
@@ -241,10 +241,10 @@ class CliTests(unittest.TestCase):
             "SELECT id FROM executions WHERE workflow_id = ?", (workflow_id,)
         ).fetchall())
         store.close()
-        code, output = self.invoke(["approve", "--repo", str(self.repository), "--workflow", workflow_id, "--artifact", plan.id])
+        code, output = self.invoke(["approve", "--repo", str(self.repository)])
         self.assertEqual(code, 0)
         self.assertIn("Plan approved.\nNo implementation has started.", output)
-        code, status = self.invoke(["status", "--repo", str(self.repository), "--workflow", workflow_id, "--json"])
+        code, status = self.invoke(["status", "--repo", str(self.repository), "--json"])
         self.assertEqual(code, 0)
         self.assertEqual((status["stage"], status["status"], status["plan"]["approval_state"]),
                          ("plan", "plan_approved", "approved"))
@@ -273,8 +273,7 @@ class CliTests(unittest.TestCase):
         store = WorkflowStore(self.repository / ".engineering-flow" / "workflows.sqlite3")
         plan = store.list_artifacts(workflow_id, Stage.PLAN)[0]
         store.close()
-        code, output = self.invoke(["reject", "--repo", str(self.repository), "--workflow", workflow_id,
-                                    "--artifact", plan.id, "--reason", "Revise boundaries."])
+        code, output = self.invoke(["reject", "--repo", str(self.repository), "--reason", "Revise boundaries."])
         self.assertEqual(code, 0)
         self.assertIn("Plan rejected.\nRejection reason recorded.", output)
         code, status = self.invoke(["status", "--repo", str(self.repository), "--workflow", workflow_id, "--json"])
@@ -393,7 +392,6 @@ class CliTests(unittest.TestCase):
     def test_json_usage_errors_emit_one_stable_result_document(self):
         for argv in (
             ["logs", "--repo", str(self.repository), "--workflow", "id", "--after", "-1", "--json"],
-            ["status", "--repo", str(self.repository), "--json"],
         ):
             code, result = self.invoke(argv)
             self.assertEqual(code, 2)
@@ -402,6 +400,33 @@ class CliTests(unittest.TestCase):
             self.assertIn("workflow_id", result)
             self.assertIn("status", result)
             self.assertIn("stage", result)
+
+        code, result = self.invoke(["status", "--repo", str(self.repository), "--json"])
+        self.assertEqual((code, result["error_code"]), (3, "not_found"))
+        self.assertIn("No workflow is selected", result["message"])
+
+    def test_explicit_v2_status_replaces_selected_workflow_context(self):
+        first = self.ready_v2_workflow()
+        self.ready_v2_workflow()
+        self.assertEqual(self.invoke(["status", "--repo", str(self.repository), "--workflow", first, "--json"])[1]["workflow_id"], first)
+        code, selected = self.invoke(["status", "--repo", str(self.repository), "--json"])
+        self.assertEqual((code, selected["workflow_id"]), (0, first))
+        store = WorkflowStore(self.repository / ".engineering-flow" / "workflows.sqlite3")
+        store._connection.execute("UPDATE repository_state SET value = ? WHERE key = 'selected_workflow_id'", ("not-a-uuid",))
+        store.close()
+        code, result = self.invoke(["status", "--repo", str(self.repository), "--json"])
+        self.assertEqual((code, result["error_code"]), (7, "persistence"))
+        self.assertIn("selected workflow context", result["message"])
+
+    def test_invalid_explicit_workflow_does_not_replace_selection(self):
+        selected = self.ready_v2_workflow()
+        code, result = self.invoke([
+            "status", "--repo", str(self.repository),
+            "--workflow", "00000000-0000-0000-0000-000000000000", "--json",
+        ])
+        self.assertEqual((code, result["error_code"]), (3, "not_found"))
+        code, result = self.invoke(["status", "--repo", str(self.repository), "--json"])
+        self.assertEqual((code, result["workflow_id"]), (0, selected))
 
     def test_run_approve_and_reject_json_are_single_documents_with_empty_stderr(self):
         class IntakeRuntime(FakeRuntime):

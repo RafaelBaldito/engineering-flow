@@ -6,6 +6,7 @@ import argparse
 import json
 import sqlite3
 import sys
+import uuid
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
@@ -103,13 +104,13 @@ def build_parser() -> argparse.ArgumentParser:
     for name in ("status", "approve", "reject", "resume", "intervene", "logs"):
         command = commands.add_parser(name)
         command.add_argument("--repo", required=True, metavar="PATH")
-        command.add_argument("--workflow", required=True, metavar="ID")
+        command.add_argument("--workflow", required=name in ("intervene", "logs"), metavar="ID")
         output = command.add_mutually_exclusive_group()
         output.add_argument("--json", action="store_true", dest="json_output")
         output.add_argument("--verbose", action="store_true")
         command.add_argument("--no-color", action="store_true")
         if name in ("approve", "reject"):
-            command.add_argument("--artifact", required=True, metavar="ID")
+            command.add_argument("--artifact", required=False, metavar="ID")
         if name in ("approve", "reject"):
             command.add_argument("--reason", required=name == "reject", metavar="TEXT")
         if name == "resume":
@@ -356,6 +357,53 @@ def _services(config: FlowConfig) -> tuple[WorkflowStore, PlanningOrchestrator, 
     return store, orchestrator, IntakeOrchestrator(store, runtime, timeout_seconds=config.timeout_seconds), V2PlanOrchestrator(store, runtime, timeout_seconds=config.timeout_seconds)
 
 
+def _resolve_v2_workflow(store: WorkflowStore, explicit_workflow_id: str | None) -> tuple[Workflow, bool]:
+    """Resolve explicit V2 context or the persisted selected V2 workflow.
+
+    The boolean records explicit use; selection is deliberately updated only
+    after the command itself completes successfully.
+    """
+    if explicit_workflow_id is not None:
+        try:
+            uuid.UUID(explicit_workflow_id)
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise ValidationFailure("invalid workflow id") from exc
+        workflow = store.get_workflow(explicit_workflow_id)
+        _require_local_workflow(store, workflow)
+        if workflow.lifecycle_version is not LifecycleVersion.V2:
+            return workflow, True
+        return workflow, True
+
+    selected_workflow_id = store.get_selected_workflow_id()
+    if selected_workflow_id is None:
+        raise NotFoundFailure(
+            "No workflow is selected for this repository. Run a V2 workflow or specify --workflow <id>."
+        )
+    try:
+        uuid.UUID(selected_workflow_id)
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise PersistenceFailure("selected workflow context contains an invalid workflow id") from exc
+    try:
+        workflow = store.get_workflow(selected_workflow_id)
+    except NotFoundFailure as exc:
+        raise PersistenceFailure("selected workflow context refers to a missing workflow") from exc
+    _require_local_workflow(store, workflow)
+    if workflow.lifecycle_version is not LifecycleVersion.V2:
+        raise ConflictFailure("selected workflow context does not refer to a V2 workflow")
+    return workflow, False
+
+
+def _require_local_workflow(store: WorkflowStore, workflow: Workflow) -> None:
+    """Reject a copied/cross-repository workflow record before it becomes context."""
+    try:
+        repository_path = Path(workflow.repository_path).resolve()
+        database_repository = store.workspace_path.parent.resolve()
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        raise PersistenceFailure("workflow repository context is invalid") from exc
+    if repository_path != database_repository:
+        raise ConflictFailure("workflow does not belong to this repository context")
+
+
 def _init(repository_value: str) -> dict[str, Any]:
     try:
         repository = Path(repository_value).expanduser().resolve()
@@ -428,36 +476,51 @@ def _run_command(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
             feature_file = _validate_feature_file(args.feature_file)
             workflow = orchestrator.run(config.repository_path, feature_file=feature_file, provider=config.provider_name, configuration_snapshot=config.snapshot)
         elif command == "status":
-            workflow = orchestrator.status(args.workflow)
+            workflow, explicit = _resolve_v2_workflow(store, args.workflow)
+            workflow = orchestrator.status(workflow.id)
             payload = payload_for(workflow)
+            if explicit and workflow.lifecycle_version is LifecycleVersion.V2:
+                store.set_selected_workflow_id(workflow.id)
             code, exit_code = _failure_for_workflow(store, workflow)
             return _result_document(command, workflow=workflow, error_code=code, data=payload), exit_code
         elif command == "approve":
-            existing = store.get_workflow(args.workflow)
+            existing, explicit = _resolve_v2_workflow(store, args.workflow)
             if existing.lifecycle_version is LifecycleVersion.V2:
-                workflow = plan_orchestrator.approve(args.workflow, args.artifact, reason=args.reason)
+                artifact_id = args.artifact or plan_orchestrator.resolve_current_pending_plan_artifact(existing.id)
+                workflow = plan_orchestrator.approve(existing.id, artifact_id, reason=args.reason)
             else:
-                workflow = orchestrator.approve(args.workflow, args.artifact, reason=args.reason)
+                if args.artifact is None:
+                    raise ValidationFailure("--artifact is required for V1 workflows")
+                workflow = orchestrator.approve(existing.id, args.artifact, reason=args.reason)
+            if explicit and workflow.lifecycle_version is LifecycleVersion.V2:
+                store.set_selected_workflow_id(workflow.id)
         elif command == "reject":
-            existing = store.get_workflow(args.workflow)
+            existing, explicit = _resolve_v2_workflow(store, args.workflow)
             if existing.lifecycle_version is LifecycleVersion.V2:
-                workflow = plan_orchestrator.reject(args.workflow, args.artifact, reason=args.reason)
+                artifact_id = args.artifact or plan_orchestrator.resolve_current_pending_plan_artifact(existing.id)
+                workflow = plan_orchestrator.reject(existing.id, artifact_id, reason=args.reason)
             else:
-                workflow = orchestrator.reject(args.workflow, args.artifact, reason=args.reason)
+                if args.artifact is None:
+                    raise ValidationFailure("--artifact is required for V1 workflows")
+                workflow = orchestrator.reject(existing.id, args.artifact, reason=args.reason)
+            if explicit and workflow.lifecycle_version is LifecycleVersion.V2:
+                store.set_selected_workflow_id(workflow.id)
         elif command == "resume":
-            existing = store.get_workflow(args.workflow)
+            existing, explicit = _resolve_v2_workflow(store, args.workflow)
             if existing.lifecycle_version is LifecycleVersion.V2:
                 if args.regenerate:
                     raise ValidationFailure("--regenerate is V1-only")
                 workflow = plan_orchestrator.resume(
-                    args.workflow,
+                    existing.id,
                     progress_sink=(None if args.json_output else create_progress_renderer(
                         sys.stderr, no_color=args.no_color,
                     )),
                 )
             else:
                 regenerate = {"prd": Stage.PRD, "techspec": Stage.TECHSPEC, "task-plan": Stage.TASK_PLAN}.get(args.regenerate)
-                workflow = orchestrator.resume(args.workflow, regenerate=regenerate)
+                workflow = orchestrator.resume(existing.id, regenerate=regenerate)
+            if explicit and workflow.lifecycle_version is LifecycleVersion.V2:
+                store.set_selected_workflow_id(workflow.id)
         elif command == "intervene":
             workflow = orchestrator.intervene(args.workflow, args.task, reason=args.reason)
         elif command == "logs":

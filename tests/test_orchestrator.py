@@ -958,6 +958,14 @@ class V2PlanApprovalTests(unittest.TestCase):
             "SELECT COUNT(*) FROM task_artifacts WHERE workflow_id = ?", (workflow.id,)
         ).fetchone()[0], 0)
 
+    def test_current_pending_plan_resolution_reuses_strict_authority_checks(self):
+        workflow, plan, _feature, runtime = self.pending_plan()
+        orchestrator = V2PlanOrchestrator(self.store, runtime)
+        self.assertEqual(orchestrator.resolve_current_pending_plan_artifact(workflow.id), plan.id)
+        Path(plan.path).write_text("tampered", encoding="utf-8")
+        with self.assertRaises(ArtifactCorruptionFailure):
+            orchestrator.resolve_current_pending_plan_artifact(workflow.id)
+
     def test_approval_guards_fail_closed_for_wrong_duplicate_tampered_and_invalid_inputs(self):
         workflow, plan, feature, runtime = self.pending_plan()
         orchestrator = V2PlanOrchestrator(self.store, runtime)
