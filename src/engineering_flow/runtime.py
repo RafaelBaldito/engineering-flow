@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any, Mapping, Protocol, Sequence
+from typing import Any, Callable, Mapping, Protocol, Sequence
 
 from .domain import (
     CanonicalStage,
@@ -151,6 +151,16 @@ class NormalizedEvent:
         return self.type
 
 
+@dataclass(frozen=True, slots=True)
+class RuntimeProgressEvent:
+    """Transient, safe execution progress; never durable workflow evidence."""
+
+    kind: str
+    stage: Stage
+    elapsed_seconds: float
+    message: str | None = None
+
+
 _DEVELOPER_CONTINUITY_KEYS = frozenset({
     "task_contract", "developer_result", "test_evidence", "review_findings",
 })
@@ -188,6 +198,7 @@ class RuntimeExecutionRequest:
     runtime_name: str | None = None
     provider_name: str | None = None
     execution_contract: ExecutionContract = ExecutionContract.LEGACY
+    progress_sink: Callable[[RuntimeProgressEvent], None] | None = None
 
     def __post_init__(self) -> None:
         if not self.workflow_id or not self.execution_id:

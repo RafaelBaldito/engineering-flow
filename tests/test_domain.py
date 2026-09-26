@@ -1,5 +1,6 @@
 import dataclasses
 import sys
+import tempfile
 from pathlib import Path
 import unittest
 
@@ -24,6 +25,7 @@ from engineering_flow.domain import (  # noqa: E402
     GovernanceDecisionType,
     FeatureContract,
     IntakeOutcome,
+    Plan,
     ValidationFailure,
 )
 
@@ -31,7 +33,7 @@ from engineering_flow.domain import (  # noqa: E402
 class DomainTests(unittest.TestCase):
     def test_domain_enums_are_provider_neutral_and_complete(self):
         self.assertEqual([stage.value for stage in Stage], [
-            "intake", "prd", "techspec", "task_plan", "ready_for_wave_2",
+            "intake", "plan", "prd", "techspec", "task_plan", "ready_for_wave_2",
             "task_execution", "tasks_ready_for_wave_review",
         ])
         self.assertEqual({item.value for item in WorkflowStatus}, {
@@ -103,6 +105,48 @@ class DomainTests(unittest.TestCase):
         payload["unexpected"] = True
         with self.assertRaisesRegex(ValidationFailure, "only outcome and feature"):
             FeatureContract.parse(payload, workflow_id="workflow-1")
+
+    def test_plan_parser_rejects_critical_contract_violations(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "source.py").write_text("x = 1\n", encoding="utf-8")
+            def payload():
+                return {"plan": {"id": "workflow-1:plan:r1", "workflow_id": "workflow-1", "revision": 1,
+                    "feature_contract": {"artifact_id": "artifact-1", "sha256": "hash-1"}, "strategy": "Plan it.",
+                    "assumptions": [], "verification_strategy": ["unit tests"], "tasks": [{"id": "T1", "objective": "Change it.",
+                    "context": {"relevant_files": ["source.py"], "existing_patterns": []}, "requirements": ["Requirement"],
+                    "acceptance_criteria": ["Criterion"], "verification": ["tests"], "constraints": [],
+                    "depends_on": [], "complexity": "low", "risk": "high"}]}}
+            parse = lambda value: Plan.parse(value, workflow_id="workflow-1", revision=1,
+                feature_contract_artifact_id="artifact-1", feature_contract_sha256="hash-1", repository_path=root)
+            for mutate, message in (
+                (lambda item: item["plan"]["feature_contract"].update(artifact_id="wrong"), "binding"),
+                (lambda item: item["plan"]["tasks"][0].update(depends_on=["T2"]), "dependencies"),
+                (lambda item: item["plan"]["tasks"][0]["context"].update(relevant_files=["../outside.py"]), "repository-relative"),
+                (lambda item: item["plan"].update(assumptions=["same", "same"]), "duplicates"),
+            ):
+                value = payload()
+                mutate(value)
+                with self.assertRaisesRegex(ValidationFailure, message):
+                    parse(value)
+
+    def test_plan_parser_validates_complexity_and_risk_independently(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "source.py").write_text("x = 1\n", encoding="utf-8")
+            value = {"plan": {"id": "workflow-1:plan:r1", "workflow_id": "workflow-1", "revision": 1,
+                "feature_contract": {"artifact_id": "artifact-1", "sha256": "hash-1"}, "strategy": "Plan it.",
+                "assumptions": [], "verification_strategy": ["unit tests"], "tasks": [{"id": "T1", "objective": "Change it.",
+                "context": {"relevant_files": ["source.py"], "existing_patterns": []}, "requirements": ["Requirement"],
+                "acceptance_criteria": ["Criterion"], "verification": ["tests"], "constraints": [], "depends_on": [],
+                "complexity": "low", "risk": "high"}]}}
+            parsed = Plan.parse(value, workflow_id="workflow-1", revision=1, feature_contract_artifact_id="artifact-1",
+                feature_contract_sha256="hash-1", repository_path=root)
+            self.assertEqual((parsed.tasks[0].complexity, parsed.tasks[0].risk), ("low", "high"))
+            value["plan"]["tasks"][0]["risk"] = "invalid"
+            with self.assertRaisesRegex(ValidationFailure, "complexity and risk"):
+                Plan.parse(value, workflow_id="workflow-1", revision=1, feature_contract_artifact_id="artifact-1",
+                    feature_contract_sha256="hash-1", repository_path=root)
 
 
 if __name__ == "__main__":

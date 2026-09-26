@@ -32,7 +32,7 @@ from .domain import (
     WorkflowStatus,
     LifecycleVersion,
 )
-from .orchestrator import IntakeOrchestrator, PlanningOrchestrator
+from .orchestrator import IntakeOrchestrator, PlanningOrchestrator, V2PlanOrchestrator
 from .sanitization import sanitize_payload, sanitize_text
 from .store import WorkflowStore
 
@@ -107,6 +107,7 @@ def build_parser() -> argparse.ArgumentParser:
             command.add_argument("--reason", required=name == "reject", metavar="TEXT")
         if name == "resume":
             command.add_argument("--regenerate", choices=("prd", "techspec", "task-plan"))
+            command.add_argument("--json", action="store_true", dest="json_output")
         if name == "intervene":
             command.add_argument("--task", required=True, metavar="ID")
             command.add_argument("--reason", required=True, metavar="TEXT")
@@ -159,6 +160,7 @@ def _workflow_payload(store: WorkflowStore, workflow: Workflow) -> dict[str, Any
         "active_task": active_task,
         "lifecycle_version": workflow.lifecycle_version.value,
         **(_intake_payload(store, workflow) if workflow.lifecycle_version is LifecycleVersion.V2 else {}),
+        **(_plan_payload(store, workflow) if workflow.lifecycle_version is LifecycleVersion.V2 and workflow.stage is Stage.PLAN else {}),
     }
 
 
@@ -172,6 +174,16 @@ def _intake_payload(store: WorkflowStore, workflow: Workflow) -> dict[str, Any]:
     feature = contract.get("feature", {}) if isinstance(contract.get("feature"), dict) else {}
     return {"intake": {"outcome": contract.get("outcome"), "feature_contract_artifact_id": artifact.id if artifact else None,
                        "open_questions": feature.get("open_questions", [])}}
+
+
+def _plan_payload(store: WorkflowStore, workflow: Workflow) -> dict[str, Any]:
+    artifacts = store.list_artifacts(workflow.id, Stage.PLAN)
+    if not artifacts:
+        return {"plan": None}
+    artifact = artifacts[-1]
+    plan = json.loads(store.read_artifact(artifact.id))
+    return {"plan": {"artifact_id": artifact.id, "sha256": artifact.sha256, "revision": artifact.revision,
+                      "approval_state": artifact.approval_state.value, **plan}}
 
 
 def _task_evidence(store: WorkflowStore, artifact_id: str | None, *, kind: str) -> dict[str, Any] | None:
@@ -272,6 +284,19 @@ def _print_result(document: dict[str, Any], json_output: bool) -> None:
             print("\nOpen questions:")
             for question in intake["open_questions"]:
                 print(f"- {question}")
+    plan = document.get("plan")
+    if plan:
+        details = plan.get("plan", {})
+        print(f"Plan: {details.get('id')} revision={plan.get('revision')} artifact={plan.get('artifact_id')} approval={plan.get('approval_state')}")
+        print(f"Strategy: {details.get('strategy')}")
+        for task in details.get("tasks", []):
+            print(f"Task {task['id']}: {task['objective']} (depends_on={task['depends_on']}, complexity={task['complexity']}, risk={task['risk']})")
+            for name in ("relevant_files", "existing_patterns"):
+                print(f"  {name}: {task['context'][name]}")
+            for name in ("requirements", "acceptance_criteria", "verification", "constraints"):
+                print(f"  {name}: {task[name]}")
+        if document.get("status") == WorkflowStatus.AWAITING_APPROVAL.value:
+            print("Waiting for human approval.")
     if document.get("artifacts") is not None:
         for artifact in document["artifacts"]:
             print(f"artifact: {artifact['id']} {artifact['stage']} revision={artifact['revision']} approval={artifact['approval_state']}")
@@ -324,7 +349,7 @@ def _validate_feature_file(value: str | Path) -> Path:
     return path
 
 
-def _services(config: FlowConfig) -> tuple[WorkflowStore, PlanningOrchestrator, IntakeOrchestrator]:
+def _services(config: FlowConfig) -> tuple[WorkflowStore, PlanningOrchestrator, IntakeOrchestrator, V2PlanOrchestrator]:
     store = WorkflowStore(config.database_path)
     runtime = CodexCliRuntime(
         config.provider_command,
@@ -339,7 +364,22 @@ def _services(config: FlowConfig) -> tuple[WorkflowStore, PlanningOrchestrator, 
         timeout_seconds=config.timeout_seconds,
         max_review_cycles=config.max_review_cycles,
     )
-    return store, orchestrator, IntakeOrchestrator(store, runtime, timeout_seconds=config.timeout_seconds)
+    return store, orchestrator, IntakeOrchestrator(store, runtime, timeout_seconds=config.timeout_seconds), V2PlanOrchestrator(store, runtime, timeout_seconds=config.timeout_seconds)
+
+
+def _progress_renderer() -> Callable[[Any], None] | None:
+    if not sys.stderr.isatty():
+        return None
+    def render(event: Any) -> None:
+        if event.kind == "started": text = "→ PLAN started"
+        elif event.kind == "heartbeat": text = f"  Codex running... {event.elapsed_seconds:.0f}s"
+        elif event.kind == "activity": text = f"  {event.message}" if event.message else ""
+        elif event.kind == "completed": text = f"✓ PLAN completed ({event.elapsed_seconds:.1f}s)"
+        elif event.kind == "timed_out": text = f"✗ PLAN timed out ({event.elapsed_seconds:.1f}s)"
+        else: text = f"✗ PLAN failed ({event.elapsed_seconds:.1f}s)"
+        if text:
+            print(text, file=sys.stderr, flush=True)
+    return render
 
 
 def _init(repository_value: str) -> dict[str, Any]:
@@ -387,7 +427,7 @@ def _run_command(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
     if command == "init":
         return _init(args.repo), EXIT_SUCCESS
     config = load_config(args.repo)
-    store, orchestrator, intake_orchestrator = _services(config)
+    store, orchestrator, intake_orchestrator, plan_orchestrator = _services(config)
     try:
         if command == "run":
             if args.request is not None:
@@ -406,8 +446,14 @@ def _run_command(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
         elif command == "reject":
             workflow = orchestrator.reject(args.workflow, args.artifact, reason=args.reason)
         elif command == "resume":
-            regenerate = {"prd": Stage.PRD, "techspec": Stage.TECHSPEC, "task-plan": Stage.TASK_PLAN}.get(args.regenerate)
-            workflow = orchestrator.resume(args.workflow, regenerate=regenerate)
+            existing = store.get_workflow(args.workflow)
+            if existing.lifecycle_version is LifecycleVersion.V2:
+                if args.regenerate:
+                    raise ValidationFailure("--regenerate is V1-only")
+                workflow = plan_orchestrator.resume(args.workflow, progress_sink=None if args.json_output else _progress_renderer())
+            else:
+                regenerate = {"prd": Stage.PRD, "techspec": Stage.TECHSPEC, "task-plan": Stage.TASK_PLAN}.get(args.regenerate)
+                workflow = orchestrator.resume(args.workflow, regenerate=regenerate)
         elif command == "intervene":
             workflow = orchestrator.intervene(args.workflow, args.task, reason=args.reason)
         elif command == "logs":
@@ -419,7 +465,8 @@ def _run_command(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
         else:
             raise ValidationFailure(f"unsupported command: {command}")
         code, exit_code = _failure_for_workflow(store, workflow)
-        return _result_document(command, workflow=workflow, error_code=code), exit_code
+        payload = _workflow_payload(store, workflow) if command == "resume" and workflow.lifecycle_version is LifecycleVersion.V2 else None
+        return _result_document(command, workflow=workflow, error_code=code, data=payload), exit_code
     finally:
         store.close()
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Mapping
+from pathlib import Path, PurePosixPath
 
 
 class _ValueEnum(str, Enum):
@@ -14,6 +15,7 @@ class _ValueEnum(str, Enum):
 
 class Stage(_ValueEnum):
     INTAKE = "intake"
+    PLAN = "plan"
     PRD = "prd"
     TECHSPEC = "techspec"
     TASK_PLAN = "task_plan"
@@ -338,6 +340,114 @@ class FeatureContract:
             "out_of_scope": list(self.out_of_scope), "assumptions": list(self.assumptions),
             "open_questions": list(self.open_questions),
         }}
+
+
+def _plan_text(value: Any, name: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValidationFailure(f"Plan {name} must be a non-empty string")
+    return value
+
+
+def _plan_texts(value: Any, name: str) -> tuple[str, ...]:
+    if not isinstance(value, list) or not all(isinstance(item, str) and item.strip() for item in value):
+        raise ValidationFailure(f"Plan {name} must be a list of non-empty strings")
+    if len(set(value)) != len(value):
+        raise ValidationFailure(f"Plan {name} must not contain duplicates")
+    return tuple(value)
+
+
+@dataclass(frozen=True, slots=True)
+class TaskContract:
+    id: str
+    objective: str
+    relevant_files: tuple[str, ...]
+    existing_patterns: tuple[str, ...]
+    requirements: tuple[str, ...]
+    acceptance_criteria: tuple[str, ...]
+    verification: tuple[str, ...]
+    constraints: tuple[str, ...]
+    depends_on: tuple[str, ...]
+    complexity: str
+    risk: str
+
+    def as_payload(self) -> dict[str, Any]:
+        return {"id": self.id, "objective": self.objective, "context": {"relevant_files": list(self.relevant_files), "existing_patterns": list(self.existing_patterns)}, "requirements": list(self.requirements), "acceptance_criteria": list(self.acceptance_criteria), "verification": list(self.verification), "constraints": list(self.constraints), "depends_on": list(self.depends_on), "complexity": self.complexity, "risk": self.risk}
+
+
+@dataclass(frozen=True, slots=True)
+class Plan:
+    id: str
+    workflow_id: str
+    revision: int
+    feature_contract_artifact_id: str
+    feature_contract_sha256: str
+    strategy: str
+    assumptions: tuple[str, ...]
+    verification_strategy: tuple[str, ...]
+    tasks: tuple[TaskContract, ...]
+
+    @classmethod
+    def parse(cls, value: Mapping[str, Any], *, workflow_id: str, revision: int,
+              feature_contract_artifact_id: str, feature_contract_sha256: str,
+              repository_path: str | Path) -> "Plan":
+        if not isinstance(value, Mapping) or set(value) != {"plan"} or not isinstance(value["plan"], Mapping):
+            raise ValidationFailure("Plan must contain only plan")
+        plan = value["plan"]
+        expected = {"id", "workflow_id", "revision", "feature_contract", "strategy", "assumptions", "verification_strategy", "tasks"}
+        if set(plan) != expected:
+            raise ValidationFailure("Plan has an invalid shape")
+        feature = plan["feature_contract"]
+        if not isinstance(feature, Mapping) or set(feature) != {"artifact_id", "sha256"}:
+            raise ValidationFailure("Plan feature_contract has an invalid shape")
+        plan_id = _plan_text(plan["id"], "id")
+        if plan_id != f"{workflow_id}:plan:r{revision}" or _plan_text(plan["workflow_id"], "workflow_id") != workflow_id or plan["revision"] != revision:
+            raise ValidationFailure("Plan identity does not match generation intent")
+        if _plan_text(feature["artifact_id"], "feature_contract.artifact_id") != feature_contract_artifact_id or _plan_text(feature["sha256"], "feature_contract.sha256") != feature_contract_sha256:
+            raise ValidationFailure("Plan Feature Contract binding does not match verified source")
+        raw_tasks = plan["tasks"]
+        if not isinstance(raw_tasks, list) or not raw_tasks:
+            raise ValidationFailure("Plan tasks must be a non-empty list")
+        repository = Path(repository_path).resolve()
+        tasks: list[TaskContract] = []
+        for index, raw in enumerate(raw_tasks, 1):
+            task_expected = {"id", "objective", "context", "requirements", "acceptance_criteria", "verification", "constraints", "depends_on", "complexity", "risk"}
+            if not isinstance(raw, Mapping) or set(raw) != task_expected or not isinstance(raw["context"], Mapping) or set(raw["context"]) != {"relevant_files", "existing_patterns"}:
+                raise ValidationFailure("Task Contract has an invalid shape")
+            task_id = _plan_text(raw["id"], "task.id")
+            if task_id != f"T{index}":
+                raise ValidationFailure("Task IDs must be contiguous T1, T2, ...")
+            files = _plan_texts(raw["context"]["relevant_files"], "context.relevant_files")
+            for item in files:
+                parsed = PurePosixPath(item)
+                if parsed.is_absolute() or any(part in (".", "..") for part in parsed.parts) or str(parsed) != item:
+                    raise ValidationFailure("Task relevant_files must be normalized repository-relative paths")
+                try:
+                    resolved = (repository / Path(*parsed.parts)).resolve()
+                    resolved.relative_to(repository)
+                except ValueError as exc:
+                    raise ValidationFailure("Task relevant_files escapes repository") from exc
+                if not resolved.is_file():
+                    raise ValidationFailure("Task relevant_files must exist as files")
+            dependencies = _plan_texts(raw["depends_on"], "depends_on")
+            known = {task.id for task in tasks}
+            if any(dep == task_id or dep not in known for dep in dependencies):
+                raise ValidationFailure("Task dependencies must refer only to earlier tasks")
+            complexity, risk = _plan_text(raw["complexity"], "complexity"), _plan_text(raw["risk"], "risk")
+            if complexity not in {"low", "medium", "high"} or risk not in {"low", "medium", "high"}:
+                raise ValidationFailure("Task complexity and risk must be low, medium, or high")
+            tasks.append(TaskContract(task_id, _plan_text(raw["objective"], "objective"), files,
+                _plan_texts(raw["context"]["existing_patterns"], "context.existing_patterns"), _plan_texts(raw["requirements"], "requirements"),
+                _plan_texts(raw["acceptance_criteria"], "acceptance_criteria"), _plan_texts(raw["verification"], "verification"),
+                _plan_texts(raw["constraints"], "constraints"), dependencies, complexity, risk))
+        return cls(plan_id, workflow_id, revision, feature_contract_artifact_id, feature_contract_sha256,
+                   _plan_text(plan["strategy"], "strategy"), _plan_texts(plan["assumptions"], "assumptions"),
+                   _plan_texts(plan["verification_strategy"], "verification_strategy"), tuple(tasks))
+
+    def as_payload(self) -> dict[str, Any]:
+        return {"plan": {"id": self.id, "workflow_id": self.workflow_id, "revision": self.revision,
+                "feature_contract": {"artifact_id": self.feature_contract_artifact_id, "sha256": self.feature_contract_sha256},
+                "strategy": self.strategy, "assumptions": list(self.assumptions), "verification_strategy": list(self.verification_strategy),
+                "tasks": [task.as_payload() for task in self.tasks]}}
 
 
 @dataclass(frozen=True, slots=True)

@@ -24,7 +24,7 @@ from engineering_flow.domain import (  # noqa: E402
     WorkKind,
     WorkflowStatus,
 )
-from engineering_flow.orchestrator import CanonicalLifecycleOrchestrator, IntakeOrchestrator, PlanningOrchestrator  # noqa: E402
+from engineering_flow.orchestrator import CanonicalLifecycleOrchestrator, IntakeOrchestrator, PlanningOrchestrator, V2PlanOrchestrator  # noqa: E402
 from engineering_flow.runtime import (  # noqa: E402
     CapabilityReport,
     PlanningExecutionResult,
@@ -830,6 +830,32 @@ class CanonicalLifecycleOrchestratorTests(unittest.TestCase):
         self.assertEqual(paused.status, WorkflowStatus.HUMAN_ATTENTION)
         self.assertEqual(self.store.get_capability_operation("delivery-result").attention_outcome,
                          HumanAttentionOutcome.MISSING_AUTHORITY)
+
+
+class V2PlanTests(unittest.TestCase):
+    def test_ready_contract_becomes_pending_plan_without_task_rows(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.py"
+            source.write_text("x = 1\n", encoding="utf-8")
+            store = WorkflowStore(root / ".engineering-flow" / "workflows.sqlite3")
+            class Runtime(FakeRuntime):
+                def execute(self, request):
+                    self.requests.append(request)
+                    return PlanningExecutionResult(self.provider, request.logical_session_id or "s", "thread", "turn", TerminalState.SUCCEEDED, {"plan": {"id": f"{request.workflow_id}:plan:r1", "workflow_id": request.workflow_id, "revision": 1, "feature_contract": {"artifact_id": feature.id, "sha256": feature.sha256}, "strategy": "Change source.", "assumptions": [], "verification_strategy": ["unit tests"], "tasks": [{"id": "T1", "objective": "Change source.", "context": {"relevant_files": ["source.py"], "existing_patterns": []}, "requirements": ["Update behavior."], "acceptance_criteria": ["Works."], "verification": ["tests"], "constraints": [], "depends_on": [], "complexity": "low", "risk": "high"}]}})
+            runtime = Runtime()
+            intake = IntakeOrchestrator(store, runtime)
+            # Persist a verified READY source without invoking the intake fake.
+            workflow = store.create_workflow(root, provider="fake", configuration_snapshot={}, feature_content=b"request", feature_path=root / ".engineering-flow" / "workflows" / "input", lifecycle_version=LifecycleVersion.V2, stage=Stage.INTAKE)
+            intent = store.create_generation_intent(workflow.id, Stage.INTAKE, request_hash="source", provider="fake", role=Role.INTAKE, revision=1, artifact_path=root / ".engineering-flow" / "workflows" / workflow.id / "artifacts" / "001-feature-contract.json")
+            payload = {"outcome": "READY", "feature": {"id": workflow.id, "goal": "Goal", "requirements": ["Requirement"], "acceptance_criteria": ["Criterion"], "constraints": [], "out_of_scope": [], "assumptions": [], "open_questions": []}}
+            feature = store.complete_generation(intent.operation.idempotency_key, content=json.dumps(payload), artifact_path=root / ".engineering-flow" / "workflows" / workflow.id / "artifacts" / "001-feature-contract.json", stage=Stage.INTAKE, revision=1, workflow_stage=Stage.INTAKE, workflow_status=WorkflowStatus.READY, approval_state=ApprovalState.NOT_REQUIRED)
+            result = V2PlanOrchestrator(store, runtime).resume(workflow.id)
+            self.assertEqual((result.stage, result.status), (Stage.PLAN, WorkflowStatus.AWAITING_APPROVAL))
+            self.assertEqual(store.list_artifacts(workflow.id, Stage.PLAN)[0].approval_state, ApprovalState.PENDING)
+            self.assertEqual(store.list_tasks(workflow.id), [])
+            self.assertEqual(runtime.requests[-1].role, Role.PLANNER)
+            store.close()
 
 
 if __name__ == "__main__":

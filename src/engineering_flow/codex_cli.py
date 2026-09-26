@@ -26,6 +26,7 @@ from .runtime import (
     PlanningExecutionResult,
     RuntimeExecutionRequest,
     RuntimeExecutionResult,
+    RuntimeProgressEvent,
     TerminalState,
 )
 from .sanitization import sanitize_payload, sanitize_text
@@ -111,6 +112,9 @@ INTAKE_OUTPUT_SCHEMA: dict[str, Any] = {
         },
     },
 }
+
+_STRING_LIST = {"type": "array", "items": {"type": "string"}}
+PLAN_OUTPUT_SCHEMA: dict[str, Any] = {"$schema": "https://json-schema.org/draft/2020-12/schema", "type": "object", "additionalProperties": False, "required": ["plan"], "properties": {"plan": {"type": "object", "additionalProperties": False, "required": ["id", "workflow_id", "revision", "feature_contract", "strategy", "assumptions", "verification_strategy", "tasks"], "properties": {"id": {"type": "string"}, "workflow_id": {"type": "string"}, "revision": {"type": "integer"}, "feature_contract": {"type": "object", "additionalProperties": False, "required": ["artifact_id", "sha256"], "properties": {"artifact_id": {"type": "string"}, "sha256": {"type": "string"}}}, "strategy": {"type": "string"}, "assumptions": _STRING_LIST, "verification_strategy": _STRING_LIST, "tasks": {"type": "array", "items": {"type": "object", "additionalProperties": False, "required": ["id", "objective", "context", "requirements", "acceptance_criteria", "verification", "constraints", "depends_on", "complexity", "risk"], "properties": {"id": {"type": "string"}, "objective": {"type": "string"}, "context": {"type": "object", "additionalProperties": False, "required": ["relevant_files", "existing_patterns"], "properties": {"relevant_files": _STRING_LIST, "existing_patterns": _STRING_LIST}}, "requirements": _STRING_LIST, "acceptance_criteria": _STRING_LIST, "verification": _STRING_LIST, "constraints": _STRING_LIST, "depends_on": _STRING_LIST, "complexity": {"enum": ["low", "medium", "high"]}, "risk": {"enum": ["low", "medium", "high"]}}}}}}}}
 
 _AUTHENTICATION_ERROR = re.compile(
     r"(?i)(authentication|unauthori[sz]ed|invalid\s+(?:api\s*)?key|"
@@ -207,6 +211,8 @@ class CodexCliRuntime(AgentRuntime):
         environment: Mapping[str, str] | None = None,
         secret_values: tuple[str, ...] = (),
         mechanisms: Mapping[str, CodexMechanismDescriptor] | None = None,
+        monotonic_clock: Callable[[], float] = time.monotonic,
+        heartbeat_interval: float = 10.0,
     ) -> None:
         if not command:
             raise ValueError("Codex executable command is required")
@@ -223,6 +229,8 @@ class CodexCliRuntime(AgentRuntime):
         self._environment = dict(environment) if environment is not None else None
         self._secret_values = tuple(secret_values)
         self._mechanisms = dict(mechanisms or {})
+        self._monotonic = monotonic_clock
+        self._heartbeat_interval = heartbeat_interval
 
     def materialize_capability(self, request: RuntimeExecutionRequest) -> CodexMechanismDescriptor:
         """Validate the configured native descriptor before it can dispatch."""
@@ -437,6 +445,8 @@ class CodexCliRuntime(AgentRuntime):
     def _schema_for(request: RuntimeExecutionRequest) -> Mapping[str, Any]:
         if request.role is Role.INTAKE:
             return INTAKE_OUTPUT_SCHEMA
+        if request.role is Role.PLANNER and request.stage.value == "plan":
+            return PLAN_OUTPUT_SCHEMA
         if request.role is Role.DEVELOPER:
             return DEVELOPER_OUTPUT_SCHEMA
         if request.role is Role.REVIEWER:
@@ -585,6 +595,7 @@ class CodexCliRuntime(AgentRuntime):
         timeout_seconds: float,
         state: dict[str, Any],
         events: list[NormalizedEvent],
+        request: RuntimeExecutionRequest | None = None,
     ) -> tuple[bool, str]:
         """Read JSONL as it arrives while retaining only bounded stderr."""
 
@@ -627,12 +638,24 @@ class CodexCliRuntime(AgentRuntime):
         stderr_thread = threading.Thread(target=read_stderr, daemon=True)
         stdout_thread.start()
         stderr_thread.start()
-        deadline = time.monotonic() + timeout_seconds
+        started = self._monotonic()
+        deadline = started + timeout_seconds
+        next_heartbeat = started + self._heartbeat_interval
+        def progress(kind: str, message: str | None = None) -> None:
+            if request is not None and request.progress_sink is not None:
+                try:
+                    request.progress_sink(RuntimeProgressEvent(kind, request.stage, max(0.0, self._monotonic() - started), message))
+                except Exception:
+                    pass
         line_number = 0
         timed_out = False
         poll = getattr(process, "poll", lambda: 0)
         while stdout_thread.is_alive() or not lines.empty() or poll() is None:
-            remaining = deadline - time.monotonic()
+            now = self._monotonic()
+            while now >= next_heartbeat:
+                progress("heartbeat")
+                next_heartbeat += self._heartbeat_interval
+            remaining = deadline - now
             if remaining <= 0:
                 timed_out = True
                 try:
@@ -646,6 +669,8 @@ class CodexCliRuntime(AgentRuntime):
                 continue
             line_number += 1
             self._normalize_line(line, line_number, state, events)
+            if events[-1].type == "thread.started":
+                progress("activity", "Agent session started")
         while True:
             try:
                 line = lines.get_nowait()
@@ -698,6 +723,8 @@ class CodexCliRuntime(AgentRuntime):
                 return FeatureContract.parse(raw_payload, workflow_id=request.workflow_id).as_payload(), None
             except ValidationFailure as exc:
                 return None, str(exc)
+        if request.role is Role.PLANNER and request.stage.value == "plan":
+            return dict(raw_payload), None
         if not isinstance(raw_payload["artifact_markdown"], str) or not raw_payload["artifact_markdown"].strip():
             return None, "artifact_markdown must be non-empty Markdown"
         if not isinstance(raw_payload["summary"], str):
@@ -836,7 +863,7 @@ class CodexCliRuntime(AgentRuntime):
         events: list[NormalizedEvent] = []
         try:
             timed_out, stderr_text = self._stream_process(
-                process, request.timeout_seconds, state, events
+                process, request.timeout_seconds, state, events, request
             )
         except subprocess.TimeoutExpired as exc:
             timed_out = True

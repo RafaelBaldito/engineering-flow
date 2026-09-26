@@ -1930,6 +1930,7 @@ class WorkflowStore:
         if artifact_path is None:
             labels = {
                 Stage.INTAKE: "feature-contract",
+                Stage.PLAN: "plan",
                 Stage.PRD: "prd",
                 Stage.TECHSPEC: "techspec",
                 Stage.TASK_PLAN: "task-plan",

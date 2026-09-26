@@ -1,6 +1,7 @@
 import contextlib
 import io
 import json
+import re
 import subprocess
 import sys
 import tempfile
@@ -11,8 +12,8 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 
 from engineering_flow.cli import main  # noqa: E402
-from engineering_flow.domain import ApprovalDecision, Stage, WorkflowStatus  # noqa: E402
-from engineering_flow.runtime import CapabilityReport, PlanningExecutionResult, TerminalState  # noqa: E402
+from engineering_flow.domain import ApprovalDecision, ApprovalState, LifecycleVersion, Role, Stage, WorkflowStatus  # noqa: E402
+from engineering_flow.runtime import CapabilityReport, PlanningExecutionResult, RuntimeProgressEvent, TerminalState  # noqa: E402
 from engineering_flow.store import WorkflowStore  # noqa: E402
 
 
@@ -60,6 +61,22 @@ class CliTests(unittest.TestCase):
         with contextlib.redirect_stdout(output):
             code = main(argv)
         return code, json.loads(output.getvalue()) if "--json" in argv else output.getvalue()
+
+    def ready_v2_workflow(self):
+        (self.repository / "source.py").write_text("x = 1\n", encoding="utf-8")
+        store = WorkflowStore(self.repository / ".engineering-flow" / "workflows.sqlite3")
+        workflow = store.create_workflow(self.repository, provider="fake", configuration_snapshot={}, feature_content=b"request",
+            feature_path=self.repository / ".engineering-flow" / "workflows" / "input", lifecycle_version=LifecycleVersion.V2, stage=Stage.INTAKE)
+        intent = store.create_generation_intent(workflow.id, Stage.INTAKE, request_hash="source", provider="fake", role=Role.INTAKE, revision=1,
+            artifact_path=self.repository / ".engineering-flow" / "workflows" / workflow.id / "artifacts" / "001-feature-contract.json")
+        feature = {"outcome": "READY", "feature": {"id": workflow.id, "goal": "Goal", "requirements": ["Requirement"],
+            "acceptance_criteria": ["Criterion"], "constraints": [], "out_of_scope": [], "assumptions": [], "open_questions": []}}
+        store.complete_generation(intent.operation.idempotency_key, content=json.dumps(feature),
+            artifact_path=self.repository / ".engineering-flow" / "workflows" / workflow.id / "artifacts" / "001-feature-contract.json",
+            stage=Stage.INTAKE, revision=1, workflow_stage=Stage.INTAKE, workflow_status=WorkflowStatus.READY,
+            approval_state=ApprovalState.NOT_REQUIRED)
+        store.close()
+        return workflow.id
 
     def test_run_status_and_logs_use_persisted_state(self):
         with patch("engineering_flow.cli.CodexCliRuntime", FakeRuntime):
@@ -131,6 +148,49 @@ class CliTests(unittest.TestCase):
         self.assertEqual(logs["lifecycle_version"], "v2")
         self.assertEqual(logs["intake"]["outcome"], "READY")
         self.assertTrue(any(event["type"] == "intake.completed" for event in logs["events"]))
+
+    def test_resume_progress_uses_tty_stderr_and_json_and_non_tty_stay_quiet(self):
+        class PlanRuntime(FakeRuntime):
+            def verify_planning_capabilities(self, repository):
+                return CapabilityReport("fake", "fake", str(repository), True, {"read_only": True}, True)
+            def execute(self, request):
+                self.requests.append(request)
+                match = re.search(r"artifact UUID ([^,]+), sha256 ([^)]+)", request.instruction)
+                artifact_id, sha256 = match.groups()
+                if request.progress_sink:
+                    request.progress_sink(RuntimeProgressEvent("heartbeat", Stage.PLAN, 10.0))
+                return PlanningExecutionResult("fake", request.logical_session_id or "session", "thread", "turn", TerminalState.SUCCEEDED,
+                    {"plan": {"id": f"{request.workflow_id}:plan:r1", "workflow_id": request.workflow_id, "revision": 1,
+                    "feature_contract": {"artifact_id": artifact_id, "sha256": sha256}, "strategy": "Change source.", "assumptions": [],
+                    "verification_strategy": ["tests"], "tasks": [{"id": "T1", "objective": "Change source.",
+                    "context": {"relevant_files": ["source.py"], "existing_patterns": []}, "requirements": ["Update behavior."],
+                    "acceptance_criteria": ["Works."], "verification": ["tests"], "constraints": [], "depends_on": [],
+                    "complexity": "low", "risk": "high"}]}})
+        class Tty(io.StringIO):
+            def isatty(self): return True
+        workflow_id = self.ready_v2_workflow()
+        stdout, stderr = io.StringIO(), Tty()
+        with patch("engineering_flow.cli.CodexCliRuntime", PlanRuntime), contextlib.redirect_stdout(stdout), patch("engineering_flow.cli.sys.stderr", stderr):
+            self.assertEqual(main(["resume", "--repo", str(self.repository), "--workflow", workflow_id]), 0, stdout.getvalue())
+        self.assertIn("→ PLAN started", stderr.getvalue())
+        self.assertIn("Codex running... 10s", stderr.getvalue())
+        self.assertIn("✓ PLAN completed", stderr.getvalue())
+        self.assertNotIn("Codex running", stdout.getvalue())
+
+        # A reopened V2 workflow does not execute again; both machine modes remain noise-free.
+        json_out, json_err = io.StringIO(), Tty()
+        with patch("engineering_flow.cli.CodexCliRuntime", PlanRuntime), contextlib.redirect_stdout(json_out), patch("engineering_flow.cli.sys.stderr", json_err):
+            self.assertEqual(main(["resume", "--repo", str(self.repository), "--workflow", workflow_id, "--json"]), 0)
+        self.assertEqual(json_err.getvalue(), "")
+        self.assertNotIn("Codex running", json_out.getvalue())
+        self.assertEqual(json.loads(json_out.getvalue())["stage"], "plan")
+
+        workflow_id = self.ready_v2_workflow()
+        non_tty_out, non_tty_err = io.StringIO(), io.StringIO()
+        with patch("engineering_flow.cli.CodexCliRuntime", PlanRuntime), contextlib.redirect_stdout(non_tty_out), patch("engineering_flow.cli.sys.stderr", non_tty_err):
+            self.assertEqual(main(["resume", "--repo", str(self.repository), "--workflow", workflow_id]), 0)
+        self.assertEqual(non_tty_err.getvalue(), "")
+        self.assertNotIn("Codex running", non_tty_out.getvalue())
 
     def test_v2_feature_contract_tampering_is_detected_after_reopen(self):
         class IntakeRuntime(FakeRuntime):

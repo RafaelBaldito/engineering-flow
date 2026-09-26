@@ -12,7 +12,7 @@ sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 from engineering_flow.codex_cli import CodexCliRuntime, CodexMechanismDescriptor, FINAL_OUTPUT_SCHEMA, INTAKE_OUTPUT_SCHEMA, REVIEWER_OUTPUT_SCHEMA  # noqa: E402
 from engineering_flow.domain import FailureClassification, Role, Stage, ValidationFailure, WorkKind  # noqa: E402
 from engineering_flow.runtime import (  # noqa: E402
-    ExecutionContract, PlanningExecutionRequest, TaskExecutionRequest, TerminalState,
+    ExecutionContract, PlanningExecutionRequest, RuntimeExecutionRequest, TaskExecutionRequest, TerminalState,
 )
 
 
@@ -146,6 +146,15 @@ class CodexCliTests(unittest.TestCase):
             authoritative_input_paths=(str(self.root / "request.txt"),), authoritative_input_hashes=("hash",),
             instruction="Perform Intake only.", output_schema_path=str(self.schema),
             final_output_path=str(self.output), timeout_seconds=3, required_capabilities=("read_only",),
+        )
+
+    def plan_request(self, sink=None):
+        return RuntimeExecutionRequest(
+            workflow_id="workflow-1", execution_id="execution-plan", logical_session_id="session-1",
+            role=Role.PLANNER, stage=Stage.PLAN, repository_path=str(self.root),
+            authoritative_input_paths=(str(self.root / "feature.json"),), authoritative_input_hashes=("hash",),
+            instruction="Create the Plan.", output_schema_path=str(self.schema), final_output_path=str(self.output),
+            timeout_seconds=60, required_capabilities=("read_only",), progress_sink=sink,
         )
 
     def run_factory(self, *args, **kwargs):
@@ -355,6 +364,39 @@ class CodexCliTests(unittest.TestCase):
         self.assertTrue(result.success)
         self.assertEqual(result.provider_session_id, "thread-stream")
         self.assertEqual([event.type for event in result.events], ["thread.started", "turn.completed"])
+
+    def test_progress_heartbeats_use_fake_monotonic_clock_without_sleeping(self):
+        events = []
+        def plan_popen(argv, **kwargs):
+            self.output.parent.mkdir(parents=True, exist_ok=True)
+            self.output.write_text(json.dumps({"plan": {"id": "p", "workflow_id": "w", "revision": 1,
+                "feature_contract": {"artifact_id": "a", "sha256": "h"}, "strategy": "s", "assumptions": [],
+                "verification_strategy": [], "tasks": []}}), encoding="utf-8")
+            return StreamingProcess('{"type":"turn.completed","id":"turn-plan"}\n')
+        clock_values = iter((0.0, 30.0))
+        runtime = self.runtime(popen_factory=plan_popen, monotonic_clock=lambda: next(clock_values, 30.0))
+        result = runtime.execute(self.plan_request(events.append))
+        self.assertTrue(result.success)
+        self.assertEqual([event.kind for event in events], ["heartbeat", "heartbeat", "heartbeat"])
+        self.assertTrue(all(event.stage is Stage.PLAN for event in events))
+
+    def test_progress_sink_failure_and_raw_provider_payload_do_not_affect_execution(self):
+        raw = "reasoning=private prompt tool_output=secret"
+        observed = []
+        def plan_popen(argv, **kwargs):
+            self.output.parent.mkdir(parents=True, exist_ok=True)
+            self.output.write_text(json.dumps({"plan": {"id": "p", "workflow_id": "w", "revision": 1,
+                "feature_contract": {"artifact_id": "a", "sha256": "h"}, "strategy": "s", "assumptions": [],
+                "verification_strategy": [], "tasks": []}}), encoding="utf-8")
+            return StreamingProcess(json.dumps({"type": "thread.started", "message": raw, "payload": {"text": raw}}) + "\n" +
+                json.dumps({"type": "item.completed", "text": raw}) + "\n" + '{"type":"turn.completed","id":"turn-plan"}\n')
+        def sink(event):
+            observed.append(event)
+            raise RuntimeError("renderer failed")
+        result = self.runtime(popen_factory=plan_popen).execute(self.plan_request(sink))
+        self.assertTrue(result.success)
+        self.assertEqual([(event.kind, event.message) for event in observed], [("activity", "Agent session started")])
+        self.assertNotIn(raw, repr(observed))
 
     def test_developer_uses_workspace_write_and_exact_required_test_payload(self):
         request = self.task_request(
