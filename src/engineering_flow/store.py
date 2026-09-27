@@ -199,6 +199,9 @@ class WorkflowStore:
             self._connection.execute("PRAGMA foreign_keys = ON")
             self._connection.execute("PRAGMA journal_mode = WAL")
             self._create_schema()
+        except DomainFailure:
+            self._connection.close()
+            raise
         except sqlite3.Error as exc:
             raise PersistenceFailure(f"could not open workflow database: {exc}") from exc
 
@@ -341,13 +344,39 @@ class WorkflowStore:
             error_classification TEXT, error_detail TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
             UNIQUE(workflow_id, plan_artifact_id, task_contract_id, sequence)
         );
-        CREATE TABLE IF NOT EXISTS workspace_writer_leases (
+        CREATE TABLE IF NOT EXISTS workspace_operation_leases (
             repository_key TEXT PRIMARY KEY, lease_id TEXT NOT NULL UNIQUE,
-            attempt_id TEXT NOT NULL UNIQUE REFERENCES implementation_attempts(id),
+            operation_kind TEXT NOT NULL CHECK(operation_kind IN ('implementation', 'verification', 'fix')),
+            attempt_id TEXT NOT NULL UNIQUE, operation_id TEXT NOT NULL UNIQUE REFERENCES operations(id),
             workflow_id TEXT NOT NULL REFERENCES workflows(id), canonical_root TEXT NOT NULL,
             owner_instance_id TEXT NOT NULL, owner_pid INTEGER NOT NULL, owner_host_id TEXT NOT NULL,
-            owner_boot_id TEXT, provider_pid INTEGER, provider_process_start TEXT,
-            provider_process_group INTEGER, acquired_at TEXT NOT NULL, updated_at TEXT NOT NULL
+            owner_boot_id TEXT, child_pid INTEGER, child_process_start TEXT,
+            child_process_group INTEGER, acquired_at TEXT NOT NULL, updated_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS verification_attempts (
+            id TEXT PRIMARY KEY, workflow_id TEXT NOT NULL REFERENCES workflows(id),
+            producer_operation_id TEXT NOT NULL REFERENCES operations(id),
+            execution_id TEXT NOT NULL UNIQUE REFERENCES executions(id),
+            operation_id TEXT NOT NULL UNIQUE REFERENCES operations(id), lease_id TEXT NOT NULL UNIQUE,
+            feature_artifact_id TEXT NOT NULL REFERENCES artifacts(id), feature_sha256 TEXT NOT NULL,
+            plan_artifact_id TEXT NOT NULL REFERENCES artifacts(id), plan_sha256 TEXT NOT NULL,
+            plan_revision INTEGER NOT NULL, plan_id TEXT NOT NULL, approval_id TEXT NOT NULL REFERENCES approvals(id),
+            task_contract_id TEXT NOT NULL, task_contract_sha256 TEXT NOT NULL,
+            authority_sha256 TEXT NOT NULL, request_hash TEXT NOT NULL,
+            manifest_binding_json TEXT NOT NULL, baseline_repository_json TEXT NOT NULL,
+            final_inspection_json TEXT, status TEXT NOT NULL, classification TEXT,
+            sequence INTEGER NOT NULL, started_at TEXT, finished_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+            UNIQUE(workflow_id, producer_operation_id, sequence)
+        );
+        CREATE TABLE IF NOT EXISTS verification_command_results (
+            id TEXT PRIMARY KEY, verification_attempt_id TEXT NOT NULL REFERENCES verification_attempts(id),
+            ordinal INTEGER NOT NULL CHECK(ordinal > 0), command_id TEXT NOT NULL,
+            canonical_command_sha256 TEXT NOT NULL, argv_json TEXT NOT NULL,
+            timeout_seconds INTEGER NOT NULL CHECK(timeout_seconds > 0), intent_at TEXT NOT NULL,
+            result_at TEXT, exit_code INTEGER, timed_out INTEGER, output_sha256 TEXT,
+            output_bytes INTEGER, output_truncated INTEGER, post_command_inspection_json TEXT,
+            classification TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+            UNIQUE(verification_attempt_id, ordinal), UNIQUE(verification_attempt_id, command_id)
         );
         CREATE TABLE IF NOT EXISTS operations (
             id TEXT PRIMARY KEY,
@@ -590,6 +619,8 @@ class WorkflowStore:
                     self._connection.execute(
                         "ALTER TABLE migration_receipts ADD COLUMN request_fingerprint TEXT"
                     )
+                self._migrate_workspace_writer_leases()
+                self._migrate_verification_attempt_sequences()
                 # SQLite cannot widen a CHECK constraint in place.  This is
                 # the existing MDS #3 task-state table, not verification
                 # attempt persistence; rebuilding it retains all rows while
@@ -631,6 +662,97 @@ class WorkflowStore:
                         self._connection.execute(statement)
             except sqlite3.Error as exc:
                 raise PersistenceFailure(f"could not create workflow schema: {exc}") from exc
+
+    def _migrate_workspace_writer_leases(self) -> None:
+        """Atomically absorb the MDS #3 lease table, including interrupted residue."""
+        legacy = self._connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='workspace_writer_leases'"
+        ).fetchone()
+        if legacy is None:
+            return
+        with self._transaction() as conn:
+            rows = conn.execute("""SELECT l.*, a.id AS implementation_attempt_id,
+                a.lease_id AS implementation_lease_id,
+                a.workflow_id AS implementation_workflow_id,
+                a.operation_id AS implementation_operation_id,
+                a.baseline_repository_json AS implementation_baseline_repository_json,
+                o.id AS implementation_operation_identity,
+                o.workflow_id AS implementation_operation_workflow_id
+                FROM workspace_writer_leases l
+                LEFT JOIN implementation_attempts a ON a.id=l.attempt_id
+                LEFT JOIN operations o ON o.id=a.operation_id""").fetchall()
+            for row in rows:
+                if (row["implementation_attempt_id"] != row["attempt_id"]
+                        or row["implementation_lease_id"] != row["lease_id"]
+                        or row["implementation_workflow_id"] != row["workflow_id"]
+                        or row["implementation_operation_identity"] != row["implementation_operation_id"]
+                        or row["implementation_operation_workflow_id"] != row["workflow_id"]):
+                    raise ConflictFailure("legacy writer lease identity conflicts with implementation attempt")
+                try:
+                    baseline = json.loads(row["implementation_baseline_repository_json"])
+                    repository_key = hashlib.sha256("\0".join((
+                        baseline["canonical_root"], baseline["git_dir"], baseline["git_common_dir"],
+                    )).encode()).hexdigest()
+                except (KeyError, TypeError, json.JSONDecodeError):
+                    raise ConflictFailure("legacy writer lease lacks matching implementation repository identity") from None
+                if baseline["canonical_root"] != row["canonical_root"] or repository_key != row["repository_key"]:
+                    raise ConflictFailure("legacy writer lease repository identity conflicts with implementation attempt")
+                common = conn.execute("SELECT * FROM workspace_operation_leases WHERE repository_key=?",
+                                      (row["repository_key"],)).fetchone()
+                values = (row["repository_key"], row["lease_id"], "implementation", row["attempt_id"],
+                          row["implementation_operation_id"], row["workflow_id"], row["canonical_root"],
+                          row["owner_instance_id"], row["owner_pid"], row["owner_host_id"],
+                          row["owner_boot_id"], row["provider_pid"], row["provider_process_start"],
+                          row["provider_process_group"], row["acquired_at"], row["updated_at"])
+                if common is not None:
+                    fields = ("repository_key", "lease_id", "operation_kind", "attempt_id", "operation_id",
+                              "workflow_id", "canonical_root", "owner_instance_id", "owner_pid", "owner_host_id",
+                              "owner_boot_id", "child_pid", "child_process_start", "child_process_group",
+                              "acquired_at", "updated_at")
+                    if tuple(common[field] for field in fields) != values:
+                        raise ConflictFailure("legacy writer lease conflicts with common operation lease")
+                    continue
+                conn.execute("""INSERT INTO workspace_operation_leases
+                    (repository_key,lease_id,operation_kind,attempt_id,operation_id,workflow_id,canonical_root,
+                     owner_instance_id,owner_pid,owner_host_id,owner_boot_id,child_pid,child_process_start,
+                     child_process_group,acquired_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", values)
+            for row in rows:
+                migrated = conn.execute("""SELECT l.* FROM workspace_operation_leases l
+                    WHERE l.repository_key=? AND l.lease_id=? AND l.attempt_id=?
+                      AND l.operation_kind='implementation'""",
+                    (row["repository_key"], row["lease_id"], row["attempt_id"])).fetchone()
+                if migrated is None:
+                    raise PersistenceFailure("legacy writer lease migration validation failed")
+            conn.execute("DROP TABLE workspace_writer_leases")
+
+    def _migrate_verification_attempt_sequences(self) -> None:
+        """Remove the obsolete deterministic-request uniqueness constraint safely."""
+        sql_row = self._connection.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='verification_attempts'").fetchone()
+        if sql_row is None or "sequence INTEGER NOT NULL" in (sql_row["sql"] or ""):
+            return
+        with self._transaction() as conn:
+            conn.execute("ALTER TABLE verification_attempts RENAME TO verification_attempts_legacy")
+            conn.execute("""CREATE TABLE verification_attempts (
+                id TEXT PRIMARY KEY, workflow_id TEXT NOT NULL REFERENCES workflows(id),
+                producer_operation_id TEXT NOT NULL REFERENCES operations(id),
+                execution_id TEXT NOT NULL UNIQUE REFERENCES executions(id),
+                operation_id TEXT NOT NULL UNIQUE REFERENCES operations(id), lease_id TEXT NOT NULL UNIQUE,
+                feature_artifact_id TEXT NOT NULL REFERENCES artifacts(id), feature_sha256 TEXT NOT NULL,
+                plan_artifact_id TEXT NOT NULL REFERENCES artifacts(id), plan_sha256 TEXT NOT NULL,
+                plan_revision INTEGER NOT NULL, plan_id TEXT NOT NULL, approval_id TEXT NOT NULL REFERENCES approvals(id),
+                task_contract_id TEXT NOT NULL, task_contract_sha256 TEXT NOT NULL,
+                authority_sha256 TEXT NOT NULL, request_hash TEXT NOT NULL,
+                manifest_binding_json TEXT NOT NULL, baseline_repository_json TEXT NOT NULL,
+                final_inspection_json TEXT, status TEXT NOT NULL, classification TEXT,
+                sequence INTEGER NOT NULL, started_at TEXT, finished_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                UNIQUE(workflow_id, producer_operation_id, sequence))""")
+            conn.execute("""INSERT INTO verification_attempts
+                SELECT id,workflow_id,producer_operation_id,execution_id,operation_id,lease_id,feature_artifact_id,
+                       feature_sha256,plan_artifact_id,plan_sha256,plan_revision,plan_id,approval_id,task_contract_id,
+                       task_contract_sha256,authority_sha256,request_hash,manifest_binding_json,baseline_repository_json,
+                       final_inspection_json,status,classification,1,started_at,finished_at,created_at,updated_at
+                FROM verification_attempts_legacy""")
+            conn.execute("DROP TABLE verification_attempts_legacy")
 
     @contextmanager
     def _transaction(self) -> Iterator[sqlite3.Connection]:
@@ -1025,7 +1147,7 @@ class WorkflowStore:
             raise PersistenceFailure("workflow has multiple open Plan change requests")
         return self._plan_change_request_from_row(rows[0]) if rows else None
 
-    def load_approved_v2_plan_authority(self, workflow_id: str) -> ApprovedV2PlanAuthority:
+    def load_approved_v2_plan_authority(self, workflow_id: str, *, allow_human_attention: bool = False) -> ApprovedV2PlanAuthority:
         """Load the exact, currently approved V2 authority for task selection.
 
         This is intentionally a read-only projection: task definitions remain
@@ -1040,7 +1162,9 @@ class WorkflowStore:
                             WorkflowStatus.VERIFYING,
                             WorkflowStatus.VERIFICATION_FAILED,
                             WorkflowStatus.TASK_VERIFIED,
-                        }))):
+                        })
+                        or (allow_human_attention and workflow.stage is Stage.TASK_EXECUTION
+                            and workflow.status is WorkflowStatus.HUMAN_ATTENTION))):
             raise ConflictFailure("workflow is not at V2 PLAN_APPROVED authority")
         plans = self.list_artifacts(workflow.id, Stage.PLAN)
         if not plans:
@@ -1169,7 +1293,7 @@ class WorkflowStore:
               AND a.workspace_changed=0 AND a.id=(SELECT b.id FROM implementation_attempts b
                 WHERE b.workflow_id=a.workflow_id AND b.plan_artifact_id=a.plan_artifact_id
                   AND b.task_contract_id=a.task_contract_id ORDER BY b.sequence DESC LIMIT 1)
-              AND NOT EXISTS (SELECT 1 FROM workspace_writer_leases l WHERE l.attempt_id=a.id)""",
+              AND NOT EXISTS (SELECT 1 FROM workspace_operation_leases l WHERE l.attempt_id=a.id)""",
             (workflow_id, plan_artifact_id)).fetchall()
         return frozenset(row["task_contract_id"] for row in rows)
 
@@ -1242,7 +1366,7 @@ class WorkflowStore:
             task = next((item for item in authority.plan.tasks if item.id == task_contract_id), None)
             if task is None or task.payload_sha256() != task_contract_sha256:
                 raise ConflictFailure("selected Task Contract no longer matches approved Plan")
-            if conn.execute("SELECT 1 FROM workspace_writer_leases WHERE repository_key = ?", (repository_key,)).fetchone():
+            if conn.execute("SELECT 1 FROM workspace_operation_leases WHERE repository_key = ?", (repository_key,)).fetchone():
                 raise ConflictFailure("target workspace already has an unresolved writer lease")
             old = conn.execute("""SELECT status, workspace_changed FROM implementation_attempts
                 WHERE workflow_id=? AND plan_artifact_id=? AND task_contract_id=? ORDER BY sequence DESC LIMIT 1""",
@@ -1265,15 +1389,20 @@ class WorkflowStore:
             conn.execute("""INSERT INTO implementation_attempts (id,workflow_id,execution_id,operation_id,lease_id,feature_artifact_id,feature_sha256,plan_artifact_id,plan_sha256,plan_revision,plan_id,approval_id,task_contract_id,task_contract_sha256,sequence,request_hash,requested_profile,requested_provider,requested_model,requested_reasoning,started_at,status,baseline_repository_json,created_at,updated_at)
                 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'preparing',?,?,?)""",
                 (attempt_id,workflow_id,execution_id,operation_id,lease_id,authority.feature_contract_artifact.id,authority.feature_contract_artifact.sha256,authority.plan_artifact.id,authority.plan_artifact.sha256,authority.plan.revision,authority.plan.id,authority.approval.id,task_contract_id,task_contract_sha256,sequence,request_hash,requested_profile,requested_provider,requested_model,requested_reasoning,now,_json(baseline),now,now))
-            conn.execute("""INSERT INTO workspace_writer_leases (repository_key,lease_id,attempt_id,workflow_id,canonical_root,owner_instance_id,owner_pid,owner_host_id,owner_boot_id,acquired_at,updated_at)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?)""", (repository_key,lease_id,attempt_id,workflow_id,canonical_root,owner_instance_id,owner_pid,owner_host_id,owner_boot_id,now,now))
+            conn.execute("""INSERT INTO workspace_operation_leases
+                (repository_key,lease_id,operation_kind,attempt_id,operation_id,workflow_id,canonical_root,
+                 owner_instance_id,owner_pid,owner_host_id,owner_boot_id,acquired_at,updated_at)
+                VALUES (?,?,'implementation',?,?,?,?,?,?,?,?,?,?)""",
+                (repository_key,lease_id,attempt_id,operation_id,workflow_id,canonical_root,
+                 owner_instance_id,owner_pid,owner_host_id,owner_boot_id,now,now))
             conn.execute("""INSERT INTO task_implementation_states (id,workflow_id,plan_artifact_id,plan_sha256,task_contract_id,task_contract_sha256,status,selected_at,updated_at)
                 VALUES (?,?,?,?,?,?, 'implementing',?,?) ON CONFLICT(workflow_id,plan_artifact_id,task_contract_id)
                 DO UPDATE SET status='implementing', selected_at=excluded.selected_at, updated_at=excluded.updated_at""",
                 (str(uuid.uuid4()),workflow_id,authority.plan_artifact.id,authority.plan_artifact.sha256,task_contract_id,task_contract_sha256,now,now))
             conn.execute("UPDATE workflows SET stage=?, status=?, updated_at=? WHERE id=?", (Stage.TASK_EXECUTION.value, WorkflowStatus.IMPLEMENTING.value,now,workflow_id))
             self._event_unlocked(conn, workflow_id, "implementation.attempt.created", stage=Stage.TASK_EXECUTION, execution_id=execution_id, payload={"attempt_id":attempt_id,"lease_id":lease_id})
-        return {"attempt_id": attempt_id, "lease_id": lease_id, "execution_id": execution_id, "operation_id": operation_id}
+        return {"attempt_id": attempt_id, "lease_id": lease_id, "execution_id": execution_id,
+                "operation_id": operation_id, "owner_instance_id": owner_instance_id}
 
     def record_implementation_provider_started(self, attempt_id: str, lease_id: str,
                                                evidence: Mapping[str, Any]) -> None:
@@ -1290,7 +1419,7 @@ class WorkflowStore:
             now = _now()
             if not isinstance(start, str) or not start:
                 start = None
-            conn.execute("UPDATE workspace_writer_leases SET provider_pid=?,provider_process_start=?,provider_process_group=?,updated_at=? WHERE attempt_id=? AND lease_id=?",
+            conn.execute("UPDATE workspace_operation_leases SET child_pid=?,child_process_start=?,child_process_group=?,updated_at=? WHERE attempt_id=? AND lease_id=? AND operation_kind='implementation'",
                          (pid, start, group, now, attempt_id, lease_id))
             conn.execute("UPDATE implementation_attempts SET started_at=?,status='running',updated_at=? WHERE id=?", (now, now, attempt_id))
             conn.execute("UPDATE executions SET lifecycle='running',updated_at=? WHERE id=?", (now, row["execution_id"]))
@@ -1306,7 +1435,8 @@ class WorkflowStore:
 
     def finish_implementation_attempt(self, attempt_id: str, lease_id: str, *, status: str,
                                       classification: str, final: Mapping[str, Any] | None,
-                                      workspace_changed: bool | None, error_detail: str | None = None,
+                                      workspace_changed: bool | None, owner_instance_id: str | None = None,
+                                      error_detail: str | None = None,
                                       agent_result: Mapping[str, Any] | None = None,
                                       actual_provider: str | None = None, actual_model: str | None = None,
                                       actual_reasoning: str | None = None, provider_operation_ref: str | None = None,
@@ -1315,6 +1445,15 @@ class WorkflowStore:
         with self._transaction() as conn:
             row = conn.execute("SELECT * FROM implementation_attempts WHERE id=? AND lease_id=?", (attempt_id, lease_id)).fetchone()
             if row is None: raise ConflictFailure("implementation attempt/lease ownership mismatch")
+            lease = None
+            if release_lease:
+                if not isinstance(owner_instance_id, str) or not owner_instance_id:
+                    raise ValidationFailure("implementation lease release requires owner_instance_id")
+                lease = conn.execute("""SELECT repository_key FROM workspace_operation_leases
+                    WHERE lease_id=? AND attempt_id=? AND operation_id=? AND operation_kind='implementation'
+                      AND owner_instance_id=?""", (lease_id, attempt_id, row["operation_id"], owner_instance_id)).fetchone()
+                if lease is None:
+                    raise ConflictFailure("implementation lease ownership mismatch")
             task_status = "implementation_completed" if classification == "completed_changed" else ("pending" if classification == "baseline_refusal" else ("implementation_failed" if classification == "failed_unchanged" else "implementation_unknown"))
             workflow_status = (WorkflowStatus.PLAN_APPROVED.value if classification == "baseline_refusal" else (WorkflowStatus.IMPLEMENTATION_COMPLETED.value if task_status == "implementation_completed" else (WorkflowStatus.IMPLEMENTATION_FAILED.value if task_status == "implementation_failed" else WorkflowStatus.HUMAN_ATTENTION.value)))
             now = _now()
@@ -1325,9 +1464,14 @@ class WorkflowStore:
             conn.execute("UPDATE task_implementation_states SET status=?,updated_at=? WHERE workflow_id=? AND plan_artifact_id=? AND task_contract_id=?", (task_status,now,row["workflow_id"],row["plan_artifact_id"],row["task_contract_id"]))
             conn.execute("UPDATE workflows SET stage=?,status=?,updated_at=? WHERE id=?", (Stage.PLAN.value if classification == "baseline_refusal" else Stage.TASK_EXECUTION.value,workflow_status,now,row["workflow_id"]))
             if release_lease:
-                # Exact compare-and-delete: a stale recovery cannot delete a
-                # lease that has been rebound by a future owner.
-                conn.execute("DELETE FROM workspace_writer_leases WHERE lease_id=? AND attempt_id=?", (lease_id,attempt_id))
+                # The terminal projection and release share one transaction,
+                # but the lease must still match every persisted owner binding.
+                deleted = conn.execute("""DELETE FROM workspace_operation_leases
+                    WHERE repository_key=? AND lease_id=? AND attempt_id=? AND operation_id=?
+                      AND operation_kind='implementation' AND owner_instance_id=?""",
+                    (lease["repository_key"], lease_id, attempt_id, row["operation_id"], owner_instance_id))
+                if deleted.rowcount != 1:
+                    raise ConflictFailure("implementation lease ownership mismatch")
 
     def active_implementation_lease(self, workflow_id: str) -> Mapping[str, Any] | None:
         """Return one unresolved V2 writer lease joined to its attempt.
@@ -1335,14 +1479,224 @@ class WorkflowStore:
         This intentionally exposes raw persisted evidence only to the narrow
         recovery service; normal presentation must not display process IDs.
         """
-        rows = self._connection.execute("""SELECT l.*, a.status AS attempt_status,
+        rows = self._connection.execute("""SELECT l.*, l.child_pid AS provider_pid,
+            l.child_process_start AS provider_process_start,
+            l.child_process_group AS provider_process_group, a.status AS attempt_status,
             a.result_classification, a.baseline_repository_json, a.workflow_id AS attempt_workflow_id,
             a.lease_id AS attempt_lease_id, a.task_contract_id, a.plan_artifact_id
-            FROM workspace_writer_leases l JOIN implementation_attempts a ON a.id=l.attempt_id
-            WHERE l.workflow_id=?""", (workflow_id,)).fetchall()
+            FROM workspace_operation_leases l JOIN implementation_attempts a ON a.id=l.attempt_id
+            WHERE l.workflow_id=? AND l.operation_kind='implementation'""", (workflow_id,)).fetchall()
         if len(rows) > 1:
             raise PersistenceFailure("workflow has multiple unresolved writer leases")
         return dict(rows[0]) if rows else None
+
+    def active_workspace_operation_lease(self, repository_key: str) -> Mapping[str, Any] | None:
+        """Return the one non-expiring repository mutex, without interpreting it."""
+        row = self._connection.execute(
+            "SELECT * FROM workspace_operation_leases WHERE repository_key=?", (repository_key,)
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    def release_workspace_operation_lease(self, *, repository_key: str, lease_id: str,
+                                          attempt_id: str, owner_instance_id: str) -> None:
+        """Exact compare-and-delete; leases are never timed out or stolen."""
+        with self._transaction() as conn:
+            result = conn.execute("""DELETE FROM workspace_operation_leases
+                WHERE repository_key=? AND lease_id=? AND attempt_id=? AND owner_instance_id=?""",
+                (repository_key, lease_id, attempt_id, owner_instance_id))
+            if result.rowcount != 1:
+                raise ConflictFailure("workspace operation lease ownership mismatch")
+
+    def create_verification_intent(
+        self, workflow_id: str, *, repository_key: str, canonical_root: str,
+        producer_operation_id: str, task_contract_id: str, task_contract_sha256: str,
+        authority_sha256: str, request_hash: str, manifest_binding: Mapping[str, Any],
+        baseline: Mapping[str, Any], owner_instance_id: str, owner_pid: int,
+        owner_host_id: str, owner_boot_id: str | None = None,
+    ) -> dict[str, str]:
+        """Persist VERIFY intent, its generic operation, and the common lease atomically.
+
+        This method deliberately has no runner integration: a later slice may
+        spawn only after this durable boundary exists.
+        """
+        self._require_sha256(authority_sha256, "authority_sha256")
+        self._require_sha256(request_hash, "request_hash")
+        if not all(isinstance(value, str) and value for value in
+                   (repository_key, canonical_root, producer_operation_id, task_contract_id,
+                    task_contract_sha256, owner_instance_id, owner_host_id)):
+            raise ValidationFailure("verification intent has incomplete identity bindings")
+        with self._transaction() as conn:
+            existing = conn.execute("""SELECT id, lease_id, execution_id, operation_id, status, classification
+                FROM verification_attempts WHERE workflow_id=? AND producer_operation_id=? AND request_hash=?
+                ORDER BY sequence DESC LIMIT 1""", (workflow_id, producer_operation_id, request_hash)).fetchone()
+            if existing is not None and (existing["status"] != "terminal" or existing["classification"] != "interrupted_unchanged"):
+                return {"attempt_id": existing["id"], "lease_id": existing["lease_id"],
+                        "execution_id": existing["execution_id"], "operation_id": existing["operation_id"]}
+            if conn.execute("SELECT 1 FROM workspace_operation_leases WHERE repository_key=?", (repository_key,)).fetchone():
+                raise ConflictFailure("target workspace already has an unresolved operation lease")
+            authority = self.load_approved_v2_plan_authority(workflow_id, allow_human_attention=True)
+            producer = self.load_successful_implementation_producer(
+                workflow_id, producer_operation_id, task_contract_id, task_contract_sha256)
+            if (producer.feature_artifact_id != authority.feature_contract_artifact.id
+                    or producer.feature_sha256 != authority.feature_contract_artifact.sha256
+                    or producer.plan_artifact_id != authority.plan_artifact.id
+                    or producer.plan_sha256 != authority.plan_artifact.sha256
+                    or producer.approval_id != authority.approval.id):
+                raise ConflictFailure("verification producer no longer matches approved authority")
+            now, attempt_id, lease_id, execution_id, operation_id = (
+                _now(), str(uuid.uuid4()), str(uuid.uuid4()), str(uuid.uuid4()), str(uuid.uuid4()))
+            sequence = int(conn.execute("""SELECT COALESCE(MAX(sequence), 0) + 1 FROM verification_attempts
+                WHERE workflow_id=? AND producer_operation_id=?""", (workflow_id, producer_operation_id)).fetchone()[0])
+            session = self._create_session_unlocked(conn, workflow_id, "deterministic-verification", Role.DEVELOPER)
+            conn.execute("""INSERT INTO executions
+                (id,workflow_id,session_id,role,provider_execution_id,request_hash,lifecycle,capability_report,terminal_result,failure_classification,failure_detail,created_at,updated_at)
+                VALUES (?,?,?,?,NULL,?,'intent','{}',NULL,NULL,NULL,?,?)""",
+                (execution_id, workflow_id, session.id, Role.DEVELOPER.value, request_hash, now, now))
+            conn.execute("""INSERT INTO operations (id,idempotency_key,kind,workflow_id,status,related_record_id,created_at,updated_at)
+                VALUES (?,?,?,?,?,?,?,?)""",
+                (operation_id, f"verification:{attempt_id}", "verification", workflow_id, "pending", execution_id, now, now))
+            conn.execute("""INSERT INTO verification_attempts
+                (id,workflow_id,producer_operation_id,execution_id,operation_id,lease_id,feature_artifact_id,feature_sha256,
+                 plan_artifact_id,plan_sha256,plan_revision,plan_id,approval_id,task_contract_id,task_contract_sha256,
+                 authority_sha256,request_hash,manifest_binding_json,baseline_repository_json,status,sequence,started_at,created_at,updated_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'verifying',?,?,?,?)""",
+                (attempt_id, workflow_id, producer_operation_id, execution_id, operation_id, lease_id,
+                 producer.feature_artifact_id, producer.feature_sha256, producer.plan_artifact_id, producer.plan_sha256,
+                 producer.plan_revision, producer.plan_id, producer.approval_id, task_contract_id, task_contract_sha256,
+                 authority_sha256, request_hash, _json(manifest_binding), _json(baseline), sequence, now, now, now))
+            conn.execute("""INSERT INTO workspace_operation_leases
+                (repository_key,lease_id,operation_kind,attempt_id,operation_id,workflow_id,canonical_root,
+                 owner_instance_id,owner_pid,owner_host_id,owner_boot_id,acquired_at,updated_at)
+                VALUES (?,?,'verification',?,?,?,?,?,?,?,?,?,?)""",
+                (repository_key, lease_id, attempt_id, operation_id, workflow_id, canonical_root,
+                 owner_instance_id, owner_pid, owner_host_id, owner_boot_id, now, now))
+            state_update = conn.execute("""UPDATE task_implementation_states SET status='verifying',updated_at=?
+                WHERE workflow_id=? AND plan_artifact_id=? AND task_contract_id=? AND status='implementation_completed'""",
+                (now, workflow_id, authority.plan_artifact.id, task_contract_id))
+            if state_update.rowcount != 1:
+                raise ConflictFailure("verification requires completed implementation task state")
+            conn.execute("UPDATE workflows SET stage=?,status=?,updated_at=? WHERE id=?",
+                (Stage.TASK_EXECUTION.value, WorkflowStatus.VERIFYING.value, now, workflow_id))
+            self._event_unlocked(conn, workflow_id, "verification.attempt.created", stage=Stage.TASK_EXECUTION,
+                execution_id=execution_id, payload={"attempt_id": attempt_id, "lease_id": lease_id,
+                                                     "producer_operation_id": producer_operation_id})
+        return {"attempt_id": attempt_id, "lease_id": lease_id, "execution_id": execution_id, "operation_id": operation_id}
+
+    def record_verification_command_intent(self, attempt_id: str, lease_id: str, *, owner_instance_id: str,
+                                            ordinal: int, command_id: str, canonical_command_sha256: str,
+                                            argv: list[str] | tuple[str, ...], timeout_seconds: int) -> str:
+        """Durably reserve exactly one command ordinal immediately before spawn."""
+        self._require_sha256(canonical_command_sha256, "canonical_command_sha256")
+        if (type(ordinal) is not int or ordinal < 1 or not isinstance(command_id, str) or not command_id
+                or type(timeout_seconds) is not int or timeout_seconds < 1
+                or not isinstance(argv, (list, tuple)) or not argv
+                or any(not isinstance(x, str) or not x for x in argv)):
+            raise ValidationFailure("verification command intent is invalid")
+        with self._transaction() as conn:
+            lease = conn.execute("""SELECT * FROM workspace_operation_leases WHERE lease_id=? AND attempt_id=?
+                AND owner_instance_id=? AND operation_kind='verification'""",
+                (lease_id, attempt_id, owner_instance_id)).fetchone()
+            attempt = conn.execute("SELECT status FROM verification_attempts WHERE id=? AND lease_id=?", (attempt_id, lease_id)).fetchone()
+            if lease is None or attempt is None or attempt["status"] != "verifying":
+                raise ConflictFailure("verification command intent lacks exact active lease ownership")
+            existing = conn.execute("SELECT * FROM verification_command_results WHERE verification_attempt_id=? AND ordinal=?",
+                (attempt_id, ordinal)).fetchone()
+            if existing is not None:
+                if (existing["command_id"], existing["canonical_command_sha256"], existing["argv_json"], existing["timeout_seconds"]) != (
+                        command_id, canonical_command_sha256, _json(list(argv)), timeout_seconds):
+                    raise ConflictFailure("verification command ordinal is already bound differently")
+                return existing["id"]
+            if ordinal > 1:
+                previous = conn.execute("""SELECT result_at FROM verification_command_results
+                    WHERE verification_attempt_id=? AND ordinal=?""", (attempt_id, ordinal - 1)).fetchone()
+                if previous is None or previous["result_at"] is None:
+                    raise ConflictFailure("verification command ordinal requires the previous terminal result")
+            unresolved = conn.execute("""SELECT 1 FROM verification_command_results
+                WHERE verification_attempt_id=? AND result_at IS NULL""", (attempt_id,)).fetchone()
+            if unresolved is not None:
+                raise ConflictFailure("verification command intent is already unresolved")
+            command_result_id, now = str(uuid.uuid4()), _now()
+            conn.execute("""INSERT INTO verification_command_results
+                (id,verification_attempt_id,ordinal,command_id,canonical_command_sha256,argv_json,timeout_seconds,intent_at,created_at,updated_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                (command_result_id, attempt_id, ordinal, command_id, canonical_command_sha256,
+                 _json(list(argv)), timeout_seconds, now, now, now))
+            conn.execute("UPDATE workspace_operation_leases SET updated_at=? WHERE lease_id=?", (now, lease_id))
+        return command_result_id
+
+    def record_workspace_operation_child(self, attempt_id: str, lease_id: str, *, owner_instance_id: str,
+                                         child_pid: int | None, child_process_start: str | None,
+                                         child_process_group: int | None) -> None:
+        """Record the currently owned child identity; no lease can be reassigned."""
+        if child_pid is not None and type(child_pid) is not int: raise ValidationFailure("child_pid must be an integer")
+        if child_process_group is not None and type(child_process_group) is not int: raise ValidationFailure("child_process_group must be an integer")
+        if child_process_start is not None and not isinstance(child_process_start, str): raise ValidationFailure("child_process_start must be text")
+        with self._transaction() as conn:
+            result = conn.execute("""UPDATE workspace_operation_leases
+                SET child_pid=?,child_process_start=?,child_process_group=?,updated_at=?
+                WHERE lease_id=? AND attempt_id=? AND owner_instance_id=?""",
+                (child_pid, child_process_start, child_process_group, _now(), lease_id, attempt_id, owner_instance_id))
+            if result.rowcount != 1: raise ConflictFailure("workspace operation lease ownership mismatch")
+
+    def record_verification_command_result(self, attempt_id: str, lease_id: str, command_result_id: str, *,
+                                            owner_instance_id: str, exit_code: int | None, timed_out: bool,
+                                            output_sha256: str | None, output_bytes: int | None,
+                                            output_truncated: bool, post_command_inspection: Mapping[str, Any],
+                                            classification: str) -> None:
+        """Persist one dead-child result and its single post-command inspection."""
+        if output_sha256 is not None: self._require_sha256(output_sha256, "output_sha256")
+        if exit_code is not None and type(exit_code) is not int: raise ValidationFailure("exit_code must be an integer")
+        if output_bytes is not None and (type(output_bytes) is not int or output_bytes < 0): raise ValidationFailure("output_bytes must be non-negative")
+        if type(timed_out) is not bool or type(output_truncated) is not bool:
+            raise ValidationFailure("verification command boolean fields must be boolean")
+        if not isinstance(post_command_inspection, Mapping) or not isinstance(classification, str) or not classification:
+            raise ValidationFailure("verification command result is invalid")
+        with self._transaction() as conn:
+            lease = conn.execute("SELECT 1 FROM workspace_operation_leases WHERE lease_id=? AND attempt_id=? AND owner_instance_id=? AND operation_kind='verification'",
+                (lease_id, attempt_id, owner_instance_id)).fetchone()
+            row = conn.execute("SELECT result_at FROM verification_command_results WHERE id=? AND verification_attempt_id=?",
+                (command_result_id, attempt_id)).fetchone()
+            if lease is None or row is None: raise ConflictFailure("verification command result lacks exact active lease ownership")
+            if row["result_at"] is not None: raise ConflictFailure("verification command result is already terminal")
+            now = _now()
+            conn.execute("""UPDATE verification_command_results SET result_at=?,exit_code=?,timed_out=?,output_sha256=?,output_bytes=?,
+                output_truncated=?,post_command_inspection_json=?,classification=?,updated_at=? WHERE id=?""",
+                (now, exit_code, int(timed_out), output_sha256, output_bytes, int(output_truncated),
+                 _json(post_command_inspection), classification, now, command_result_id))
+            conn.execute("UPDATE workspace_operation_leases SET child_pid=NULL,child_process_start=NULL,child_process_group=NULL,updated_at=? WHERE lease_id=?", (now, lease_id))
+
+    def finish_verification_attempt(self, attempt_id: str, lease_id: str, *, owner_instance_id: str,
+                                    outcome: str, final_inspection: Mapping[str, Any], detail: str | None = None) -> None:
+        """One terminal transaction: projection, evidence, generic result/event, exact release."""
+        outcome = str(outcome)
+        allowed = {"verified", "verification_failed", "verification_blocked", "interrupted_unchanged", "verification_unknown"}
+        if outcome not in allowed: raise ValidationFailure("invalid verification terminal outcome")
+        with self._transaction() as conn:
+            lease = conn.execute("SELECT * FROM workspace_operation_leases WHERE lease_id=? AND attempt_id=? AND owner_instance_id=? AND operation_kind='verification'",
+                (lease_id, attempt_id, owner_instance_id)).fetchone()
+            attempt = conn.execute("SELECT * FROM verification_attempts WHERE id=? AND lease_id=?", (attempt_id, lease_id)).fetchone()
+            if lease is None or attempt is None or attempt["status"] != "verifying":
+                raise ConflictFailure("verification terminal transition lacks exact active lease ownership")
+            now = _now()
+            task_status = "verified" if outcome == "verified" else ("verification_failed" if outcome == "verification_failed" else "implementation_completed")
+            workflow_status = (WorkflowStatus.TASK_VERIFIED.value if outcome == "verified" else
+                (WorkflowStatus.VERIFICATION_FAILED.value if outcome == "verification_failed" else WorkflowStatus.HUMAN_ATTENTION.value))
+            execution_lifecycle = "completed" if outcome == "verified" else "failed" if outcome == "verification_failed" else "unknown"
+            operation_status = "completed" if outcome in {"verified", "verification_failed", "verification_blocked", "interrupted_unchanged"} else "unknown"
+            conn.execute("UPDATE verification_attempts SET status='terminal',classification=?,final_inspection_json=?,finished_at=?,updated_at=? WHERE id=?",
+                (outcome, _json(final_inspection), now, now, attempt_id))
+            conn.execute("UPDATE executions SET lifecycle=?,terminal_result=?,failure_detail=?,updated_at=? WHERE id=?",
+                (execution_lifecycle, _json({"classification": outcome}), detail, now, attempt["execution_id"]))
+            conn.execute("UPDATE operations SET status=?,updated_at=? WHERE id=?", (operation_status, now, attempt["operation_id"]))
+            conn.execute("UPDATE task_implementation_states SET status=?,updated_at=? WHERE workflow_id=? AND plan_artifact_id=? AND task_contract_id=?",
+                (task_status, now, attempt["workflow_id"], attempt["plan_artifact_id"], attempt["task_contract_id"]))
+            conn.execute("UPDATE workflows SET stage=?,status=?,updated_at=? WHERE id=?",
+                (Stage.TASK_EXECUTION.value, workflow_status, now, attempt["workflow_id"]))
+            self._event_unlocked(conn, attempt["workflow_id"], "verification.attempt.terminal", stage=Stage.TASK_EXECUTION,
+                execution_id=attempt["execution_id"], payload={"attempt_id": attempt_id, "outcome": outcome})
+            result = conn.execute("DELETE FROM workspace_operation_leases WHERE repository_key=? AND lease_id=? AND attempt_id=? AND owner_instance_id=?",
+                (lease["repository_key"], lease_id, attempt_id, owner_instance_id))
+            if result.rowcount != 1: raise PersistenceFailure("verification terminal transition could not release its lease")
 
     def list_implementation_attempts(self, workflow_id: str) -> list[Mapping[str, Any]]:
         """Return bounded operational evidence for the CLI status projection."""

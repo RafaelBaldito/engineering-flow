@@ -182,10 +182,12 @@ class ImplementationRecoveryService:
         if unchanged:
             self.store.finish_implementation_attempt(lease["attempt_id"], lease["lease_id"], status="failed",
                 classification="failed_unchanged", final=final.as_payload(), workspace_changed=False,
+                owner_instance_id=lease["owner_instance_id"],
                 error_detail="recovered after writer death with exact unchanged baseline")
             return ReconciliationOutcome.WRITER_GONE_UNCHANGED
         self.store.finish_implementation_attempt(lease["attempt_id"], lease["lease_id"], status="unknown",
             classification="interrupted_changed", final=final.as_payload(), workspace_changed=True,
+            owner_instance_id=lease["owner_instance_id"],
             error_detail="recovered after writer death with changed or control-violating workspace")
         return ReconciliationOutcome.WRITER_GONE_CHANGED
 
@@ -325,11 +327,13 @@ class ImplementationAttemptOrchestrator:
             accepted = inspector.capture(require_clean=True)
         except Exception as exc:
             self.store.finish_implementation_attempt(intent["attempt_id"], intent["lease_id"], status="failed",
-                classification="baseline_refusal", final=None, workspace_changed=False, error_detail=f"baseline changed after lease: {exc}")
+                classification="baseline_refusal", final=None, workspace_changed=False,
+                owner_instance_id=intent["owner_instance_id"], error_detail=f"baseline changed after lease: {exc}")
             return selection
         if accepted.fingerprint != baseline.fingerprint:
             self.store.finish_implementation_attempt(intent["attempt_id"], intent["lease_id"], status="failed",
-                classification="baseline_refusal", final=accepted.as_payload(), workspace_changed=False, error_detail="baseline changed after lease")
+                classification="baseline_refusal", final=accepted.as_payload(), workspace_changed=False,
+                owner_instance_id=intent["owner_instance_id"], error_detail="baseline changed after lease")
             return selection
         # The lease/intent itself is an expected control write.  Capture the
         # immutable control boundary only after it, immediately before spawn.
@@ -352,7 +356,8 @@ class ImplementationAttemptOrchestrator:
             final = inspector.capture()
         except Exception as exc:
             self.store.finish_implementation_attempt(intent["attempt_id"], intent["lease_id"], status="unknown",
-                classification="safety_violation", final=None, workspace_changed=None, error_detail=str(exc), agent_result={"summary": getattr(result, "summary", "")})
+                classification="safety_violation", final=None, workspace_changed=None,
+                owner_instance_id=intent["owner_instance_id"], error_detail=str(exc), agent_result={"summary": getattr(result, "summary", "")})
             return selection
         changed = final.fingerprint != baseline.fingerprint
         safe = (self._same_structure(baseline, final)
@@ -381,6 +386,7 @@ class ImplementationAttemptOrchestrator:
             status, classification = "failed", "failed_unchanged"
         self.store.finish_implementation_attempt(intent["attempt_id"], intent["lease_id"], status=status,
             classification=classification, final=final.as_payload(), workspace_changed=changed,
+            owner_instance_id=intent["owner_instance_id"],
             error_detail=getattr(result, "error", None), agent_result={"summary": getattr(result, "summary", ""), "changed_files": list(getattr(result, "changed_files", ()),), "notes": []},
             actual_provider=getattr(result, "actual_provider", None), actual_model=getattr(result, "actual_model", None),
             actual_reasoning=getattr(result, "actual_reasoning", None), provider_operation_ref=getattr(result, "provider_operation_ref", None),

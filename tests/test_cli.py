@@ -466,27 +466,31 @@ class CliTests(unittest.TestCase):
                     "complexity": "low", "risk": "high"}]}})
 
         workflow_id = self.ready_v2_workflow()
-        with patch("engineering_flow.cli.CodexCliRuntime", PlanRuntime):
-            self.assertEqual(main(["resume", "--repo", str(self.repository), "--workflow", workflow_id]), 0)
-        store = WorkflowStore(self.repository / ".engineering-flow" / "workflows.sqlite3")
-        plan = store.list_artifacts(workflow_id, Stage.PLAN)[0]
-        executions_before = len(store._connection.execute(
-            "SELECT id FROM executions WHERE workflow_id = ?", (workflow_id,)
-        ).fetchall())
-        store.close()
-        code, output = self.invoke(["approve", "--repo", str(self.repository)])
-        self.assertEqual(code, 0)
-        self.assertIn("Plan approved.\nNo implementation has started.", output)
-        code, status = self.invoke(["status", "--repo", str(self.repository), "--json"])
-        self.assertEqual(code, 0)
-        self.assertEqual((status["stage"], status["status"], status["plan"]["approval_state"]),
-                         ("plan", "plan_approved", "approved"))
-        store = WorkflowStore(self.repository / ".engineering-flow" / "workflows.sqlite3")
-        self.assertEqual(len(store._connection.execute(
-            "SELECT id FROM executions WHERE workflow_id = ?", (workflow_id,)
-        ).fetchall()), executions_before)
-        self.assertEqual(store.list_tasks(workflow_id), [])
-        store.close()
+        stdin, stdout, stderr = io.StringIO(), io.StringIO(), io.StringIO()
+        with patch("engineering_flow.cli.sys.stdin", stdin), \
+                patch("engineering_flow.cli.sys.stdout", stdout), \
+                patch("engineering_flow.cli.sys.stderr", stderr):
+            with patch("engineering_flow.cli.CodexCliRuntime", PlanRuntime):
+                self.assertEqual(main(["resume", "--repo", str(self.repository), "--workflow", workflow_id]), 0)
+            store = WorkflowStore(self.repository / ".engineering-flow" / "workflows.sqlite3")
+            plan = store.list_artifacts(workflow_id, Stage.PLAN)[0]
+            executions_before = len(store._connection.execute(
+                "SELECT id FROM executions WHERE workflow_id = ?", (workflow_id,)
+            ).fetchall())
+            store.close()
+            code, output = self.invoke(["approve", "--repo", str(self.repository)])
+            self.assertEqual(code, 0)
+            self.assertIn("Plan approved.\nNo implementation has started.", output)
+            code, status = self.invoke(["status", "--repo", str(self.repository), "--json"])
+            self.assertEqual(code, 0)
+            self.assertEqual((status["stage"], status["status"], status["plan"]["approval_state"]),
+                             ("plan", "plan_approved", "approved"))
+            store = WorkflowStore(self.repository / ".engineering-flow" / "workflows.sqlite3")
+            self.assertEqual(len(store._connection.execute(
+                "SELECT id FROM executions WHERE workflow_id = ?", (workflow_id,)
+            ).fetchall()), executions_before)
+            self.assertEqual(store.list_tasks(workflow_id), [])
+            store.close()
 
     def test_v2_reject_routes_to_plan_gate_and_reports_persisted_reason(self):
         class PlanRuntime(FakeRuntime):
@@ -501,21 +505,25 @@ class CliTests(unittest.TestCase):
                     "feature_contract": {"artifact_id": artifact_id, "sha256": sha256}, "strategy": "Change source.", "assumptions": [], "verification_strategy": ["tests"], "tasks": [{"id": "T1", "objective": "Change source.", "context": {"relevant_files": ["source.py"], "existing_patterns": []}, "requirements": ["Update behavior."], "acceptance_criteria": ["Works."], "verification": ["tests"], "constraints": [], "depends_on": [], "complexity": "low", "risk": "high"}]}})
 
         workflow_id = self.ready_v2_workflow()
-        with patch("engineering_flow.cli.CodexCliRuntime", PlanRuntime):
-            self.assertEqual(main(["resume", "--repo", str(self.repository), "--workflow", workflow_id]), 0)
-        store = WorkflowStore(self.repository / ".engineering-flow" / "workflows.sqlite3")
-        plan = store.list_artifacts(workflow_id, Stage.PLAN)[0]
-        store.close()
-        code, output = self.invoke(["reject", "--repo", str(self.repository), "--reason", "Revise boundaries."])
-        self.assertEqual(code, 0)
-        self.assertIn("Plan rejected.\nRejection reason recorded.", output)
-        code, status = self.invoke(["status", "--repo", str(self.repository), "--workflow", workflow_id, "--json"])
-        self.assertEqual(code, 0)
-        self.assertEqual((status["stage"], status["status"], status["plan"]["approval_state"], status["plan"]["decision_reason"]),
-                         ("plan", "rejected", "rejected", "Revise boundaries."))
-        code, failed = self.invoke(["approve", "--repo", str(self.repository), "--workflow", workflow_id, "--artifact", plan.id])
-        self.assertEqual(code, 4)
-        self.assertIn("error: conflict:", failed)
+        stdin, stdout, stderr = io.StringIO(), io.StringIO(), io.StringIO()
+        with patch("engineering_flow.cli.sys.stdin", stdin), \
+                patch("engineering_flow.cli.sys.stdout", stdout), \
+                patch("engineering_flow.cli.sys.stderr", stderr):
+            with patch("engineering_flow.cli.CodexCliRuntime", PlanRuntime):
+                self.assertEqual(main(["resume", "--repo", str(self.repository), "--workflow", workflow_id]), 0)
+            store = WorkflowStore(self.repository / ".engineering-flow" / "workflows.sqlite3")
+            plan = store.list_artifacts(workflow_id, Stage.PLAN)[0]
+            store.close()
+            code, output = self.invoke(["reject", "--repo", str(self.repository), "--reason", "Revise boundaries."])
+            self.assertEqual(code, 0)
+            self.assertIn("Plan rejected.\nRejection reason recorded.", output)
+            code, status = self.invoke(["status", "--repo", str(self.repository), "--workflow", workflow_id, "--json"])
+            self.assertEqual(code, 0)
+            self.assertEqual((status["stage"], status["status"], status["plan"]["approval_state"], status["plan"]["decision_reason"]),
+                             ("plan", "rejected", "rejected", "Revise boundaries."))
+            code, failed = self.invoke(["approve", "--repo", str(self.repository), "--workflow", workflow_id, "--artifact", plan.id])
+            self.assertEqual(code, 4)
+            self.assertIn("error: conflict:", failed)
 
     def test_v2_feature_contract_tampering_is_detected_after_reopen(self):
         class IntakeRuntime(FakeRuntime):
@@ -928,65 +936,69 @@ class CliTests(unittest.TestCase):
                         "id": request.workflow_id, "goal": "Goal", "requirements": [], "acceptance_criteria": [],
                         "constraints": [], "out_of_scope": [], "assumptions": [], "open_questions": ["Which API?"]}})
 
-        with patch("engineering_flow.cli.CodexCliRuntime", AmbiguousRuntime):
-            code, document = self.invoke(["run", "--repo", str(self.repository), "--request", "Ambiguous", "--json"])
-        self.assertEqual((code, document["status"]), (0, "needs_clarification"))
-        workflow_id = document["workflow_id"]
-        store = WorkflowStore(self.repository / ".engineering-flow" / "workflows.sqlite3")
-        feature = store.list_artifacts(workflow_id, Stage.INTAKE)[0]
-        clarification = store.get_active_clarification(workflow_id)
-        feature_bytes = Path(feature.path).read_bytes()
-        store.close()
+        stdin, stdout, stderr = io.StringIO(), io.StringIO(), io.StringIO()
+        with patch("engineering_flow.cli.sys.stdin", stdin), \
+                patch("engineering_flow.cli.sys.stdout", stdout), \
+                patch("engineering_flow.cli.sys.stderr", stderr):
+            with patch("engineering_flow.cli.CodexCliRuntime", AmbiguousRuntime):
+                code, document = self.invoke(["run", "--repo", str(self.repository), "--request", "Ambiguous", "--json"])
+            self.assertEqual((code, document["status"]), (0, "needs_clarification"))
+            workflow_id = document["workflow_id"]
+            store = WorkflowStore(self.repository / ".engineering-flow" / "workflows.sqlite3")
+            feature = store.list_artifacts(workflow_id, Stage.INTAKE)[0]
+            clarification = store.get_active_clarification(workflow_id)
+            feature_bytes = Path(feature.path).read_bytes()
+            store.close()
 
-        # Omitted --repo resolves the selected workflow from the current repo.
-        prior_cwd = Path.cwd()
-        try:
-            os.chdir(self.repository)
-            self.assertEqual(main(["resume"]), 0)
-            out, err = io.StringIO(), io.StringIO()
-            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-                self.assertEqual(main(["cancel", "--json"]), 0)
-            self.assertEqual(err.getvalue(), "")
-            self.assertEqual(len(out.getvalue().splitlines()), 1)
-            cancelled = json.loads(out.getvalue())
-        finally:
-            os.chdir(prior_cwd)
-        self.assertEqual((cancelled["workflow_id"], cancelled["status"]), (workflow_id, "cancelled"))
+            # Omitted --repo resolves the selected workflow from the current repo.
+            prior_cwd = Path.cwd()
+            try:
+                os.chdir(self.repository)
+                self.assertEqual(main(["resume"]), 0)
+                out, err = io.StringIO(), io.StringIO()
+                with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                    self.assertEqual(main(["cancel", "--json"]), 0)
+                self.assertEqual(err.getvalue(), "")
+                self.assertEqual(len(out.getvalue().splitlines()), 1)
+                cancelled = json.loads(out.getvalue())
+            finally:
+                os.chdir(prior_cwd)
+            self.assertEqual((cancelled["workflow_id"], cancelled["status"]), (workflow_id, "cancelled"))
 
-        store = WorkflowStore(self.repository / ".engineering-flow" / "workflows.sqlite3")
-        self.assertEqual(store.get_selected_workflow_id(), workflow_id)
-        self.assertEqual(store.get_workflow(workflow_id).status, WorkflowStatus.CANCELLED)
-        self.assertEqual(Path(feature.path).read_bytes(), feature_bytes)
-        self.assertEqual(store.get_active_clarification(workflow_id).id, clarification.id)
-        event_count = len(store.list_events(workflow_id))
-        store.close()
+            store = WorkflowStore(self.repository / ".engineering-flow" / "workflows.sqlite3")
+            self.assertEqual(store.get_selected_workflow_id(), workflow_id)
+            self.assertEqual(store.get_workflow(workflow_id).status, WorkflowStatus.CANCELLED)
+            self.assertEqual(Path(feature.path).read_bytes(), feature_bytes)
+            self.assertEqual(store.get_active_clarification(workflow_id).id, clarification.id)
+            event_count = len(store.list_events(workflow_id))
+            store.close()
 
-        for argv in (
-            ["resume", "--repo", str(self.repository)],
-            ["resume", "--repo", str(self.repository), "--answer", "HTTP"],
-            ["cancel", "--repo", str(self.repository)],
-        ):
-            code, text = self.invoke(argv)
-            if argv[0] == "cancel":
-                self.assertEqual(code, 0)
-            else:
-                self.assertEqual(code, 4)
-                self.assertIn("cancelled", text)
-        store = WorkflowStore(self.repository / ".engineering-flow" / "workflows.sqlite3")
-        self.assertEqual(len(store.list_events(workflow_id)), event_count)
-        self.assertEqual(len(AmbiguousRuntime.instances[0].requests), 1)
-        store.close()
+            for argv in (
+                ["resume", "--repo", str(self.repository)],
+                ["resume", "--repo", str(self.repository), "--answer", "HTTP"],
+                ["cancel", "--repo", str(self.repository)],
+            ):
+                code, text = self.invoke(argv)
+                if argv[0] == "cancel":
+                    self.assertEqual(code, 0)
+                else:
+                    self.assertEqual(code, 4)
+                    self.assertIn("cancelled", text)
+            store = WorkflowStore(self.repository / ".engineering-flow" / "workflows.sqlite3")
+            self.assertEqual(len(store.list_events(workflow_id)), event_count)
+            self.assertEqual(len(AmbiguousRuntime.instances[0].requests), 1)
+            store.close()
 
-        # A new V2 run gets a distinct identity and takes over selection;
-        # cancelling A never reopens or reuses it.
-        with patch("engineering_flow.cli.CodexCliRuntime", AmbiguousRuntime):
-            code, next_workflow = self.invoke(["run", "--repo", str(self.repository), "--request", "New feature", "--json"])
-        self.assertEqual(code, 0)
-        self.assertNotEqual(next_workflow["workflow_id"], workflow_id)
-        store = WorkflowStore(self.repository / ".engineering-flow" / "workflows.sqlite3")
-        self.assertEqual(store.get_selected_workflow_id(), next_workflow["workflow_id"])
-        self.assertEqual(store.get_workflow(workflow_id).status, WorkflowStatus.CANCELLED)
-        store.close()
+            # A new V2 run gets a distinct identity and takes over selection;
+            # cancelling A never reopens or reuses it.
+            with patch("engineering_flow.cli.CodexCliRuntime", AmbiguousRuntime):
+                code, next_workflow = self.invoke(["run", "--repo", str(self.repository), "--request", "New feature", "--json"])
+            self.assertEqual(code, 0)
+            self.assertNotEqual(next_workflow["workflow_id"], workflow_id)
+            store = WorkflowStore(self.repository / ".engineering-flow" / "workflows.sqlite3")
+            self.assertEqual(store.get_selected_workflow_id(), next_workflow["workflow_id"])
+            self.assertEqual(store.get_workflow(workflow_id).status, WorkflowStatus.CANCELLED)
+            store.close()
 
     def test_task_status_logs_and_intervention_are_persisted_projections(self):
         store = WorkflowStore(self.repository / ".engineering-flow" / "workflows.sqlite3")

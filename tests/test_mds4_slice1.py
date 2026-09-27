@@ -52,7 +52,7 @@ class Mds4Slice1Tests(unittest.TestCase):
         intent = self.store.create_implementation_intent(workflow.id, repository_key=inspector.repository_key(), canonical_root=str(self.root), task_contract_id=contract.id, task_contract_sha256=contract.payload_sha256(), request_hash="i" * 64, baseline=baseline, owner_instance_id=str(uuid.uuid4()), owner_pid=os.getpid(), owner_host_id="host", owner_boot_id="boot")
         (self.root / "source.py").write_text("implemented\n")
         final = inspector.capture().as_payload()
-        self.store.finish_implementation_attempt(intent["attempt_id"], intent["lease_id"], status="succeeded", classification="completed_changed", final=final, workspace_changed=True)
+        self.store.finish_implementation_attempt(intent["attempt_id"], intent["lease_id"], status="succeeded", classification="completed_changed", final=final, workspace_changed=True, owner_instance_id=intent["owner_instance_id"])
         return workflow, authority, contract, intent, final
 
     def test_tracked_manifest_is_canonical_and_hash_bound(self):
