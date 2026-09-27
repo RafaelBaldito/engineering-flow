@@ -23,8 +23,12 @@ from .domain import (
     WorkKind,
     Workflow,
     WorkflowStatus,
+    VerificationOutcome,
 )
 from .store import WorkflowStore, parse_task_plan_manifest
+from .verification import (DeterministicVerificationPreflight, VerificationCommand,
+                           VerificationManifest, VerificationManifestBinding,
+                           VerificationManifestResolver)
 from .runtime import (
     AgentRuntime,
     CapabilityReport,
@@ -63,8 +67,14 @@ __all__ = [
     "WorkKind",
     "Workflow",
     "WorkflowStatus",
+    "VerificationOutcome",
     "WorkflowStore",
     "parse_task_plan_manifest",
+    "DeterministicVerificationPreflight",
+    "VerificationCommand",
+    "VerificationManifest",
+    "VerificationManifestBinding",
+    "VerificationManifestResolver",
     "AgentRuntime",
     "CapabilityReport",
     "NormalizedEvent",

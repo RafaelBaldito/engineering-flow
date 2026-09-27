@@ -51,6 +51,7 @@ from .domain import (
     ScopeKind,
     Session,
     Stage,
+    SuccessfulImplementationProducer,
     Intervention,
     TaskArtifact,
     TaskArtifactType,
@@ -316,7 +317,7 @@ class WorkflowStore:
             plan_sha256 TEXT NOT NULL CHECK(length(plan_sha256) = 64),
             task_contract_id TEXT NOT NULL,
             task_contract_sha256 TEXT NOT NULL CHECK(length(task_contract_sha256) = 64),
-            status TEXT NOT NULL CHECK(status IN ('pending', 'implementing', 'implementation_completed', 'implementation_failed', 'implementation_unknown', 'verified')),
+            status TEXT NOT NULL CHECK(status IN ('pending', 'implementing', 'implementation_completed', 'implementation_failed', 'implementation_unknown', 'verifying', 'verification_failed', 'verified')),
             selected_at TEXT,
             updated_at TEXT NOT NULL,
             UNIQUE(workflow_id, plan_artifact_id, task_contract_id)
@@ -589,6 +590,34 @@ class WorkflowStore:
                     self._connection.execute(
                         "ALTER TABLE migration_receipts ADD COLUMN request_fingerprint TEXT"
                     )
+                # SQLite cannot widen a CHECK constraint in place.  This is
+                # the existing MDS #3 task-state table, not verification
+                # attempt persistence; rebuilding it retains all rows while
+                # allowing the Slice 1 domain states to round-trip.
+                task_state_sql = self._connection.execute(
+                    "SELECT sql FROM sqlite_master WHERE type='table' AND name='task_implementation_states'"
+                ).fetchone()["sql"]
+                if "'verifying'" not in task_state_sql:
+                    self._connection.executescript("""
+                        ALTER TABLE task_implementation_states RENAME TO task_implementation_states_legacy;
+                        CREATE TABLE task_implementation_states (
+                            id TEXT PRIMARY KEY,
+                            workflow_id TEXT NOT NULL REFERENCES workflows(id),
+                            plan_artifact_id TEXT NOT NULL REFERENCES artifacts(id),
+                            plan_sha256 TEXT NOT NULL CHECK(length(plan_sha256) = 64),
+                            task_contract_id TEXT NOT NULL,
+                            task_contract_sha256 TEXT NOT NULL CHECK(length(task_contract_sha256) = 64),
+                            status TEXT NOT NULL CHECK(status IN ('pending', 'implementing', 'implementation_completed', 'implementation_failed', 'implementation_unknown', 'verifying', 'verification_failed', 'verified')),
+                            selected_at TEXT,
+                            updated_at TEXT NOT NULL,
+                            UNIQUE(workflow_id, plan_artifact_id, task_contract_id)
+                        );
+                        INSERT INTO task_implementation_states
+                            SELECT * FROM task_implementation_states_legacy;
+                        DROP TABLE task_implementation_states_legacy;
+                        CREATE INDEX IF NOT EXISTS idx_task_implementation_states_plan
+                            ON task_implementation_states(workflow_id, plan_artifact_id, task_contract_id);
+                    """)
                 current_operation_columns = {
                     row["name"]
                     for row in self._connection.execute("PRAGMA table_info(operations)").fetchall()
@@ -1008,6 +1037,9 @@ class WorkflowStore:
                         or (workflow.stage is Stage.TASK_EXECUTION and workflow.status in {
                             WorkflowStatus.IMPLEMENTATION_FAILED,
                             WorkflowStatus.IMPLEMENTATION_COMPLETED,
+                            WorkflowStatus.VERIFYING,
+                            WorkflowStatus.VERIFICATION_FAILED,
+                            WorkflowStatus.TASK_VERIFIED,
                         }))):
             raise ConflictFailure("workflow is not at V2 PLAN_APPROVED authority")
         plans = self.list_artifacts(workflow.id, Stage.PLAN)
@@ -1051,6 +1083,75 @@ class WorkflowStore:
                           repository_path=workflow.repository_path)
         return ApprovedV2PlanAuthority(workflow, feature_artifact, feature,
                                        plan_artifact, plan, approval)
+
+    def load_successful_implementation_producer(
+        self, workflow_id: str, operation_id: str, task_contract_id: str,
+        task_contract_sha256: str,
+    ) -> SuccessfulImplementationProducer:
+        """Load only durable MDS #3 IMPLEMENT evidence eligible for VERIFY.
+
+        The join deliberately proves all relationships at the persistence
+        boundary, so callers cannot turn an arbitrary completed operation ID
+        into verification authority.
+        """
+        if not operation_id:
+            raise ValidationFailure("verification requires a producer operation")
+        row = self._connection.execute("""SELECT o.id AS operation_id, o.kind AS operation_kind,
+            o.workflow_id AS operation_workflow_id, o.status AS operation_status,
+            o.related_record_id AS operation_execution_id, a.*, e.workflow_id AS execution_workflow_id,
+            e.lifecycle AS execution_lifecycle, e.role AS execution_role, e.request_hash AS execution_request_hash,
+            w.repository_path AS workflow_repository_path
+            FROM operations o
+            LEFT JOIN implementation_attempts a ON a.operation_id=o.id
+            LEFT JOIN executions e ON e.id=a.execution_id
+            LEFT JOIN workflows w ON w.id=o.workflow_id
+            WHERE o.id=?""", (operation_id,)).fetchone()
+        if row is None:
+            raise ValidationFailure("verification producer operation is missing")
+        if (row["operation_kind"] != "implementation" or row["operation_status"] != OperationStatus.COMPLETED.value
+                or row["operation_workflow_id"] != workflow_id or row["workflow_id"] != workflow_id
+                or row["execution_workflow_id"] != workflow_id or row["operation_execution_id"] != row["execution_id"]
+                or row["execution_lifecycle"] != ExecutionLifecycle.COMPLETED.value
+                or row["execution_role"] != Role.DEVELOPER.value):
+            raise ValidationFailure("verification producer operation is not a successful IMPLEMENT operation")
+        if (row["result_classification"] != "completed_changed" or row["status"] not in {"completed", "succeeded"}
+                or row["task_contract_id"] != task_contract_id
+                or row["task_contract_sha256"] != task_contract_sha256
+                or row["request_hash"] != row["execution_request_hash"]):
+            raise ValidationFailure("verification producer operation does not match the selected implementation")
+        raw_final = row["final_repository_json"]
+        try:
+            final = json.loads(raw_final) if raw_final else None
+        except json.JSONDecodeError as exc:
+            raise ValidationFailure("verification producer final repository evidence is invalid") from exc
+        if not isinstance(final, dict) or set(final) != {
+                "canonical_root", "git_toplevel", "git_dir", "git_common_dir", "head_sha", "branch_name",
+                "detached", "status_sha256", "diff_sha256", "untracked_manifest_sha256", "changed_paths",
+                "changed_paths_sha256", "local_git_config_sha256", "fingerprint"}:
+            raise ValidationFailure("verification producer final repository evidence is missing or invalid")
+        fingerprint = final.get("fingerprint")
+        if not isinstance(fingerprint, str) or not re.fullmatch(r"[0-9a-f]{64}", fingerprint):
+            raise ValidationFailure("verification producer final repository fingerprint is invalid")
+        string_fields = set(final) - {"changed_paths", "detached"}
+        if (any(not isinstance(final[field], str) for field in string_fields)
+                or not isinstance(final["detached"], bool)
+                or not isinstance(final["changed_paths"], list)
+                or any(not isinstance(path, str) for path in final["changed_paths"])
+                or final["canonical_root"] != str(Path(row["workflow_repository_path"]).resolve())):
+            raise ValidationFailure("verification producer final repository evidence is invalid")
+        recomputed = hashlib.sha256(_json({key: final[key] for key in final if key != "fingerprint"}).encode("utf-8")).hexdigest()
+        if fingerprint != recomputed:
+            raise ValidationFailure("verification producer final repository fingerprint does not match its evidence")
+        digest = hashlib.sha256(_json(final).encode("utf-8")).hexdigest()
+        return SuccessfulImplementationProducer(
+            operation_id=row["operation_id"], execution_id=row["execution_id"], workflow_id=workflow_id,
+            feature_artifact_id=row["feature_artifact_id"], feature_sha256=row["feature_sha256"],
+            plan_artifact_id=row["plan_artifact_id"], plan_sha256=row["plan_sha256"],
+            plan_revision=row["plan_revision"], plan_id=row["plan_id"], approval_id=row["approval_id"],
+            task_contract_id=row["task_contract_id"], task_contract_sha256=row["task_contract_sha256"],
+            implementation_request_hash=row["request_hash"], final_repository=final,
+            final_repository_sha256=digest, final_repository_fingerprint=fingerprint,
+        )
 
     def list_task_implementation_states(
         self, workflow_id: str, plan_artifact_id: str

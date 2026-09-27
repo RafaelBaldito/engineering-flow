@@ -86,6 +86,9 @@ class WorkflowStatus(_ValueEnum):
     IMPLEMENTING = "implementing"
     IMPLEMENTATION_COMPLETED = "implementation_completed"
     IMPLEMENTATION_FAILED = "implementation_failed"
+    VERIFYING = "verifying"
+    VERIFICATION_FAILED = "verification_failed"
+    TASK_VERIFIED = "task_verified"
 
 
 def is_terminal_workflow_status(status: WorkflowStatus) -> bool:
@@ -145,7 +148,19 @@ class TaskImplementationStatus(_ValueEnum):
     IMPLEMENTATION_COMPLETED = "implementation_completed"
     IMPLEMENTATION_FAILED = "implementation_failed"
     IMPLEMENTATION_UNKNOWN = "implementation_unknown"
+    VERIFYING = "verifying"
+    VERIFICATION_FAILED = "verification_failed"
     VERIFIED = "verified"
+
+
+class VerificationOutcome(_ValueEnum):
+    """Terminal classifications for deterministic verification attempts."""
+
+    VERIFIED = "verified"
+    VERIFICATION_FAILED = "verification_failed"
+    VERIFICATION_BLOCKED = "verification_blocked"
+    INTERRUPTED_UNCHANGED = "interrupted_unchanged"
+    VERIFICATION_UNKNOWN = "verification_unknown"
 
 
 class TaskSelectionOutcome(_ValueEnum):
@@ -778,6 +793,28 @@ class ApprovedV2PlanAuthority:
     plan_artifact: Artifact
     plan: Plan
     approval: Approval
+
+
+@dataclass(frozen=True, slots=True)
+class SuccessfulImplementationProducer:
+    """Persisted MDS #3 evidence that authorizes one verification input."""
+
+    operation_id: str
+    execution_id: str
+    workflow_id: str
+    feature_artifact_id: str
+    feature_sha256: str
+    plan_artifact_id: str
+    plan_sha256: str
+    plan_revision: int
+    plan_id: str
+    approval_id: str
+    task_contract_id: str
+    task_contract_sha256: str
+    implementation_request_hash: str
+    final_repository: Mapping[str, Any]
+    final_repository_sha256: str
+    final_repository_fingerprint: str
 
 
 @dataclass(frozen=True, slots=True)

@@ -35,4 +35,10 @@ Thumbs.db
 
 # Logs
 *.log
-.engineering-flow/
+
+# Runtime/control state remains local, while the verification policy is a
+# normal tracked repository artifact.
+.engineering-flow/*
+!.engineering-flow/verification/
+.engineering-flow/verification/*
+!.engineering-flow/verification/manifest-v1.json
