@@ -9,7 +9,8 @@ sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 
 from engineering_flow.domain import Stage  # noqa: E402
 from engineering_flow.presentation import (OutputMode, ProgressRenderer, create_progress_renderer,
-                                           prompt_for_plan_decision, render_result)  # noqa: E402
+                                           prompt_for_implementation_start, prompt_for_plan_decision,
+                                           render_result)  # noqa: E402
 from engineering_flow.runtime import RuntimeProgressEvent  # noqa: E402
 
 
@@ -87,6 +88,13 @@ class Tty(io.StringIO):
 
 
 class PresentationTests(unittest.TestCase):
+    def test_implementation_start_prompt_is_default_no_and_requires_affirmative_input(self):
+        for answer in ("n\n", "\n", ""):
+            output = Tty()
+            self.assertFalse(prompt_for_implementation_start(Tty(answer), output, no_color=True))
+            self.assertIn("Start implementation now? [y/N]", output.getvalue())
+        self.assertTrue(prompt_for_implementation_start(Tty("YES\n"), Tty(), no_color=True))
+
     def test_plan_prompt_accepts_explicit_values_reprompts_and_leaves_eof_undecided(self):
         output = Tty()
         self.assertEqual(prompt_for_plan_decision(Tty("wat\nYES\n"), output, no_color=True), ("approve", None))

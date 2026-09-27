@@ -373,6 +373,26 @@ def prompt_for_plan_decision(
         console.print("Please enter y or n.", style="yellow")
 
 
+def prompt_for_implementation_start(
+    input_stream: TextIO,
+    output_stream: TextIO,
+    *,
+    no_color: bool = False,
+    environ: Mapping[str, str] | None = None,
+) -> bool:
+    """Read the one-shot, default-no inline implementation decision.
+
+    This is intentionally not an approval or an authority transition.  EOF,
+    blank input, and every non-affirmative response decline this invocation's
+    optional continuation.
+    """
+
+    console = build_console(output_stream, no_color=no_color, environ=environ)
+    console.print("Start implementation now? [y/N]", end=" ")
+    answer = input_stream.readline()
+    return answer != "" and answer.strip().casefold() in {"y", "yes"}
+
+
 def prompt_for_clarification(
     question: str,
     input_stream: TextIO,

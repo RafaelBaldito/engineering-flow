@@ -38,6 +38,7 @@ from .orchestrator import (CodexImplementationWriter, ImplementationAttemptOrche
                            V2PlanOrchestrator)
 from .presentation import (OutputMode, create_progress_renderer, interactive_prompt_eligible,
                            prompt_for_clarification, prompt_for_plan_decision,
+                           prompt_for_implementation_start,
                            render_clarification_recovery_instruction, render_plan_decision_result,
                            render_plan_revision_limit_instruction, render_recovery_instruction, render_result)
 from .sanitization import sanitize_payload, sanitize_text
@@ -424,6 +425,25 @@ def _close_progress(progress_sink: Any) -> None:
         close()
 
 
+def _continue_approved_implementation(
+    workflow_id: str,
+    *,
+    store: WorkflowStore,
+    config: FlowConfig,
+    runtime: Any,
+    progress_sink: Any,
+) -> Workflow:
+    """Invoke the sole MDS #3 implementation gateway once, then reload state.
+
+    Selection, authority validation, leases, repository safety, recovery, and
+    result classification deliberately remain owned by the orchestrator.
+    """
+
+    writer = CodexImplementationWriter(runtime=runtime, config=config, progress_sink=progress_sink)
+    ImplementationAttemptOrchestrator(store, writer, progress_sink=progress_sink).run_once(workflow_id)
+    return store.get_workflow(workflow_id)
+
+
 def _continue_v2_clarifications(
     workflow: Workflow,
     *,
@@ -667,10 +687,34 @@ def _run_command(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
                     progress_sink=progress_sink, planner_calls=1, verbose=args.verbose,
                     no_color=args.no_color,
                 )
-                result = _result_document(command, workflow=workflow, data=_workflow_payload(store, workflow))
+                if workflow.status is WorkflowStatus.PLAN_APPROVED:
+                    # The prompt-local approval decision is never authority.
+                    # Reload and validate the durable Plan before offering the
+                    # optional, one-shot continuation.
+                    workflow = store.get_workflow(workflow.id)
+                    if (workflow.lifecycle_version is LifecycleVersion.V2
+                            and workflow.stage is Stage.PLAN
+                            and workflow.status is WorkflowStatus.PLAN_APPROVED):
+                        store.load_approved_v2_plan_authority(workflow.id)
+                        if prompt_for_implementation_start(sys.stdin, sys.stdout, no_color=args.no_color):
+                            progress_sink = create_progress_renderer(sys.stderr, no_color=args.no_color)
+                            workflow = _continue_approved_implementation(
+                                workflow.id, store=store, config=config,
+                                runtime=plan_orchestrator.runtime, progress_sink=progress_sink,
+                            )
+                            rendered = False
+                # Inline continuation is the same implementation boundary as
+                # ``resume``.  Classify its reloaded terminal state through
+                # the shared workflow classifier so writer failures and
+                # uncertain outcomes cannot be reported as command success.
+                code, exit_code = _failure_for_workflow(store, workflow)
+                result = _result_document(
+                    command, workflow=workflow, error_code=code,
+                    data=_workflow_payload(store, workflow),
+                )
                 if rendered:
                     result["_already_rendered"] = True
-                return result, EXIT_SUCCESS
+                return result, exit_code
             feature_file = _validate_feature_file(args.feature_file)
             workflow = orchestrator.run(config.repository_path, feature_file=feature_file, provider=config.provider_name, configuration_snapshot=config.snapshot)
         elif command == "status":
@@ -737,12 +781,10 @@ def _run_command(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
                     progress_sink = (None if args.json_output else create_progress_renderer(
                         sys.stderr, no_color=args.no_color,
                     ))
-                    writer = CodexImplementationWriter(runtime=plan_orchestrator.runtime,
-                                                       config=config, progress_sink=progress_sink)
-                    ImplementationAttemptOrchestrator(
-                        store, writer, progress_sink=progress_sink,
-                    ).run_once(existing.id)
-                    workflow = store.get_workflow(existing.id)
+                    workflow = _continue_approved_implementation(
+                        existing.id, store=store, config=config,
+                        runtime=plan_orchestrator.runtime, progress_sink=progress_sink,
+                    )
                 else:
                     workflow = plan_orchestrator.resume(existing.id, progress_sink=(None if args.json_output else create_progress_renderer(sys.stderr, no_color=args.no_color)))
             else:

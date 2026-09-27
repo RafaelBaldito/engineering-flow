@@ -14,6 +14,7 @@ sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 
 from engineering_flow.cli import main  # noqa: E402
 from engineering_flow.domain import ApprovalDecision, ApprovalState, LifecycleVersion, Role, Stage, WorkflowStatus  # noqa: E402
+from engineering_flow.orchestrator import FakeWriterResult  # noqa: E402
 from engineering_flow.runtime import CapabilityReport, PlanningExecutionResult, RuntimeProgressEvent, TerminalState  # noqa: E402
 from engineering_flow.store import WorkflowStore  # noqa: E402
 
@@ -183,7 +184,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(store.list_artifacts(workflow.id), [])
         store.close()
 
-    def test_interactive_run_approves_the_displayed_plan_without_starting_tasks(self):
+    def test_interactive_run_no_or_eof_at_start_leaves_plan_approved_without_dispatch(self):
         class Runtime(FakeRuntime):
             def execute_planning(self, request):
                 return PlanningExecutionResult("fake", request.logical_session_id or "s", "thread", "turn", TerminalState.SUCCEEDED,
@@ -200,16 +201,185 @@ class CliTests(unittest.TestCase):
                     "requirements": ["Requirement"], "acceptance_criteria": ["Criterion"], "verification": ["tests"], "constraints": [], "depends_on": [], "complexity": "low", "risk": "low"}]}})
         class Tty(io.StringIO):
             def isatty(self): return True
-        stdout, stderr, stdin = Tty(), Tty(), Tty("\n")
-        with patch("engineering_flow.cli.CodexCliRuntime", Runtime), patch("engineering_flow.cli.sys.stdin", stdin), \
+        calls = []
+        class Writer:
+            provider = "fake"
+            def __init__(self, *args, **kwargs): pass
+            def routing_for(self, task): return None, "", ""
+            def bind(self, *args): pass
+            def __call__(self, root, task): calls.append(task.id); return FakeWriterResult(True)
+        for start_answer in ("n\n", ""):
+            with self.subTest(start_answer=repr(start_answer)):
+                stdout, stderr, stdin = Tty(), Tty(), Tty("\n" + start_answer)
+                with patch("engineering_flow.cli.CodexCliRuntime", Runtime), \
+                        patch("engineering_flow.cli.CodexImplementationWriter", Writer), \
+                        patch("engineering_flow.cli.sys.stdin", stdin), \
+                        patch("engineering_flow.cli.sys.stdout", stdout), patch("engineering_flow.cli.sys.stderr", stderr):
+                    self.assertEqual(main(["run", "--repo", str(self.repository), "--request", "Change feature."]), 0)
+                self.assertIn("Approve this plan? [Y/n]", stdout.getvalue())
+                self.assertIn("Plan approved.", stdout.getvalue())
+                self.assertIn("Start implementation now? [y/N]", stdout.getvalue())
+                store = WorkflowStore(self.repository / ".engineering-flow" / "workflows.sqlite3")
+                workflow = store.get_workflow(store.get_selected_workflow_id())
+                self.assertEqual((workflow.stage, workflow.status), (Stage.PLAN, WorkflowStatus.PLAN_APPROVED))
+                self.assertEqual(store.list_tasks(workflow.id), [])
+                self.assertEqual(store._connection.execute(
+                    "SELECT COUNT(*) FROM implementation_attempts WHERE workflow_id = ?", (workflow.id,)
+                ).fetchone()[0], 0)
+                store.close()
+        self.assertEqual(calls, [])
+
+        # Piped input is never an approval or inline-start channel.
+        stdout, stderr, stdin = io.StringIO(), io.StringIO(), io.StringIO("y\ny\n")
+        with patch("engineering_flow.cli.CodexCliRuntime", Runtime), \
+                patch("engineering_flow.cli.CodexImplementationWriter", Writer), \
+                patch("engineering_flow.cli.sys.stdin", stdin), \
                 patch("engineering_flow.cli.sys.stdout", stdout), patch("engineering_flow.cli.sys.stderr", stderr):
             self.assertEqual(main(["run", "--repo", str(self.repository), "--request", "Change feature."]), 0)
-        self.assertIn("Approve this plan? [Y/n]", stdout.getvalue())
-        self.assertIn("Plan approved.", stdout.getvalue())
         store = WorkflowStore(self.repository / ".engineering-flow" / "workflows.sqlite3")
         workflow = store.get_workflow(store.get_selected_workflow_id())
-        self.assertEqual((workflow.stage, workflow.status), (Stage.PLAN, WorkflowStatus.PLAN_APPROVED))
-        self.assertEqual(store.list_tasks(workflow.id), [])
+        self.assertEqual((workflow.stage, workflow.status), (Stage.PLAN, WorkflowStatus.AWAITING_APPROVAL))
+        self.assertEqual(store._connection.execute(
+            "SELECT COUNT(*) FROM implementation_attempts WHERE workflow_id = ?", (workflow.id,)
+        ).fetchone()[0], 0)
+        store.close()
+        self.assertEqual(calls, [])
+
+    def test_interactive_run_affirmative_start_dispatches_one_task_then_stops(self):
+        class Runtime(FakeRuntime):
+            def execute_planning(self, request):
+                return PlanningExecutionResult("fake", request.logical_session_id or "s", "thread", "turn", TerminalState.SUCCEEDED,
+                    {"outcome": "READY", "feature": {"id": request.workflow_id, "goal": "Goal", "requirements": ["Requirement"],
+                    "acceptance_criteria": ["Criterion"], "constraints": [], "out_of_scope": [], "assumptions": [], "open_questions": []}})
+            def verify_planning_capabilities(self, repository):
+                return CapabilityReport("fake", "fake", str(repository), True, {"read_only": True}, True)
+            def execute(self, request):
+                artifact_id, sha256 = re.search(r"artifact UUID ([^,]+), sha256 ([^)]+)", request.instruction).groups()
+                return PlanningExecutionResult("fake", request.logical_session_id or "s", "thread", "turn", TerminalState.SUCCEEDED,
+                    {"plan": {"id": f"{request.workflow_id}:plan:r1", "workflow_id": request.workflow_id, "revision": 1,
+                    "feature_contract": {"artifact_id": artifact_id, "sha256": sha256}, "strategy": "Strategy", "assumptions": [], "verification_strategy": ["tests"],
+                    "tasks": [{"id": "T1", "objective": "Change source.", "context": {"relevant_files": ["source.py"], "existing_patterns": []},
+                    "requirements": ["Requirement"], "acceptance_criteria": ["Criterion"], "verification": ["tests"], "constraints": [], "depends_on": [], "complexity": "low", "risk": "low"}]}})
+        class Tty(io.StringIO):
+            def isatty(self): return True
+        subprocess.run(["git", "-C", str(self.repository), "config", "user.email", "test@example.invalid"], check=True)
+        subprocess.run(["git", "-C", str(self.repository), "config", "user.name", "Test"], check=True)
+        (self.repository / "source.py").write_text("before\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(self.repository), "add", ".gitignore", "feature.md", "source.py"], check=True)
+        subprocess.run(["git", "-C", str(self.repository), "commit", "-m", "baseline"], check=True, capture_output=True)
+        calls = []
+        class Writer:
+            provider = "fake"
+            def __init__(self, *args, **kwargs): pass
+            def routing_for(self, task): return None, "", ""
+            def bind(self, *args): pass
+            def __call__(self, root, task):
+                calls.append(task.id)
+                Path(root, "source.py").write_text("after\n", encoding="utf-8")
+                return FakeWriterResult(True)
+        stdout, stderr, stdin = Tty(), Tty(), Tty("\ny\n")
+        with patch("engineering_flow.cli.CodexCliRuntime", Runtime), \
+                patch("engineering_flow.cli.CodexImplementationWriter", Writer), \
+                patch("engineering_flow.cli.sys.stdin", stdin), patch("engineering_flow.cli.sys.stdout", stdout), \
+                patch("engineering_flow.cli.sys.stderr", stderr):
+            self.assertEqual(main(["run", "--repo", str(self.repository), "--request", "Change source."]), 0,
+                             stdout.getvalue() + stderr.getvalue())
+        self.assertEqual(calls, ["T1"])
+        self.assertIn("verification: NOT_RUN", stdout.getvalue())
+        store = WorkflowStore(self.repository / ".engineering-flow" / "workflows.sqlite3")
+        workflow = store.get_workflow(store.get_selected_workflow_id())
+        self.assertEqual(workflow.status, WorkflowStatus.IMPLEMENTATION_COMPLETED)
+        self.assertEqual(store.list_implementation_attempts(workflow.id)[0]["task_contract_id"], "T1")
+        store.close()
+
+    def test_inline_writer_failure_has_the_same_nonzero_exit_as_resume(self):
+        class Runtime(FakeRuntime):
+            def execute_planning(self, request):
+                return PlanningExecutionResult("fake", request.logical_session_id or "s", "thread", "turn", TerminalState.SUCCEEDED,
+                    {"outcome": "READY", "feature": {"id": request.workflow_id, "goal": "Goal", "requirements": ["Requirement"],
+                    "acceptance_criteria": ["Criterion"], "constraints": [], "out_of_scope": [], "assumptions": [], "open_questions": []}})
+            def verify_planning_capabilities(self, repository):
+                return CapabilityReport("fake", "fake", str(repository), True, {"read_only": True}, True)
+            def execute(self, request):
+                artifact_id, sha256 = re.search(r"artifact UUID ([^,]+), sha256 ([^)]+)", request.instruction).groups()
+                return PlanningExecutionResult("fake", request.logical_session_id or "s", "thread", "turn", TerminalState.SUCCEEDED,
+                    {"plan": {"id": f"{request.workflow_id}:plan:r1", "workflow_id": request.workflow_id, "revision": 1,
+                    "feature_contract": {"artifact_id": artifact_id, "sha256": sha256}, "strategy": "Strategy", "assumptions": [], "verification_strategy": ["tests"],
+                    "tasks": [{"id": "T1", "objective": "Change source.", "context": {"relevant_files": ["source.py"], "existing_patterns": []},
+                    "requirements": ["Requirement"], "acceptance_criteria": ["Criterion"], "verification": ["tests"], "constraints": [], "depends_on": [], "complexity": "low", "risk": "low"}]}})
+        class Tty(io.StringIO):
+            def isatty(self): return True
+        subprocess.run(["git", "-C", str(self.repository), "config", "user.email", "test@example.invalid"], check=True)
+        subprocess.run(["git", "-C", str(self.repository), "config", "user.name", "Test"], check=True)
+        (self.repository / "source.py").write_text("before\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(self.repository), "add", ".gitignore", "feature.md", "source.py"], check=True)
+        subprocess.run(["git", "-C", str(self.repository), "commit", "-m", "baseline"], check=True, capture_output=True)
+        calls = []
+        class Writer:
+            provider = "fake"
+            def __init__(self, *args, **kwargs): pass
+            def routing_for(self, task): return None, "", ""
+            def bind(self, *args): pass
+            def __call__(self, root, task):
+                calls.append(task.id)
+                return FakeWriterResult(False, error="failed")
+        stdout, stderr, stdin = Tty(), Tty(), Tty("\ny\n")
+        with patch("engineering_flow.cli.CodexCliRuntime", Runtime), \
+                patch("engineering_flow.cli.CodexImplementationWriter", Writer), \
+                patch("engineering_flow.cli.sys.stdin", stdin), patch("engineering_flow.cli.sys.stdout", stdout), \
+                patch("engineering_flow.cli.sys.stderr", stderr):
+            inline_code = main(["run", "--repo", str(self.repository), "--request", "Change source."])
+        self.assertNotEqual(inline_code, 0)
+        store = WorkflowStore(self.repository / ".engineering-flow" / "workflows.sqlite3")
+        workflow_id = store.get_selected_workflow_id()
+        self.assertEqual(store.get_workflow(workflow_id).status, WorkflowStatus.IMPLEMENTATION_FAILED)
+        store.close()
+        with patch("engineering_flow.cli.CodexImplementationWriter", Writer):
+            resume_code = main(["resume", "--repo", str(self.repository), "--workflow", workflow_id])
+        self.assertEqual(inline_code, resume_code)
+        self.assertEqual(calls, ["T1", "T1"])
+
+    def test_inline_start_revalidates_dirty_workspace_before_writer_dispatch(self):
+        class Runtime(FakeRuntime):
+            def execute_planning(self, request):
+                return PlanningExecutionResult("fake", request.logical_session_id or "s", "thread", "turn", TerminalState.SUCCEEDED,
+                    {"outcome": "READY", "feature": {"id": request.workflow_id, "goal": "Goal", "requirements": ["Requirement"],
+                    "acceptance_criteria": ["Criterion"], "constraints": [], "out_of_scope": [], "assumptions": [], "open_questions": []}})
+            def verify_planning_capabilities(self, repository):
+                return CapabilityReport("fake", "fake", str(repository), True, {"read_only": True}, True)
+            def execute(self, request):
+                artifact_id, sha256 = re.search(r"artifact UUID ([^,]+), sha256 ([^)]+)", request.instruction).groups()
+                return PlanningExecutionResult("fake", request.logical_session_id or "s", "thread", "turn", TerminalState.SUCCEEDED,
+                    {"plan": {"id": f"{request.workflow_id}:plan:r1", "workflow_id": request.workflow_id, "revision": 1,
+                    "feature_contract": {"artifact_id": artifact_id, "sha256": sha256}, "strategy": "Strategy", "assumptions": [], "verification_strategy": ["tests"],
+                    "tasks": [{"id": "T1", "objective": "Change source.", "context": {"relevant_files": ["source.py"], "existing_patterns": []},
+                    "requirements": ["Requirement"], "acceptance_criteria": ["Criterion"], "verification": ["tests"], "constraints": [], "depends_on": [], "complexity": "low", "risk": "low"}]}})
+        class Tty(io.StringIO):
+            def isatty(self): return True
+        subprocess.run(["git", "-C", str(self.repository), "config", "user.email", "test@example.invalid"], check=True)
+        subprocess.run(["git", "-C", str(self.repository), "config", "user.name", "Test"], check=True)
+        (self.repository / "source.py").write_text("before\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(self.repository), "add", ".gitignore", "feature.md", "source.py"], check=True)
+        subprocess.run(["git", "-C", str(self.repository), "commit", "-m", "baseline"], check=True, capture_output=True)
+        (self.repository / "source.py").write_text("dirty before inline gateway\n", encoding="utf-8")
+        calls = []
+        class Writer:
+            provider = "fake"
+            def __init__(self, *args, **kwargs): pass
+            def routing_for(self, task): return None, "", ""
+            def bind(self, *args): pass
+            def __call__(self, root, task): calls.append(task.id); return FakeWriterResult(True)
+        stdout, stderr, stdin = Tty(), Tty(), Tty("\ny\n")
+        with patch("engineering_flow.cli.CodexCliRuntime", Runtime), \
+                patch("engineering_flow.cli.CodexImplementationWriter", Writer), \
+                patch("engineering_flow.cli.sys.stdin", stdin), patch("engineering_flow.cli.sys.stdout", stdout), \
+                patch("engineering_flow.cli.sys.stderr", stderr):
+            self.assertNotEqual(main(["run", "--repo", str(self.repository), "--request", "Change source."]), 0)
+        self.assertEqual(calls, [])
+        store = WorkflowStore(self.repository / ".engineering-flow" / "workflows.sqlite3")
+        workflow = store.get_workflow(store.get_selected_workflow_id())
+        self.assertEqual(workflow.status, WorkflowStatus.PLAN_APPROVED)
+        self.assertEqual(store.list_implementation_attempts(workflow.id), [])
         store.close()
 
     def test_resume_progress_uses_tty_stderr_and_json_and_non_tty_is_bounded(self):
@@ -511,6 +681,10 @@ class CliTests(unittest.TestCase):
             def isatty(self): return True
 
         workflow_id = self.ready_v2_workflow()
+        subprocess.run(["git", "-C", str(self.repository), "config", "user.email", "test@example.invalid"], check=True)
+        subprocess.run(["git", "-C", str(self.repository), "config", "user.name", "Test"], check=True)
+        subprocess.run(["git", "-C", str(self.repository), "add", ".gitignore", "feature.md", "source.py"], check=True)
+        subprocess.run(["git", "-C", str(self.repository), "commit", "-m", "baseline"], check=True, capture_output=True)
         stdout, stderr, stdin = Tty(), Tty(), Tty("n\nUse PascalCase.\nn\nUse a repository layer.\ny\n")
         with patch("engineering_flow.cli.CodexCliRuntime", Runtime), patch("engineering_flow.cli.sys.stdin", stdin), \
                 patch("engineering_flow.cli.sys.stdout", stdout), patch("engineering_flow.cli.sys.stderr", stderr):
@@ -528,7 +702,21 @@ class CliTests(unittest.TestCase):
         self.assertEqual(store.get_artifact(plans[1].id).approval_state, ApprovalState.CHANGES_REQUESTED)
         self.assertEqual(store.get_artifact(plans[2].id).approval_state, ApprovalState.APPROVED)
         self.assertIn("Approve this revised plan? [Y/n]", stdout.getvalue())
+        self.assertNotIn("Start implementation now? [y/N]", stdout.getvalue())
         store.close()
+        calls = []
+        class Writer:
+            provider = "fake"
+            def __init__(self, *args, **kwargs): pass
+            def routing_for(self, task): return None, "", ""
+            def bind(self, *args): pass
+            def __call__(self, root, task):
+                calls.append(task.id)
+                Path(root, "source.py").write_text("after\n", encoding="utf-8")
+                return FakeWriterResult(True)
+        with patch("engineering_flow.cli.CodexImplementationWriter", Writer):
+            self.assertEqual(main(["resume", "--repo", str(self.repository), "--workflow", workflow_id]), 0)
+        self.assertEqual(calls, ["T1"])
 
     def test_cli_fake_runtime_reaches_wave_two_after_three_exact_approvals(self):
         with patch("engineering_flow.cli.CodexCliRuntime", FakeRuntime):
