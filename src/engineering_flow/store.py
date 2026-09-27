@@ -375,7 +375,9 @@ class WorkflowStore:
             timeout_seconds INTEGER NOT NULL CHECK(timeout_seconds > 0), intent_at TEXT NOT NULL,
             result_at TEXT, exit_code INTEGER, timed_out INTEGER, output_sha256 TEXT,
             output_bytes INTEGER, output_truncated INTEGER, post_command_inspection_json TEXT,
-            classification TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+            classification TEXT, child_pid INTEGER, child_process_start TEXT,
+            child_process_group INTEGER, child_host_id TEXT, child_boot_id TEXT,
+            child_owner_instance_id TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
             UNIQUE(verification_attempt_id, ordinal), UNIQUE(verification_attempt_id, command_id)
         );
         CREATE TABLE IF NOT EXISTS operations (
@@ -582,6 +584,8 @@ class WorkflowStore:
                 }
                 governance_columns = {row["name"] for row in self._connection.execute(
                     "PRAGMA table_info(governance_decisions)").fetchall()}
+                verification_command_columns = {row["name"] for row in self._connection.execute(
+                    "PRAGMA table_info(verification_command_results)").fetchall()}
                 if "approval_target_stage" not in governance_columns:
                     self._connection.execute("ALTER TABLE governance_decisions ADD COLUMN approval_target_stage TEXT")
                 for name, statement in (
@@ -619,6 +623,16 @@ class WorkflowStore:
                     self._connection.execute(
                         "ALTER TABLE migration_receipts ADD COLUMN request_fingerprint TEXT"
                     )
+                for name, statement in (
+                    ("child_pid", "ALTER TABLE verification_command_results ADD COLUMN child_pid INTEGER"),
+                    ("child_process_start", "ALTER TABLE verification_command_results ADD COLUMN child_process_start TEXT"),
+                    ("child_process_group", "ALTER TABLE verification_command_results ADD COLUMN child_process_group INTEGER"),
+                    ("child_host_id", "ALTER TABLE verification_command_results ADD COLUMN child_host_id TEXT"),
+                    ("child_boot_id", "ALTER TABLE verification_command_results ADD COLUMN child_boot_id TEXT"),
+                    ("child_owner_instance_id", "ALTER TABLE verification_command_results ADD COLUMN child_owner_instance_id TEXT"),
+                ):
+                    if name not in verification_command_columns:
+                        self._connection.execute(statement)
                 self._migrate_workspace_writer_leases()
                 self._migrate_verification_attempt_sequences()
                 # SQLite cannot widen a CHECK constraint in place.  This is
@@ -1582,6 +1596,14 @@ class WorkflowStore:
                                                      "producer_operation_id": producer_operation_id})
         return {"attempt_id": attempt_id, "lease_id": lease_id, "execution_id": execution_id, "operation_id": operation_id}
 
+    def find_verification_attempt(self, workflow_id: str, producer_operation_id: str,
+                                  request_hash: str) -> Mapping[str, Any] | None:
+        """Load existing VERIFY evidence without interpreting or reconciling it."""
+        row = self._connection.execute("""SELECT * FROM verification_attempts
+            WHERE workflow_id=? AND producer_operation_id=? AND request_hash=?
+            ORDER BY sequence DESC LIMIT 1""", (workflow_id, producer_operation_id, request_hash)).fetchone()
+        return dict(row) if row is not None else None
+
     def record_verification_command_intent(self, attempt_id: str, lease_id: str, *, owner_instance_id: str,
                                             ordinal: int, command_id: str, canonical_command_sha256: str,
                                             argv: list[str] | tuple[str, ...], timeout_seconds: int) -> str:
@@ -1637,6 +1659,38 @@ class WorkflowStore:
                 WHERE lease_id=? AND attempt_id=? AND owner_instance_id=?""",
                 (child_pid, child_process_start, child_process_group, _now(), lease_id, attempt_id, owner_instance_id))
             if result.rowcount != 1: raise ConflictFailure("workspace operation lease ownership mismatch")
+
+    def record_verification_command_started(self, attempt_id: str, lease_id: str, command_result_id: str, *,
+                                            owner_instance_id: str, child_pid: int,
+                                            child_process_start: str, child_process_group: int,
+                                            child_host_id: str, child_boot_id: str) -> None:
+        """Atomically bind a spawned VERIFY child to its intent and active lease.
+
+        The command cannot be considered durably started until its PID-reuse-safe
+        identity is present in both the historical command evidence and the
+        unresolved lease used by a future recovery boundary.
+        """
+        if (type(child_pid) is not int or child_pid <= 0
+                or type(child_process_group) is not int or child_process_group <= 0
+                or not all(isinstance(value, str) and value for value in
+                           (child_process_start, child_host_id, child_boot_id, owner_instance_id))):
+            raise ValidationFailure("verification child identity is incomplete")
+        with self._transaction() as conn:
+            lease = conn.execute("""SELECT 1 FROM workspace_operation_leases WHERE lease_id=? AND attempt_id=?
+                AND owner_instance_id=? AND operation_kind='verification'""",
+                (lease_id, attempt_id, owner_instance_id)).fetchone()
+            command = conn.execute("""SELECT result_at FROM verification_command_results
+                WHERE id=? AND verification_attempt_id=?""", (command_result_id, attempt_id)).fetchone()
+            if lease is None or command is None or command["result_at"] is not None:
+                raise ConflictFailure("verification child start lacks exact active intent ownership")
+            now = _now()
+            conn.execute("""UPDATE verification_command_results SET child_pid=?,child_process_start=?,
+                child_process_group=?,child_host_id=?,child_boot_id=?,child_owner_instance_id=?,updated_at=?
+                WHERE id=?""", (child_pid, child_process_start, child_process_group, child_host_id,
+                                  child_boot_id, owner_instance_id, now, command_result_id))
+            conn.execute("""UPDATE workspace_operation_leases SET child_pid=?,child_process_start=?,
+                child_process_group=?,updated_at=? WHERE lease_id=? AND attempt_id=?""",
+                (child_pid, child_process_start, child_process_group, now, lease_id, attempt_id))
 
     def record_verification_command_result(self, attempt_id: str, lease_id: str, command_result_id: str, *,
                                             owner_instance_id: str, exit_code: int | None, timed_out: bool,
@@ -1697,6 +1751,40 @@ class WorkflowStore:
             result = conn.execute("DELETE FROM workspace_operation_leases WHERE repository_key=? AND lease_id=? AND attempt_id=? AND owner_instance_id=?",
                 (lease["repository_key"], lease_id, attempt_id, owner_instance_id))
             if result.rowcount != 1: raise PersistenceFailure("verification terminal transition could not release its lease")
+
+    def retain_verification_unknown(self, attempt_id: str, lease_id: str, *, owner_instance_id: str,
+                                    final_inspection: Mapping[str, Any], detail: str) -> None:
+        """Atomically project unknown VERIFY ownership without releasing its lease.
+
+        This is deliberately not a terminal transition.  Slice 4 owns any
+        recovery decision; until then the exact lease and unresolved command
+        intent/child identity remain the repository mutex and evidence.
+        """
+        if not isinstance(final_inspection, Mapping) or not isinstance(detail, str) or not detail:
+            raise ValidationFailure("retained verification unknown evidence is invalid")
+        with self._transaction() as conn:
+            lease = conn.execute("""SELECT * FROM workspace_operation_leases WHERE lease_id=? AND attempt_id=?
+                AND owner_instance_id=? AND operation_kind='verification'""",
+                (lease_id, attempt_id, owner_instance_id)).fetchone()
+            attempt = conn.execute("SELECT * FROM verification_attempts WHERE id=? AND lease_id=?", (attempt_id, lease_id)).fetchone()
+            if lease is None or attempt is None or attempt["status"] != "verifying":
+                raise ConflictFailure("retained verification unknown lacks exact active lease ownership")
+            now = _now()
+            conn.execute("""UPDATE verification_attempts SET status='unknown',classification='verification_unknown',
+                final_inspection_json=?,finished_at=?,updated_at=? WHERE id=?""",
+                (_json(final_inspection), now, now, attempt_id))
+            conn.execute("UPDATE executions SET lifecycle='unknown',terminal_result=?,failure_detail=?,updated_at=? WHERE id=?",
+                (_json({"classification": "verification_unknown"}), detail, now, attempt["execution_id"]))
+            conn.execute("UPDATE operations SET status='unknown',updated_at=? WHERE id=?", (now, attempt["operation_id"]))
+            conn.execute("""UPDATE task_implementation_states SET status='implementation_completed',updated_at=?
+                WHERE workflow_id=? AND plan_artifact_id=? AND task_contract_id=?""",
+                (now, attempt["workflow_id"], attempt["plan_artifact_id"], attempt["task_contract_id"]))
+            conn.execute("UPDATE workflows SET stage=?,status=?,updated_at=? WHERE id=?",
+                (Stage.TASK_EXECUTION.value, WorkflowStatus.HUMAN_ATTENTION.value, now, attempt["workflow_id"]))
+            conn.execute("UPDATE workspace_operation_leases SET updated_at=? WHERE lease_id=?", (now, lease_id))
+            self._event_unlocked(conn, attempt["workflow_id"], "verification.attempt.unknown_retained",
+                stage=Stage.TASK_EXECUTION, execution_id=attempt["execution_id"],
+                payload={"attempt_id": attempt_id, "reason": detail})
 
     def list_implementation_attempts(self, workflow_id: str) -> list[Mapping[str, Any]]:
         """Return bounded operational evidence for the CLI status projection."""

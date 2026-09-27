@@ -28,7 +28,8 @@ from .domain import (
 from .store import WorkflowStore, parse_task_plan_manifest
 from .verification import (DeterministicVerificationPreflight, VerificationCommand,
                            VerificationManifest, VerificationManifestBinding,
-                           VerificationManifestResolver)
+                           VerificationManifestResolver, VerificationCommandRunner,
+                           VerificationCommandExecution, DeterministicVerificationOrchestrator)
 from .runtime import (
     AgentRuntime,
     CapabilityReport,
@@ -75,6 +76,9 @@ __all__ = [
     "VerificationManifest",
     "VerificationManifestBinding",
     "VerificationManifestResolver",
+    "VerificationCommandRunner",
+    "VerificationCommandExecution",
+    "DeterministicVerificationOrchestrator",
     "AgentRuntime",
     "CapabilityReport",
     "NormalizedEvent",
