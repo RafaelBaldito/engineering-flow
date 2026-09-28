@@ -94,20 +94,22 @@ REVIEWER_OUTPUT_SCHEMA: dict[str, Any] = {
     "additionalProperties": False,
     "required": ["outcome", "summary", "findings"],
     "properties": {
-        "outcome": {"enum": ["PASS", "FIX_REQUIRED"]},
+        "outcome": {"enum": ["REVIEW_PASSED", "CHANGES_REQUESTED"]},
         "summary": {"type": "string"},
         "findings": {
             "type": "array",
         "items": {
             "type": "object",
             "additionalProperties": False,
-            "required": ["id", "severity", "description", "path", "line"],
+            "required": ["id", "severity", "category", "description", "path", "line", "requirement_reference"],
             "properties": {
                 "id": {"type": "string"},
-                "severity": {"enum": ["blocking", "non_blocking"]},
+                "severity": {"enum": ["blocking", "advisory"]},
+                "category": {"enum": ["correctness", "requirement", "architecture", "edge_case", "maintainability", "security", "regression_risk"]},
                 "description": {"type": "string"},
                 "path": {"type": ["string", "null"]},
                 "line": {"type": ["integer", "null"], "minimum": 1},
+                "requirement_reference": {"type": ["string", "null"]},
                 },
             },
         },
@@ -832,42 +834,14 @@ class CodexCliRuntime(AgentRuntime):
     def _validate_reviewer_payload(
         self, payload: Mapping[str, Any], request: RuntimeExecutionRequest
     ) -> tuple[dict[str, Any] | None, str | None]:
-        outcome, summary, findings = payload["outcome"], payload["summary"], payload["findings"]
-        if outcome not in ("PASS", "FIX_REQUIRED") or not isinstance(summary, str) or not isinstance(findings, list):
-            return None, "Reviewer payload has invalid outcome, summary, or findings"
-        ids: set[str] = set()
-        blocking = 0
-        repository = Path(request.repository_path).expanduser().resolve()
-        normalized: list[dict[str, Any]] = []
-        for finding in findings:
-            if not isinstance(finding, Mapping) or set(finding) - {"id", "severity", "description", "path", "line"}:
-                return None, "Reviewer finding does not match the approved schema"
-            if not {"id", "severity", "description"}.issubset(finding):
-                return None, "Reviewer finding is missing a required field"
-            identifier, severity, description = finding["id"], finding["severity"], finding["description"]
-            if not isinstance(identifier, str) or not identifier or identifier in ids:
-                return None, "Reviewer finding IDs must be non-empty and unique"
-            if severity not in ("blocking", "non_blocking") or not isinstance(description, str):
-                return None, "Reviewer finding has invalid fields"
-            safe = {"id": identifier, "severity": severity, "description": description}
-            if finding.get("path") is not None:
-                path = finding["path"]
-                candidate = (repository / path).resolve() if isinstance(path, str) else repository
-                if not isinstance(path, str) or not path or candidate == repository or repository not in candidate.parents:
-                    return None, "Reviewer finding path is outside the repository"
-                safe["path"] = str(candidate.relative_to(repository))
-            if finding.get("line") is not None:
-                if type(finding["line"]) is not int or finding["line"] <= 0:
-                    return None, "Reviewer finding line must be a positive integer"
-                safe["line"] = finding["line"]
-            ids.add(identifier)
-            blocking += severity == "blocking"
-            normalized.append(safe)
-        if outcome == "PASS" and findings:
-            return None, "Reviewer PASS requires no findings"
-        if outcome == "FIX_REQUIRED" and (not blocking or blocking != len(findings)):
-            return None, "Reviewer FIX_REQUIRED requires only blocking findings"
-        return {"outcome": outcome, "summary": summary, "findings": normalized}, None
+        del request
+        # The REVIEW adapter and Slice 5.1 share one canonical evidence
+        # contract; provider-side validation must not reinterpret it.
+        from .review import parse_reviewer_result
+        try:
+            return parse_reviewer_result(payload).canonical_payload(), None
+        except ValidationFailure as exc:
+            return None, str(exc)
 
     def execute(self, request: RuntimeExecutionRequest) -> RuntimeExecutionResult:
         logical_session_id = request.logical_session_id or request.execution_id

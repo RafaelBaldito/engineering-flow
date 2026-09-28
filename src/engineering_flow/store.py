@@ -401,6 +401,45 @@ class WorkflowStore:
             child_owner_instance_id TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
             UNIQUE(verification_attempt_id, ordinal), UNIQUE(verification_attempt_id, command_id)
         );
+        CREATE TABLE IF NOT EXISTS review_attempts (
+            id TEXT PRIMARY KEY, workflow_id TEXT NOT NULL REFERENCES workflows(id),
+            producer_operation_id TEXT NOT NULL REFERENCES operations(id),
+            verification_attempt_id TEXT NOT NULL REFERENCES verification_attempts(id),
+            execution_id TEXT NOT NULL UNIQUE REFERENCES executions(id),
+            operation_id TEXT NOT NULL UNIQUE REFERENCES operations(id),
+            feature_artifact_id TEXT NOT NULL REFERENCES artifacts(id), feature_sha256 TEXT NOT NULL,
+            plan_artifact_id TEXT NOT NULL REFERENCES artifacts(id), plan_sha256 TEXT NOT NULL,
+            plan_revision INTEGER NOT NULL, plan_id TEXT NOT NULL, approval_id TEXT NOT NULL REFERENCES approvals(id),
+            task_contract_id TEXT NOT NULL, task_contract_sha256 TEXT NOT NULL,
+            authority_sha256 TEXT NOT NULL, verification_evidence_sha256 TEXT NOT NULL,
+            repository_fingerprint TEXT NOT NULL, request_hash TEXT NOT NULL,
+            protected_control_sha256 TEXT,
+            reviewer_result_sha256 TEXT, summary TEXT, status TEXT NOT NULL, outcome TEXT,
+            abnormal_classification TEXT, abnormal_evidence_json TEXT,
+            sequence INTEGER NOT NULL, started_at TEXT NOT NULL, finished_at TEXT,
+            created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+            UNIQUE(workflow_id, verification_attempt_id, sequence)
+        );
+        CREATE TABLE IF NOT EXISTS review_findings (
+            id TEXT PRIMARY KEY, review_attempt_id TEXT NOT NULL REFERENCES review_attempts(id),
+            ordinal INTEGER NOT NULL CHECK(ordinal > 0), finding_id TEXT NOT NULL,
+            severity TEXT NOT NULL, category TEXT NOT NULL, description TEXT NOT NULL,
+            path TEXT, line INTEGER, requirement_reference TEXT,
+            created_at TEXT NOT NULL,
+            UNIQUE(review_attempt_id, ordinal), UNIQUE(review_attempt_id, finding_id)
+        );
+        CREATE TRIGGER IF NOT EXISTS review_findings_no_update
+        BEFORE UPDATE ON review_findings BEGIN
+            SELECT RAISE(ABORT, 'review findings are immutable');
+        END;
+        CREATE TRIGGER IF NOT EXISTS review_findings_no_delete
+        BEFORE DELETE ON review_findings BEGIN
+            SELECT RAISE(ABORT, 'review findings are immutable');
+        END;
+        CREATE TRIGGER IF NOT EXISTS review_attempts_terminal_no_update
+        BEFORE UPDATE ON review_attempts WHEN OLD.status='terminal' BEGIN
+            SELECT RAISE(ABORT, 'terminal review attempts are immutable');
+        END;
         CREATE TABLE IF NOT EXISTS operations (
             id TEXT PRIMARY KEY,
             idempotency_key TEXT NOT NULL UNIQUE,
@@ -571,6 +610,10 @@ class WorkflowStore:
         CREATE INDEX IF NOT EXISTS idx_plan_change_requests_workflow ON plan_change_requests(workflow_id, sequence);
         CREATE INDEX IF NOT EXISTS idx_task_implementation_states_plan
             ON task_implementation_states(workflow_id, plan_artifact_id, task_contract_id);
+        CREATE INDEX IF NOT EXISTS idx_review_attempts_workflow
+            ON review_attempts(workflow_id, verification_attempt_id, sequence);
+        CREATE INDEX IF NOT EXISTS idx_review_findings_attempt
+            ON review_findings(review_attempt_id, ordinal);
         CREATE INDEX IF NOT EXISTS idx_tasks_workflow_ordinal
             ON tasks(workflow_id, ordinal);
         CREATE INDEX IF NOT EXISTS idx_task_cycles_task
@@ -609,6 +652,15 @@ class WorkflowStore:
                     "PRAGMA table_info(verification_command_results)").fetchall()}
                 workspace_lease_columns = {row["name"] for row in self._connection.execute(
                     "PRAGMA table_info(workspace_operation_leases)").fetchall()}
+                review_attempt_columns = {row["name"] for row in self._connection.execute(
+                    "PRAGMA table_info(review_attempts)").fetchall()}
+                for name, statement in (
+                    ("protected_control_sha256", "ALTER TABLE review_attempts ADD COLUMN protected_control_sha256 TEXT"),
+                    ("abnormal_classification", "ALTER TABLE review_attempts ADD COLUMN abnormal_classification TEXT"),
+                    ("abnormal_evidence_json", "ALTER TABLE review_attempts ADD COLUMN abnormal_evidence_json TEXT"),
+                ):
+                    if name not in review_attempt_columns:
+                        self._connection.execute(statement)
                 if "approval_target_stage" not in governance_columns:
                     self._connection.execute("ALTER TABLE governance_decisions ADD COLUMN approval_target_stage TEXT")
                 for name, statement in (
@@ -669,7 +721,7 @@ class WorkflowStore:
                 task_state_sql = self._connection.execute(
                     "SELECT sql FROM sqlite_master WHERE type='table' AND name='task_implementation_states'"
                 ).fetchone()["sql"]
-                if "'verifying'" not in task_state_sql:
+                if "'review_failed'" not in task_state_sql:
                     self._connection.executescript("""
                         ALTER TABLE task_implementation_states RENAME TO task_implementation_states_legacy;
                         CREATE TABLE task_implementation_states (
@@ -679,7 +731,7 @@ class WorkflowStore:
                             plan_sha256 TEXT NOT NULL CHECK(length(plan_sha256) = 64),
                             task_contract_id TEXT NOT NULL,
                             task_contract_sha256 TEXT NOT NULL CHECK(length(task_contract_sha256) = 64),
-                            status TEXT NOT NULL CHECK(status IN ('pending', 'implementing', 'implementation_completed', 'implementation_failed', 'implementation_unknown', 'verifying', 'verification_failed', 'verified')),
+                            status TEXT NOT NULL CHECK(status IN ('pending', 'implementing', 'implementation_completed', 'implementation_failed', 'implementation_unknown', 'verifying', 'verification_failed', 'verified', 'reviewing', 'review_failed', 'human_attention', 'review_passed', 'changes_requested')),
                             selected_at TEXT,
                             updated_at TEXT NOT NULL,
                             UNIQUE(workflow_id, plan_artifact_id, task_contract_id)
@@ -1233,6 +1285,9 @@ class WorkflowStore:
                             WorkflowStatus.VERIFYING,
                             WorkflowStatus.VERIFICATION_FAILED,
                             WorkflowStatus.TASK_VERIFIED,
+                            WorkflowStatus.REVIEWING,
+                            WorkflowStatus.TASK_REVIEW_PASSED,
+                            WorkflowStatus.TASK_CHANGES_REQUESTED,
                         })
                         or (allow_human_attention and workflow.stage is Stage.TASK_EXECUTION
                             and workflow.status is WorkflowStatus.HUMAN_ATTENTION))):
@@ -1348,6 +1403,388 @@ class WorkflowStore:
             final_repository_sha256=digest, final_repository_fingerprint=fingerprint,
         )
 
+    def load_verified_review_evidence(self, workflow_id: str, task_contract_id: str,
+                                      task_contract_sha256: str, *,
+                                      allow_reviewing: bool = False) -> Mapping[str, Any]:
+        """Return one complete terminal VERIFY record usable only as REVIEW input.
+
+        This is a read-only projection.  It deliberately refuses to infer
+        authority from the ``TASK_VERIFIED`` display state alone.
+        """
+        authority = self.load_approved_v2_plan_authority(workflow_id)
+        permitted_statuses = {WorkflowStatus.TASK_VERIFIED}
+        if allow_reviewing:
+            permitted_statuses.add(WorkflowStatus.REVIEWING)
+        if (authority.workflow.stage is not Stage.TASK_EXECUTION
+                or authority.workflow.status not in permitted_statuses):
+            raise ValidationFailure("REVIEW requires TASK_VERIFIED workflow authority")
+        task = next((item for item in authority.plan.tasks if item.id == task_contract_id), None)
+        if task is None or task.payload_sha256() != task_contract_sha256:
+            raise ValidationFailure("REVIEW Task Contract does not match approved authority")
+        states = self._connection.execute("""SELECT * FROM task_implementation_states
+            WHERE workflow_id=? AND plan_artifact_id=? AND task_contract_id=?""",
+            (workflow_id, authority.plan_artifact.id, task_contract_id)).fetchall()
+        expected_task_status = "reviewing" if allow_reviewing else "verified"
+        if len(states) != 1 or states[0]["status"] != expected_task_status or states[0]["plan_sha256"] != authority.plan_artifact.sha256 or states[0]["task_contract_sha256"] != task_contract_sha256:
+            raise ValidationFailure("REVIEW task state is not exactly verified")
+        rows = self._connection.execute("""SELECT a.*, o.status AS operation_status, o.kind AS operation_kind,
+            o.related_record_id, e.lifecycle AS execution_lifecycle, e.role AS execution_role,
+            e.request_hash AS execution_request_hash FROM verification_attempts a
+            JOIN operations o ON o.id=a.operation_id JOIN executions e ON e.id=a.execution_id
+            WHERE a.workflow_id=? AND a.task_contract_id=? AND a.task_contract_sha256=?
+              AND a.status='terminal' AND a.classification='verified'""",
+            (workflow_id, task_contract_id, task_contract_sha256)).fetchall()
+        if len(rows) != 1:
+            raise ValidationFailure("REVIEW requires exactly one terminal verified attempt")
+        row = rows[0]
+        producer = self.load_successful_implementation_producer(workflow_id, row["producer_operation_id"], task_contract_id, task_contract_sha256)
+        expected_authority = hashlib.sha256(_json({"workflow_id": workflow_id,
+            "feature_artifact_id": authority.feature_contract_artifact.id, "feature_sha256": authority.feature_contract_artifact.sha256,
+            "plan_artifact_id": authority.plan_artifact.id, "plan_sha256": authority.plan_artifact.sha256,
+            "plan_id": authority.plan.id, "plan_revision": authority.plan.revision,
+            "approval_id": authority.approval.id, "task_contract_id": task_contract_id,
+            "task_contract_sha256": task_contract_sha256}).encode()).hexdigest()
+        if (row["operation_status"] != "completed" or row["operation_kind"] != "verification"
+                or row["related_record_id"] != row["execution_id"] or row["execution_lifecycle"] != "completed"
+                or row["execution_role"] != Role.DEVELOPER.value or row["execution_request_hash"] != row["request_hash"]
+                or row["authority_sha256"] != expected_authority
+                or (row["feature_artifact_id"], row["feature_sha256"], row["plan_artifact_id"], row["plan_sha256"], row["plan_revision"], row["plan_id"], row["approval_id"])
+                    != (authority.feature_contract_artifact.id, authority.feature_contract_artifact.sha256, authority.plan_artifact.id, authority.plan_artifact.sha256, authority.plan.revision, authority.plan.id, authority.approval.id)
+                or row["lease_id"] is None or self._connection.execute("SELECT 1 FROM workspace_operation_leases WHERE lease_id=?", (row["lease_id"],)).fetchone() is not None):
+            raise ValidationFailure("REVIEW verification authority is stale or inconsistent")
+        try:
+            binding, baseline, final = (json.loads(row["manifest_binding_json"]),
+                json.loads(row["baseline_repository_json"]), json.loads(row["final_inspection_json"]))
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise ValidationFailure("REVIEW verification evidence is incomplete") from exc
+        commands = self._normalize_verification_commands(binding)
+        if not isinstance(baseline, dict) or not isinstance(final, dict) or final != {key: value for key, value in baseline.items() if key != "control_state_fingerprint"}:
+            raise ValidationFailure("REVIEW verification final inspection is inconsistent")
+        command_rows = self._connection.execute("SELECT * FROM verification_command_results WHERE verification_attempt_id=? ORDER BY ordinal,id", (row["id"],)).fetchall()
+        if len(command_rows) != len(commands):
+            raise ValidationFailure("REVIEW verification command evidence is incomplete")
+        for ordinal, (command, result) in enumerate(zip(commands, command_rows), 1):
+            try: inspection = json.loads(result["post_command_inspection_json"])
+            except (TypeError, json.JSONDecodeError) as exc: raise ValidationFailure("REVIEW verification command evidence is corrupt") from exc
+            if (result["ordinal"] != ordinal or result["command_id"] != command["id"]
+                    or result["argv_json"] != _json(command["argv"]) or result["timeout_seconds"] != command["timeout_seconds"]
+                    or result["canonical_command_sha256"] != self._command_hash(command) or not result["intent_at"] or not result["result_at"]
+                    or result["classification"] != "passed" or result["exit_code"] != 0 or result["timed_out"] != 0 or result["output_truncated"] != 0
+                    or not isinstance(inspection, dict) or inspection.get("safe") is not True
+                    or inspection.get("repository") != final or inspection.get("control_state_fingerprint") != baseline.get("control_state_fingerprint")):
+                raise ValidationFailure("REVIEW verification command evidence is incomplete or mismatched")
+        digest = hashlib.sha256(_json({"attempt": {key: row[key] for key in ("id", "producer_operation_id", "authority_sha256", "request_hash")}, "binding": binding, "baseline": baseline, "final": final, "commands": [dict(item) for item in command_rows]}).encode()).hexdigest()
+        return {"attempt_id": row["id"], "producer_operation_id": row["producer_operation_id"],
+            "verification_request_hash": row["request_hash"], "verification_authority_sha256": row["authority_sha256"],
+            "verification_evidence_sha256": digest, "repository_fingerprint": final.get("fingerprint")}
+
+    def create_review_intent(self, workflow_id: str, *, task_contract_id: str,
+                             task_contract_sha256: str, authority_sha256: str,
+                             verification_evidence_sha256: str, request_hash: str,
+                             repository_fingerprint: str,
+                             protected_control_sha256: str | None = None) -> dict[str, str]:
+        """Atomically persist the REVIEW intent and its only legal entry transition.
+
+        This is a deliberately dispatch-free boundary.  Every supplied digest is
+        compared to V2's currently durable, terminal VERIFY evidence inside the
+        transaction, rather than trusting a caller's preflight object.
+        """
+        for value, name in ((authority_sha256, "authority_sha256"),
+                            (verification_evidence_sha256, "verification_evidence_sha256"),
+                            (request_hash, "request_hash"),
+                            (repository_fingerprint, "repository_fingerprint")):
+            self._require_sha256(value, name)
+        if protected_control_sha256 is not None:
+            self._require_sha256(protected_control_sha256, "protected_control_sha256")
+        with self._transaction() as conn:
+            authority = self.load_approved_v2_plan_authority(workflow_id)
+            if (authority.workflow.stage is not Stage.TASK_EXECUTION
+                    or authority.workflow.status is not WorkflowStatus.TASK_VERIFIED):
+                raise ConflictFailure("review intent requires TASK_VERIFIED")
+            evidence = self.load_verified_review_evidence(
+                workflow_id, task_contract_id, task_contract_sha256)
+            if (authority_sha256 != evidence["verification_authority_sha256"]
+                    or verification_evidence_sha256 != evidence["verification_evidence_sha256"]
+                    or repository_fingerprint != evidence["repository_fingerprint"]):
+                raise ConflictFailure("review intent authority or verified evidence is mismatched")
+            existing = conn.execute("""SELECT * FROM review_attempts WHERE workflow_id=?
+                AND verification_attempt_id=? AND request_hash=? ORDER BY sequence DESC LIMIT 1""",
+                (workflow_id, evidence["attempt_id"], request_hash)).fetchone()
+            if existing is not None:
+                if existing["status"] == "reviewing":
+                    return {"attempt_id": existing["id"], "execution_id": existing["execution_id"],
+                            "operation_id": existing["operation_id"], "created": False}
+                raise ConflictFailure("review attempt is already terminal")
+            if conn.execute("SELECT 1 FROM review_attempts WHERE workflow_id=? AND status='reviewing'",
+                            (workflow_id,)).fetchone() is not None:
+                raise ConflictFailure("workflow already has an active review attempt")
+            task = next((item for item in authority.plan.tasks if item.id == task_contract_id), None)
+            if task is None or task.payload_sha256() != task_contract_sha256:
+                raise ConflictFailure("review Task Contract no longer matches approved Plan")
+            now, attempt_id, execution_id, operation_id = (
+                _now(), str(uuid.uuid4()), str(uuid.uuid4()), str(uuid.uuid4()))
+            sequence = int(conn.execute("SELECT COALESCE(MAX(sequence), 0)+1 FROM review_attempts WHERE workflow_id=? AND verification_attempt_id=?",
+                (workflow_id, evidence["attempt_id"])).fetchone()[0])
+            session = self._create_session_unlocked(conn, workflow_id, "independent-review", Role.REVIEWER,
+                                                    work_kind=WorkKind.REVIEW)
+            conn.execute("""INSERT INTO executions
+                (id,workflow_id,session_id,role,request_hash,lifecycle,capability_report,work_kind,created_at,updated_at)
+                VALUES (?,?,?,?,?,'intent','{}',?,?,?)""",
+                (execution_id, workflow_id, session.id, Role.REVIEWER.value, request_hash,
+                 WorkKind.REVIEW.value, now, now))
+            conn.execute("""INSERT INTO operations
+                (id,idempotency_key,kind,workflow_id,status,related_record_id,work_kind,created_at,updated_at)
+                VALUES (?,?,?,?,?,?,?, ?,?)""",
+                (operation_id, f"review:{attempt_id}", "review", workflow_id, "pending", execution_id,
+                 WorkKind.REVIEW.value, now, now))
+            conn.execute("""INSERT INTO review_attempts
+                (id,workflow_id,producer_operation_id,verification_attempt_id,execution_id,operation_id,
+                 feature_artifact_id,feature_sha256,plan_artifact_id,plan_sha256,plan_revision,plan_id,approval_id,
+                 task_contract_id,task_contract_sha256,authority_sha256,verification_evidence_sha256,
+                 repository_fingerprint,request_hash,protected_control_sha256,status,sequence,started_at,created_at,updated_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'reviewing',?,?,?,?)""",
+                (attempt_id, workflow_id, evidence["producer_operation_id"], evidence["attempt_id"], execution_id,
+                 operation_id, authority.feature_contract_artifact.id, authority.feature_contract_artifact.sha256,
+                 authority.plan_artifact.id, authority.plan_artifact.sha256, authority.plan.revision, authority.plan.id,
+                 authority.approval.id, task_contract_id, task_contract_sha256, authority_sha256,
+                 verification_evidence_sha256, repository_fingerprint, request_hash, protected_control_sha256,
+                 sequence, now, now, now))
+            state = conn.execute("""UPDATE task_implementation_states SET status='reviewing',updated_at=?
+                WHERE workflow_id=? AND plan_artifact_id=? AND task_contract_id=? AND status='verified'""",
+                (now, workflow_id, authority.plan_artifact.id, task_contract_id))
+            if state.rowcount != 1:
+                raise ConflictFailure("review intent requires exactly verified task state")
+            conn.execute("UPDATE workflows SET stage=?,status=?,updated_at=? WHERE id=?",
+                (Stage.TASK_EXECUTION.value, WorkflowStatus.REVIEWING.value, now, workflow_id))
+            self._event_unlocked(conn, workflow_id, "review.attempt.created", stage=Stage.TASK_EXECUTION,
+                execution_id=execution_id, payload={"attempt_id": attempt_id,
+                    "verification_attempt_id": evidence["attempt_id"]})
+        return {"attempt_id": attempt_id, "execution_id": execution_id, "operation_id": operation_id,
+                "created": True}
+
+    def finish_review_attempt(self, attempt_id: str, *, reviewer_result: Mapping[str, Any] | str | bytes) -> None:
+        """Atomically persist immutable findings and the only normal REVIEW outcome."""
+        from .review import parse_reviewer_result
+        result = parse_reviewer_result(reviewer_result)
+        with self._transaction() as conn:
+            attempt = conn.execute("SELECT * FROM review_attempts WHERE id=?", (attempt_id,)).fetchone()
+            if attempt is None or attempt["status"] != "reviewing":
+                raise ConflictFailure("review completion requires an active review attempt")
+            workflow = conn.execute("SELECT * FROM workflows WHERE id=?", (attempt["workflow_id"],)).fetchone()
+            operation = conn.execute("SELECT * FROM operations WHERE id=?", (attempt["operation_id"],)).fetchone()
+            execution = conn.execute("SELECT * FROM executions WHERE id=?", (attempt["execution_id"],)).fetchone()
+            state = conn.execute("""SELECT * FROM task_implementation_states WHERE workflow_id=?
+                AND plan_artifact_id=? AND task_contract_id=?""", (attempt["workflow_id"],
+                attempt["plan_artifact_id"], attempt["task_contract_id"])).fetchone()
+            if (workflow is None or operation is None or execution is None or state is None
+                    or workflow["stage"] != Stage.TASK_EXECUTION.value
+                    or workflow["status"] != WorkflowStatus.REVIEWING.value
+                    or state["status"] != "reviewing" or operation["kind"] != "review"
+                    or operation["status"] != "pending" or operation["related_record_id"] != execution["id"]
+                    or execution["role"] != Role.REVIEWER.value or execution["lifecycle"] != "intent"
+                    or execution["request_hash"] != attempt["request_hash"]):
+                raise ConflictFailure("review completion durable operation authority is inconsistent")
+            evidence = self.load_verified_review_evidence(attempt["workflow_id"], attempt["task_contract_id"],
+                attempt["task_contract_sha256"], allow_reviewing=True)
+            if (evidence["attempt_id"] != attempt["verification_attempt_id"]
+                    or evidence["producer_operation_id"] != attempt["producer_operation_id"]
+                    or evidence["verification_authority_sha256"] != attempt["authority_sha256"]
+                    or evidence["verification_evidence_sha256"] != attempt["verification_evidence_sha256"]
+                    or evidence["repository_fingerprint"] != attempt["repository_fingerprint"]):
+                raise ConflictFailure("review completion authority or verified evidence is mismatched")
+            now = _now()
+            outcome = result.outcome
+            task_status = "review_passed" if outcome == "REVIEW_PASSED" else "changes_requested"
+            workflow_status = (WorkflowStatus.TASK_REVIEW_PASSED.value if outcome == "REVIEW_PASSED"
+                else WorkflowStatus.TASK_CHANGES_REQUESTED.value)
+            lifecycle = "completed"
+            conn.execute("""UPDATE review_attempts SET status='terminal',outcome=?,reviewer_result_sha256=?,
+                summary=?,finished_at=?,updated_at=? WHERE id=?""",
+                (outcome, result.sha256(), result.summary, now, now, attempt_id))
+            for ordinal, finding in enumerate(result.findings, 1):
+                conn.execute("""INSERT INTO review_findings
+                    (id,review_attempt_id,ordinal,finding_id,severity,category,description,path,line,requirement_reference,created_at)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                    (str(uuid.uuid4()), attempt_id, ordinal, finding.id, finding.severity, finding.category,
+                     finding.description, finding.path, finding.line, finding.requirement_reference, now))
+            conn.execute("UPDATE executions SET lifecycle=?,terminal_result=?,updated_at=? WHERE id=?",
+                (lifecycle, _json(result.canonical_payload()), now, execution["id"]))
+            conn.execute("UPDATE operations SET status='completed',updated_at=? WHERE id=?", (now, operation["id"]))
+            conn.execute("UPDATE task_implementation_states SET status=?,updated_at=? WHERE id=?",
+                (task_status, now, state["id"]))
+            conn.execute("UPDATE workflows SET stage=?,status=?,updated_at=? WHERE id=?",
+                (Stage.TASK_EXECUTION.value, workflow_status, now, workflow["id"]))
+            self._event_unlocked(conn, workflow["id"], "review.attempt.terminal", stage=Stage.TASK_EXECUTION,
+                execution_id=execution["id"], payload={"attempt_id": attempt_id, "outcome": outcome,
+                    "reviewer_result_sha256": result.sha256(), "finding_count": len(result.findings)})
+
+    def finish_review_abnormal_attempt(self, attempt_id: str, *, classification: str,
+                                       detail: str, evidence: Mapping[str, Any],
+                                       review_failed: bool) -> None:
+        """Atomically retain an abnormal REVIEW outcome without findings."""
+        allowed = {"provider_runtime_failure", "interrupted", "malformed_result",
+                   "protected_state_drift", "ambiguous_evidence"}
+        if classification not in allowed or not isinstance(detail, str) or not detail or not isinstance(evidence, Mapping):
+            raise ValidationFailure("review abnormal classification evidence is invalid")
+        if review_failed != (classification == "provider_runtime_failure"):
+            raise ValidationFailure("only known provider/runtime failures may project REVIEW_FAILED")
+        with self._transaction() as conn:
+            attempt = conn.execute("SELECT * FROM review_attempts WHERE id=?", (attempt_id,)).fetchone()
+            if attempt is None or attempt["status"] != "reviewing":
+                raise ConflictFailure("review abnormal completion requires an active review attempt")
+            workflow = conn.execute("SELECT * FROM workflows WHERE id=?", (attempt["workflow_id"],)).fetchone()
+            operation = conn.execute("SELECT * FROM operations WHERE id=?", (attempt["operation_id"],)).fetchone()
+            execution = conn.execute("SELECT * FROM executions WHERE id=?", (attempt["execution_id"],)).fetchone()
+            state = conn.execute("""SELECT * FROM task_implementation_states WHERE workflow_id=?
+                AND plan_artifact_id=? AND task_contract_id=?""", (attempt["workflow_id"],
+                attempt["plan_artifact_id"], attempt["task_contract_id"])).fetchone()
+            exact = (workflow is not None and operation is not None and execution is not None and state is not None
+                and workflow["stage"] == Stage.TASK_EXECUTION.value and workflow["status"] == WorkflowStatus.REVIEWING.value
+                and state["status"] == "reviewing" and operation["kind"] == "review"
+                and operation["status"] == "pending" and operation["related_record_id"] == execution["id"]
+                and execution["role"] == Role.REVIEWER.value and execution["lifecycle"] == "intent"
+                and execution["request_hash"] == attempt["request_hash"])
+            if not exact:
+                if workflow is None:
+                    raise ConflictFailure("review abnormal workflow is missing")
+                now = _now()
+                conn.execute("UPDATE workflows SET stage=?,status=?,updated_at=? WHERE id=?",
+                    (Stage.TASK_EXECUTION.value, WorkflowStatus.HUMAN_ATTENTION.value, now, attempt["workflow_id"]))
+                self._event_unlocked(conn, attempt["workflow_id"], "review.attempt.unsafe",
+                    stage=Stage.TASK_EXECUTION, execution_id=attempt["execution_id"],
+                    payload={"attempt_id": attempt_id, "classification": "ambiguous_evidence",
+                             "reason": "review durable ownership is inconsistent", "evidence": dict(evidence)})
+                return
+            now = _now()
+            outcome = "REVIEW_FAILED" if review_failed else "HUMAN_ATTENTION"
+            workflow_status = WorkflowStatus.REVIEW_FAILED.value if review_failed else WorkflowStatus.HUMAN_ATTENTION.value
+            task_status = "review_failed" if review_failed else "human_attention"
+            lifecycle = "failed" if review_failed else "unknown"
+            operation_status = "failed" if review_failed else "unknown"
+            conn.execute("""UPDATE review_attempts SET status='terminal',outcome=?,abnormal_classification=?,
+                abnormal_evidence_json=?,finished_at=?,updated_at=? WHERE id=?""",
+                (outcome, classification, _json(dict(evidence)), now, now, attempt_id))
+            conn.execute("""UPDATE executions SET lifecycle=?,terminal_result=?,failure_classification=?,
+                failure_detail=?,updated_at=? WHERE id=?""",
+                (lifecycle, _json({"classification": classification}),
+                 FailureClassification.PROVIDER.value if review_failed else None, detail, now, execution["id"]))
+            conn.execute("UPDATE operations SET status=?,updated_at=? WHERE id=?", (operation_status, now, operation["id"]))
+            conn.execute("UPDATE task_implementation_states SET status=?,updated_at=? WHERE id=?", (task_status, now, state["id"]))
+            conn.execute("UPDATE workflows SET stage=?,status=?,updated_at=? WHERE id=?",
+                (Stage.TASK_EXECUTION.value, workflow_status, now, workflow["id"]))
+            self._event_unlocked(conn, workflow["id"], "review.attempt.abnormal",
+                stage=Stage.TASK_EXECUTION, execution_id=execution["id"],
+                payload={"attempt_id": attempt_id, "outcome": outcome, "classification": classification,
+                         "reason": detail, "evidence": dict(evidence), "finding_count": 0})
+
+    def recover_review_attempt(self, attempt_id: str, *, classification: str, detail: str,
+                               evidence: Mapping[str, Any], reviewer_result: Mapping[str, Any] | None = None,
+                               review_failed: bool = False) -> str:
+        """Reconcile one retained REVIEW intent without invoking a runtime.
+
+        Recovery is deliberately a one-way projection.  It never creates an
+        attempt, and a terminal row is already the idempotent receipt for an
+        identical later observation.
+        """
+        from .review import parse_reviewer_result
+        allowed = {"provider_runtime_failure", "interrupted", "malformed_result",
+                   "protected_state_drift", "ambiguous_evidence"}
+        if classification not in allowed or not detail or not isinstance(evidence, Mapping):
+            raise ValidationFailure("review recovery evidence is invalid")
+        if review_failed != (classification == "provider_runtime_failure"):
+            raise ValidationFailure("review recovery failure classification is invalid")
+        result = parse_reviewer_result(reviewer_result) if reviewer_result is not None else None
+        with self._transaction() as conn:
+            attempt = conn.execute("SELECT * FROM review_attempts WHERE id=?", (attempt_id,)).fetchone()
+            if attempt is None:
+                raise ConflictFailure("review recovery attempt is missing")
+            if attempt["status"] == "terminal":
+                return "already_terminal"
+            if attempt["status"] != "reviewing":
+                raise ConflictFailure("review recovery attempt is not retained")
+            workflow = conn.execute("SELECT * FROM workflows WHERE id=?", (attempt["workflow_id"],)).fetchone()
+            operation = conn.execute("SELECT * FROM operations WHERE id=?", (attempt["operation_id"],)).fetchone()
+            execution = conn.execute("SELECT * FROM executions WHERE id=?", (attempt["execution_id"],)).fetchone()
+            state = conn.execute("""SELECT * FROM task_implementation_states WHERE workflow_id=?
+                AND plan_artifact_id=? AND task_contract_id=?""", (attempt["workflow_id"],
+                attempt["plan_artifact_id"], attempt["task_contract_id"])).fetchone()
+            exact = (workflow is not None and operation is not None and execution is not None and state is not None
+                and workflow["stage"] == Stage.TASK_EXECUTION.value and workflow["status"] == WorkflowStatus.REVIEWING.value
+                and state["status"] == "reviewing" and operation["kind"] == "review"
+                and operation["related_record_id"] == execution["id"]
+                and execution["role"] == Role.REVIEWER.value and execution["request_hash"] == attempt["request_hash"])
+            if not exact:
+                classification, detail, review_failed, result = ("ambiguous_evidence",
+                    "review recovery durable ownership is inconsistent", False, None)
+            if result is not None and (not exact or operation["status"] not in {"pending", "completed"}
+                    or execution["lifecycle"] not in {"intent", "completed"}):
+                classification, detail, review_failed, result = ("ambiguous_evidence",
+                    "review recovery terminal result ownership is inconsistent", False, None)
+            if result is not None:
+                try:
+                    verified = self.load_verified_review_evidence(attempt["workflow_id"], attempt["task_contract_id"],
+                        attempt["task_contract_sha256"], allow_reviewing=True)
+                    authority_ok = (verified["attempt_id"] == attempt["verification_attempt_id"]
+                        and verified["producer_operation_id"] == attempt["producer_operation_id"]
+                        and verified["verification_authority_sha256"] == attempt["authority_sha256"]
+                        and verified["verification_evidence_sha256"] == attempt["verification_evidence_sha256"]
+                        and verified["repository_fingerprint"] == attempt["repository_fingerprint"])
+                except DomainFailure:
+                    authority_ok = False
+                if not authority_ok:
+                    classification, detail, review_failed, result = ("ambiguous_evidence",
+                        "review recovery authority evidence is stale or inconsistent", False, None)
+            now = _now()
+            if result is not None:
+                outcome = result.outcome
+                conn.execute("""UPDATE review_attempts SET status='terminal',outcome=?,reviewer_result_sha256=?,
+                    summary=?,finished_at=?,updated_at=? WHERE id=?""",
+                    (outcome, result.sha256(), result.summary, now, now, attempt_id))
+                for ordinal, finding in enumerate(result.findings, 1):
+                    conn.execute("""INSERT INTO review_findings
+                        (id,review_attempt_id,ordinal,finding_id,severity,category,description,path,line,requirement_reference,created_at)
+                        VALUES (?,?,?,?,?,?,?,?,?,?,?)""", (str(uuid.uuid4()), attempt_id, ordinal, finding.id,
+                        finding.severity, finding.category, finding.description, finding.path, finding.line,
+                        finding.requirement_reference, now))
+                conn.execute("UPDATE executions SET lifecycle='completed',terminal_result=?,updated_at=? WHERE id=?",
+                    (_json(result.canonical_payload()), now, execution["id"]))
+                conn.execute("UPDATE operations SET status='completed',updated_at=? WHERE id=?", (now, operation["id"]))
+                task_status = "review_passed" if outcome == "REVIEW_PASSED" else "changes_requested"
+                workflow_status = (WorkflowStatus.TASK_REVIEW_PASSED.value if outcome == "REVIEW_PASSED"
+                    else WorkflowStatus.TASK_CHANGES_REQUESTED.value)
+                conn.execute("UPDATE task_implementation_states SET status=?,updated_at=? WHERE id=?", (task_status, now, state["id"]))
+                conn.execute("UPDATE workflows SET stage=?,status=?,updated_at=? WHERE id=?",
+                    (Stage.TASK_EXECUTION.value, workflow_status, now, workflow["id"]))
+                self._event_unlocked(conn, workflow["id"], "review.attempt.terminal", stage=Stage.TASK_EXECUTION,
+                    execution_id=execution["id"], payload={"attempt_id": attempt_id, "outcome": outcome,
+                        "reviewer_result_sha256": result.sha256(), "finding_count": len(result.findings), "recovery": True})
+                return "terminal_result"
+            outcome = "REVIEW_FAILED" if review_failed else "HUMAN_ATTENTION"
+            workflow_status = WorkflowStatus.REVIEW_FAILED.value if review_failed else WorkflowStatus.HUMAN_ATTENTION.value
+            task_status = "review_failed" if review_failed else "human_attention"
+            lifecycle, operation_status = ("failed", "failed") if review_failed else ("unknown", "unknown")
+            # Historical malformed evidence is wrapped verbatim.  Do not let a
+            # failed parse erase valid history used by later forensic review.
+            prior = attempt["abnormal_evidence_json"]
+            envelope: dict[str, Any] = {"recovery": dict(evidence)}
+            if prior is not None:
+                envelope["historical_evidence_raw"] = prior
+            conn.execute("""UPDATE review_attempts SET status='terminal',outcome=?,abnormal_classification=?,
+                abnormal_evidence_json=?,finished_at=?,updated_at=? WHERE id=?""",
+                (outcome, classification, _json(envelope), now, now, attempt_id))
+            conn.execute("""UPDATE executions SET lifecycle=?,terminal_result=?,failure_classification=?,
+                failure_detail=?,updated_at=? WHERE id=?""", (lifecycle, _json({"classification": classification}),
+                FailureClassification.PROVIDER.value if review_failed else None, detail, now, execution["id"]))
+            conn.execute("UPDATE operations SET status=?,updated_at=? WHERE id=?", (operation_status, now, operation["id"]))
+            conn.execute("UPDATE task_implementation_states SET status=?,updated_at=? WHERE id=?", (task_status, now, state["id"]))
+            conn.execute("UPDATE workflows SET stage=?,status=?,updated_at=? WHERE id=?",
+                (Stage.TASK_EXECUTION.value, workflow_status, now, workflow["id"]))
+            self._event_unlocked(conn, workflow["id"], "review.attempt.abnormal", stage=Stage.TASK_EXECUTION,
+                execution_id=execution["id"], payload={"attempt_id": attempt_id, "outcome": outcome,
+                    "classification": classification, "reason": detail, "evidence": envelope,
+                    "finding_count": 0, "recovery": True})
+            return classification
+
     def list_task_implementation_states(
         self, workflow_id: str, plan_artifact_id: str
     ) -> list[TaskImplementationState]:
@@ -1357,6 +1794,36 @@ class WorkflowStore:
             (workflow_id, plan_artifact_id),
         ).fetchall()
         return [self._task_implementation_state_from_row(row) for row in rows]
+
+    def list_review_attempt_projections(self, workflow_id: str, *, limit: int = 20,
+                                        findings_limit: int = 100) -> list[dict[str, Any]]:
+        """Return a bounded, transcript-free REVIEW evidence projection."""
+        if limit < 1 or findings_limit < 1:
+            raise ValidationFailure("review projection limits must be positive")
+        attempts = self._connection.execute("""SELECT id,sequence,task_contract_id,status,outcome,
+            summary,abnormal_classification,reviewer_result_sha256,started_at,finished_at
+            FROM review_attempts WHERE workflow_id=? ORDER BY sequence DESC LIMIT ?""",
+            (workflow_id, limit)).fetchall()
+        projected: list[dict[str, Any]] = []
+        for attempt in attempts:
+            findings = self._connection.execute("""SELECT ordinal,finding_id,severity,category,description,
+                path,line,requirement_reference FROM review_findings WHERE review_attempt_id=?
+                ORDER BY ordinal LIMIT ?""", (attempt["id"], findings_limit)).fetchall()
+            projected.append({
+                "id": attempt["id"], "sequence": attempt["sequence"],
+                "task_contract_id": attempt["task_contract_id"], "status": attempt["status"],
+                "outcome": attempt["outcome"], "summary": attempt["summary"],
+                "classification": attempt["abnormal_classification"],
+                "result_sha256": attempt["reviewer_result_sha256"], "started_at": attempt["started_at"],
+                "finished_at": attempt["finished_at"], "findings": [dict(item) for item in findings],
+                "findings_truncated": len(findings) == findings_limit,
+            })
+        return projected
+
+    def has_retained_review_attempt(self, workflow_id: str) -> bool:
+        """Whether recovery, rather than a new REVIEW dispatch, owns this workflow."""
+        return self._connection.execute("SELECT 1 FROM review_attempts WHERE workflow_id=? AND status!='terminal'",
+            (workflow_id,)).fetchone() is not None
 
     def retry_safe_failed_task_ids(self, workflow_id: str, plan_artifact_id: str) -> frozenset[str]:
         rows = self._connection.execute("""SELECT a.task_contract_id FROM implementation_attempts a

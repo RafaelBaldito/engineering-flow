@@ -36,6 +36,7 @@ from .domain import (
 from .orchestrator import (CodexImplementationWriter, ImplementationAttemptOrchestrator,
                            IntakeOrchestrator, PlanningOrchestrator, V2HappyPathCoordinator,
                            V2PlanOrchestrator)
+from .review import ReviewContinuationService
 from .presentation import (OutputMode, create_progress_renderer, interactive_prompt_eligible,
                            prompt_for_clarification, prompt_for_plan_decision,
                            prompt_for_implementation_start,
@@ -227,6 +228,8 @@ def _plan_payload(store: WorkflowStore, workflow: Workflow, *, projection: Any =
     verification_by_task = {
         attempt["task_contract_id"]: attempt for attempt in verification_attempts
     }
+    review_attempts = store.list_review_attempt_projections(workflow.id)
+    review_by_task = {attempt["task_contract_id"]: attempt for attempt in review_attempts}
     raw_plan = plan.get("plan") if isinstance(plan, dict) else None
     raw_tasks = raw_plan.get("tasks") if isinstance(raw_plan, dict) else None
     if isinstance(raw_tasks, list):
@@ -237,6 +240,9 @@ def _plan_payload(store: WorkflowStore, workflow: Workflow, *, projection: Any =
                 task["verification_status"] = ("not_run" if verification is None
                     else verification["classification"] or verification["recovery_classification"]
                     or verification["status"])
+                review = review_by_task.get(task["id"])
+                task["review_status"] = ("not_run" if review is None
+                    else review["outcome"] or review["classification"] or review["status"])
     attempts = store.list_implementation_attempts(workflow.id)
     latest_attempt = attempts[-1] if attempts else None
     if latest_attempt and isinstance(latest_attempt.get("changed_paths_json"), str):
@@ -287,6 +293,10 @@ def _plan_payload(store: WorkflowStore, workflow: Workflow, *, projection: Any =
                               "attempt_count": len(verification_attempts),
                               "latest_attempt": (verification_attempts[-1]
                                   if verification_attempts else None),
+                          },
+                          "review": {
+                              "attempt_count": len(review_attempts),
+                              "latest_attempt": review_attempts[0] if review_attempts else None,
                           },
                       },
                       **projection_data, **plan}}
@@ -361,6 +371,13 @@ def _recovery_event_payload(event_type: str, payload: dict[str, Any]) -> dict[st
     evidence never cross it.  Non-recovery events retain their existing
     presentation unchanged.
     """
+    if event_type.startswith("review.attempt."):
+        # REVIEW event evidence may retain forensic repository details.  Logs
+        # expose its durable outcome only; the bounded review projection above
+        # supplies the safe summary and ordered findings.
+        safe = {key: payload[key] for key in ("attempt_id", "outcome", "classification", "finding_count", "recovery")
+                if key in payload}
+        return safe
     recovery_types = {
         "verification.recovery.ambiguous_context": ("state_inconsistent", True),
         "verification.recovery.inconsistent_lease": ("state_inconsistent", True),
@@ -425,7 +442,7 @@ def _failure_for_workflow(store: WorkflowStore, workflow: Workflow) -> tuple[str
         if latest and latest.failure_classification is FailureClassification.AUTHENTICATION:
             return ERROR_CODES[FailureClassification.AUTHENTICATION.value], EXIT_AUTHENTICATION
         return ERROR_CODES["human_attention"], EXIT_HUMAN_ATTENTION
-    if workflow.status is WorkflowStatus.IMPLEMENTATION_FAILED:
+    if workflow.status in {WorkflowStatus.IMPLEMENTATION_FAILED, WorkflowStatus.REVIEW_FAILED}:
         return ERROR_CODES[FailureClassification.AGENT_EXECUTION.value], EXIT_PROVIDER
     if workflow.status is not WorkflowStatus.FAILED:
         return None, EXIT_SUCCESS
@@ -506,6 +523,12 @@ def _continue_approved_implementation(
 
     writer = CodexImplementationWriter(runtime=runtime, config=config, progress_sink=progress_sink)
     ImplementationAttemptOrchestrator(store, writer, progress_sink=progress_sink).run_once(workflow_id)
+    return store.get_workflow(workflow_id)
+
+
+def _continue_review(workflow_id: str, *, store: WorkflowStore, runtime: Any) -> Workflow:
+    """Invoke one review-layer continuation; CLI owns neither selection nor recovery."""
+    ReviewContinuationService(store, runtime).continue_once(workflow_id)
     return store.get_workflow(workflow_id)
 
 
@@ -850,6 +873,9 @@ def _run_command(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
                         existing.id, store=store, config=config,
                         runtime=plan_orchestrator.runtime, progress_sink=progress_sink,
                     )
+                elif (existing.status in {WorkflowStatus.TASK_VERIFIED, WorkflowStatus.REVIEWING}
+                      or store.has_retained_review_attempt(existing.id)):
+                    workflow = _continue_review(existing.id, store=store, runtime=plan_orchestrator.runtime)
                 else:
                     workflow = plan_orchestrator.resume(existing.id, progress_sink=(None if args.json_output else create_progress_renderer(sys.stderr, no_color=args.no_color)))
             else:

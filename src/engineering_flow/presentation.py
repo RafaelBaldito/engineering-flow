@@ -163,6 +163,8 @@ def render_plan_summary(console: Console, document: Mapping[str, Any], plan: Map
                     console.print(Text(f"      implementation: {task['implementation_status']}"))
                 if task.get("verification_status"):
                     console.print(Text(f"      verification: {str(task['verification_status']).upper()}"))
+                if task.get("review_status"):
+                    console.print(Text(f"      review: {str(task['review_status']).upper()}"))
 
     status = document.get("status")
     console.print()
@@ -234,6 +236,45 @@ def render_implementation_summary(console: Console, document: Mapping[str, Any],
         console.print(Text(str(latest.get("error_detail") or "Inspect the workspace and persisted attempt evidence before resuming."), style="yellow"))
 
 
+def render_review_summary(console: Console, document: Mapping[str, Any], plan: Mapping[str, Any]) -> None:
+    implementation = plan.get("implementation")
+    review = implementation.get("review") if isinstance(implementation, Mapping) else None
+    latest = review.get("latest_attempt") if isinstance(review, Mapping) else None
+    if not isinstance(latest, Mapping):
+        return
+    console.print()
+    _heading(console, "REVIEW")
+    outcome = latest.get("outcome") or latest.get("classification") or latest.get("status") or "unknown"
+    _rows(console, [("Task", latest.get("task_contract_id", "unknown"), None),
+                    ("Attempt", latest.get("id", "unknown"), None),
+                    ("Result", str(outcome).upper(), _semantic_style(document.get("status")))])
+    if latest.get("summary"):
+        console.print(Text(str(latest["summary"])))
+    findings = latest.get("findings")
+    if isinstance(findings, list) and findings:
+        _heading(console, "Findings")
+        for finding in findings:
+            if isinstance(finding, Mapping):
+                location = finding.get("path") or "repository"
+                if finding.get("line"):
+                    location += f":{finding['line']}"
+                console.print(Text(f"{finding.get('ordinal', '?')}. [{finding.get('severity', 'unknown')}] "
+                                   f"{finding.get('id', finding.get('finding_id', '?'))} — "
+                                   f"{finding.get('description', '')} ({location})"))
+    status = document.get("status")
+    if status == "reviewing":
+        console.print(Text("REVIEWING: no additional Reviewer was started while this attempt remains unresolved.", style="yellow"))
+    elif status == "task_review_passed":
+        console.print(Text("REVIEW_PASSED: this is not task acceptance or dependency release.", style="green"))
+    elif status == "task_changes_requested":
+        console.print(Text("CHANGES_REQUESTED: no FIX or finding disposition was started.", style="yellow"))
+    elif status == "review_failed":
+        console.print(Text("REVIEW_FAILED: no retry, FIX, or successor selection was started.", style="red"))
+    elif status == "human_attention":
+        console.print(Text("HUMAN_ATTENTION: recovery performed no Reviewer dispatch.", style="bold red"))
+    console.print(Text("MDS #5 performs no FIX, acceptance, dependency release, successor selection, final review, commit, push, or PR.", style="dim"))
+
+
 def _render_legacy_summary(console: Console, document: Mapping[str, Any]) -> None:
     artifacts = document.get("artifacts")
     tasks = document.get("tasks")
@@ -279,6 +320,7 @@ def render_human(console: Console, document: Mapping[str, Any]) -> None:
     if isinstance(plan, Mapping):
         render_plan_summary(console, document, plan)
         render_implementation_summary(console, document, plan)
+        render_review_summary(console, document, plan)
     elif not isinstance(intake, Mapping):
         _render_legacy_summary(console, document)
 

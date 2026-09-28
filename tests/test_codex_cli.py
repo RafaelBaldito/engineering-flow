@@ -451,8 +451,9 @@ class CodexCliTests(unittest.TestCase):
         def reviewer_popen(argv, **kwargs):
             calls.append((argv, kwargs))
             self.output.parent.mkdir(parents=True, exist_ok=True)
-            self.output.write_text(json.dumps({"outcome": "PASS", "summary": "looks good", "findings": [{
-                "id": "F-1", "severity": "non_blocking", "description": "observation",
+            self.output.write_text(json.dumps({"outcome": "REVIEW_PASSED", "summary": "looks good", "findings": [{
+                "id": "F-1", "severity": "advisory", "category": "maintainability", "description": "observation",
+                "path": None, "line": None, "requirement_reference": None,
             }]}), encoding="utf-8")
             return FakeProcess('{"type":"turn.completed","id":"review-turn"}\n')
 
@@ -462,7 +463,7 @@ class CodexCliTests(unittest.TestCase):
         self.assertEqual(calls[0][0][4], "read-only")
         self.assertFalse(calls[0][1]["shell"])
 
-    def test_reviewer_rejects_fix_required_mixed_with_non_blocking_findings(self):
+    def test_reviewer_rejects_changes_requested_without_blocking_findings(self):
         request = self.task_request(
             Role.REVIEWER, WorkKind.REVIEW, developer_logical_session_id="developer-session",
         )
@@ -470,9 +471,9 @@ class CodexCliTests(unittest.TestCase):
         def reviewer_popen(argv, **kwargs):
             self.output.parent.mkdir(parents=True, exist_ok=True)
             self.output.write_text(json.dumps({
-                "outcome": "FIX_REQUIRED", "summary": "needs work", "findings": [
-                    {"id": "F-1", "severity": "blocking", "description": "defect"},
-                    {"id": "F-2", "severity": "non_blocking", "description": "note"},
+                "outcome": "CHANGES_REQUESTED", "summary": "needs work", "findings": [
+                    {"id": "F-1", "severity": "advisory", "category": "correctness", "description": "defect", "path": None, "line": None, "requirement_reference": None},
+                    {"id": "F-2", "severity": "advisory", "category": "maintainability", "description": "note", "path": None, "line": None, "requirement_reference": None},
                 ],
             }), encoding="utf-8")
             return FakeProcess('{"type":"turn.completed","id":"review-turn"}\n')
@@ -480,7 +481,7 @@ class CodexCliTests(unittest.TestCase):
         result = self.runtime(popen_factory=reviewer_popen).execute(request)
 
         self.assertEqual(result.failure_classification, FailureClassification.AGENT_EXECUTION)
-        self.assertIn("only blocking findings", result.failure_detail)
+        self.assertIn("findings do not match", result.failure_detail)
 
     def test_reviewer_nullable_locations_meet_strict_schema_and_are_normalized(self):
         request = self.task_request(
@@ -490,9 +491,10 @@ class CodexCliTests(unittest.TestCase):
         def reviewer_popen(argv, **kwargs):
             self.output.parent.mkdir(parents=True, exist_ok=True)
             self.output.write_text(json.dumps({
-                "outcome": "FIX_REQUIRED", "summary": "needs correction", "findings": [{
-                    "id": "F-1", "severity": "blocking", "description": "defect",
-                    "path": None, "line": None,
+                "outcome": "CHANGES_REQUESTED", "summary": "needs correction", "findings": [{
+                    "id": "F-1", "severity": "blocking", "category": "correctness",
+                    "description": "defect", "path": None, "line": None,
+                    "requirement_reference": None,
                 }],
             }), encoding="utf-8")
             return FakeProcess('{"type":"turn.completed","id":"review-turn"}\n')
@@ -501,9 +503,10 @@ class CodexCliTests(unittest.TestCase):
 
         self.assertTrue(result.success)
         self.assertEqual(REVIEWER_OUTPUT_SCHEMA["properties"]["findings"]["items"]["required"],
-                         ["id", "severity", "description", "path", "line"])
+                         ["id", "severity", "category", "description", "path", "line", "requirement_reference"])
         self.assertEqual(result.final_payload["findings"], [{
-            "id": "F-1", "severity": "blocking", "description": "defect",
+            "id": "F-1", "severity": "blocking", "category": "correctness",
+            "description": "defect", "path": None, "line": None, "requirement_reference": None,
         }])
 
     def test_developer_continuity_falls_back_when_resume_is_not_advertised(self):
