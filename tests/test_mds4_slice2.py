@@ -10,6 +10,7 @@ from pathlib import Path
 from engineering_flow.domain import ApprovalDecision, ApprovalState, LifecycleVersion, Stage, WorkflowStatus
 from engineering_flow.repository import RepositoryInspector
 from engineering_flow.store import ConflictFailure, ValidationFailure, WorkflowStore
+from engineering_flow.verification import authority_binding_sha256
 
 
 def git(root, *args):
@@ -46,8 +47,19 @@ class Mds4Slice2PersistenceTests(unittest.TestCase):
 
     def verification_intent(self):
         workflow, contract, producer, key = self.producer()
-        kwargs = dict(repository_key=key, canonical_root=str(self.root), producer_operation_id=producer["operation_id"], task_contract_id=contract.id, task_contract_sha256=contract.payload_sha256(), authority_sha256="a" * 64, request_hash="b" * 64, manifest_binding={"path":"manifest"}, baseline={"fingerprint":"baseline"}, owner_instance_id="verify-owner", owner_pid=os.getpid(), owner_host_id="host")
+        authority = self.store.load_approved_v2_plan_authority(workflow.id)
+        authority_sha256 = authority_binding_sha256(authority,
+            task_contract_id=contract.id, task_contract_sha256=contract.payload_sha256())
+        producer_evidence = self.store.load_successful_implementation_producer(workflow.id,
+            producer["operation_id"], contract.id, contract.payload_sha256())
+        kwargs = dict(repository_key=key, canonical_root=str(self.root), producer_operation_id=producer["operation_id"], task_contract_id=contract.id, task_contract_sha256=contract.payload_sha256(), authority_sha256=authority_sha256, request_hash="b" * 64, manifest_binding={"path":"manifest"}, baseline=dict(producer_evidence.final_repository), owner_instance_id="verify-owner", owner_pid=os.getpid(), owner_host_id="host", owner_boot_id="boot")
         return workflow, contract, key, kwargs, self.store.create_verification_intent(workflow.id, **kwargs)
+
+    def start_verification_command(self, intent, command):
+        self.store.record_verification_command_started(intent["attempt_id"], intent["lease_id"],
+            command, owner_instance_id="verify-owner", child_pid=4242,
+            child_process_start="start", child_process_group=4242,
+            child_process_session=4242, child_host_id="host", child_boot_id="boot")
 
     def test_verification_intent_atomically_binds_producer_operation_and_common_lease(self):
         workflow, contract, key, kwargs, intent = self.verification_intent()
@@ -63,6 +75,7 @@ class Mds4Slice2PersistenceTests(unittest.TestCase):
         command = self.store.record_verification_command_intent(intent["attempt_id"], intent["lease_id"], owner_instance_id="verify-owner", ordinal=1, command_id="unit", canonical_command_sha256="c" * 64, argv=["python", "-m", "unittest"], timeout_seconds=30)
         with self.assertRaises(ConflictFailure):
             self.store.record_verification_command_intent(intent["attempt_id"], intent["lease_id"], owner_instance_id="verify-owner", ordinal=1, command_id="other", canonical_command_sha256="d" * 64, argv=["false"], timeout_seconds=1)
+        self.start_verification_command(intent, command)
         self.store.record_verification_command_result(intent["attempt_id"], intent["lease_id"], command, owner_instance_id="verify-owner", exit_code=0, timed_out=False, output_sha256=None, output_bytes=0, output_truncated=False, post_command_inspection={"fingerprint":"same"}, classification="passed")
         with self.assertRaises(ConflictFailure):
             self.store.finish_verification_attempt(intent["attempt_id"], intent["lease_id"], owner_instance_id="wrong", outcome="verified", final_inspection={})
@@ -79,14 +92,32 @@ class Mds4Slice2PersistenceTests(unittest.TestCase):
             self.store.create_implementation_intent(workflow.id, repository_key=key, canonical_root=str(self.root), task_contract_id=contract.id, task_contract_sha256=contract.payload_sha256(), request_hash="n" * 64, baseline=RepositoryInspector(self.root).capture().as_payload(), owner_instance_id=str(uuid.uuid4()), owner_pid=os.getpid(), owner_host_id="host")
         self.store.finish_verification_attempt(intent["attempt_id"], intent["lease_id"], owner_instance_id="verify-owner", outcome="verification_blocked", final_inspection={})
 
-    def test_interrupted_unchanged_creates_one_fresh_attempt_with_same_binding(self):
+    def test_unknown_terminal_boundary_retains_exact_verification_lease(self):
+        workflow, contract, key, kwargs, intent = self.verification_intent()
+        self.store.finish_verification_attempt(intent["attempt_id"], intent["lease_id"],
+            owner_instance_id="verify-owner", outcome="verification_unknown",
+            final_inspection={"repository": {"fingerprint": "unsafe"}},
+            detail="generic safety ambiguity")
+        lease = self.store.active_workspace_operation_lease(key)
+        self.assertIsNotNone(lease)
+        self.assertEqual((lease["lease_id"], lease["attempt_id"], lease["owner_instance_id"]),
+            (intent["lease_id"], intent["attempt_id"], "verify-owner"))
+        attempt = self.store._connection.execute(
+            "SELECT status,classification FROM verification_attempts WHERE id=?",
+            (intent["attempt_id"],)).fetchone()
+        self.assertEqual(tuple(attempt), ("unknown", "verification_unknown"))
+        self.assertEqual(self.store.get_workflow(workflow.id).status,
+            WorkflowStatus.HUMAN_ATTENTION)
+
+    def test_normal_terminal_api_rejects_interrupted_unchanged_and_retains_lease(self):
         workflow, contract, key, kwargs, first = self.verification_intent()
-        self.store.finish_verification_attempt(first["attempt_id"], first["lease_id"], owner_instance_id="verify-owner", outcome="interrupted_unchanged", final_inspection={})
-        second = self.store.create_verification_intent(workflow.id, **kwargs)
-        self.assertNotEqual(first["attempt_id"], second["attempt_id"])
-        self.assertEqual(self.store.create_verification_intent(workflow.id, **kwargs), second)
-        rows = self.store._connection.execute("SELECT request_hash,authority_sha256,sequence FROM verification_attempts ORDER BY sequence").fetchall()
-        self.assertEqual([(row["request_hash"], row["authority_sha256"], row["sequence"]) for row in rows], [("b" * 64, "a" * 64, 1), ("b" * 64, "a" * 64, 2)])
+        with self.assertRaises(ValidationFailure):
+            self.store.finish_verification_attempt(first["attempt_id"], first["lease_id"],
+                owner_instance_id="verify-owner", outcome="interrupted_unchanged",
+                final_inspection={})
+        self.assertEqual(self.store.active_workspace_operation_lease(key)["lease_id"],
+            first["lease_id"])
+        self.assertEqual(self.store.create_verification_intent(workflow.id, **kwargs), first)
 
     def test_active_verification_duplicate_is_not_created(self):
         workflow, contract, key, kwargs, first = self.verification_intent()
@@ -115,6 +146,7 @@ class Mds4Slice2PersistenceTests(unittest.TestCase):
             self.store.record_verification_command_result(intent["attempt_id"], intent["lease_id"], first, owner_instance_id="verify-owner", exit_code=0, timed_out=1, output_sha256=None, output_bytes=0, output_truncated=False, post_command_inspection={}, classification="passed")
         with self.assertRaises(ValidationFailure):
             self.store.record_verification_command_result(intent["attempt_id"], intent["lease_id"], first, owner_instance_id="verify-owner", exit_code=0, timed_out=False, output_sha256=None, output_bytes=True, output_truncated=False, post_command_inspection={}, classification="passed")
+        self.start_verification_command(intent, first)
         self.store.record_verification_command_result(intent["attempt_id"], intent["lease_id"], first, owner_instance_id="verify-owner", exit_code=0, timed_out=False, output_sha256=None, output_bytes=0, output_truncated=False, post_command_inspection={}, classification="passed")
         with self.assertRaises(ConflictFailure):
             self.store.record_verification_command_intent(intent["attempt_id"], intent["lease_id"], ordinal=2, **args)

@@ -5,9 +5,11 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 from pathlib import Path
 
-from engineering_flow.domain import ApprovalDecision, ApprovalState, LifecycleVersion, Stage, VerificationOutcome, WorkflowStatus
+from engineering_flow.domain import (ApprovalDecision, ApprovalState, DomainFailure,
+    LifecycleVersion, Stage, VerificationOutcome, WorkflowStatus)
 from engineering_flow.repository import RepositoryInspector
 from engineering_flow.store import WorkflowStore
 from engineering_flow.verification import (DeterministicVerificationOrchestrator,
@@ -102,6 +104,41 @@ class Mds4Slice3RunnerTests(unittest.TestCase):
         self.assertEqual(outcome, VerificationOutcome.VERIFICATION_UNKNOWN)
         row = self.store._connection.execute("SELECT result_at,classification FROM verification_command_results").fetchone()
         self.assertTrue(row[0]); self.assertEqual(row[1], "repository_mutated")
+        self.assertIsNotNone(self.store.active_workspace_operation_lease(
+            RepositoryInspector(self.root).repository_key()))
+        self.assertEqual(self.store.get_workflow(workflow.id).status,
+            WorkflowStatus.HUMAN_ATTENTION)
+
+    def test_baseline_inspection_failure_is_unknown_and_retains_lease(self):
+        workflow, preflight, orchestrator = self.prepare([[sys.executable, "-c", "pass"]])
+        real_capture = RepositoryInspector.capture
+        calls = 0
+        def fail_second_capture(inspector):
+            nonlocal calls
+            calls += 1
+            if calls == 3:
+                raise OSError("baseline unavailable")
+            return real_capture(inspector)
+        with mock.patch.object(RepositoryInspector, "capture", fail_second_capture):
+            self.assertEqual(orchestrator.run(preflight),
+                VerificationOutcome.VERIFICATION_UNKNOWN)
+        self.assertIsNotNone(self.store.active_workspace_operation_lease(
+            RepositoryInspector(self.root).repository_key()))
+        self.assertEqual(self.store.get_workflow(workflow.id).status,
+            WorkflowStatus.HUMAN_ATTENTION)
+
+    def test_generic_runner_exception_is_unknown_and_retains_lease(self):
+        class BrokenRunner(VerificationCommandRunner):
+            def run(self, command, **kwargs):
+                raise RuntimeError("runner ambiguity")
+        workflow, preflight, orchestrator = self.prepare([[sys.executable, "-c", "pass"]])
+        orchestrator.runner = BrokenRunner(self.root)
+        self.assertEqual(orchestrator.run(preflight),
+            VerificationOutcome.VERIFICATION_UNKNOWN)
+        self.assertIsNotNone(self.store.active_workspace_operation_lease(
+            RepositoryInspector(self.root).repository_key()))
+        self.assertEqual(self.store.get_workflow(workflow.id).status,
+            WorkflowStatus.HUMAN_ATTENTION)
 
     def test_command_intent_exists_before_process_execution(self):
         class InspectingRunner(VerificationCommandRunner):
@@ -181,10 +218,12 @@ class Mds4Slice3RunnerTests(unittest.TestCase):
         workflow, outcome = self.run_commands([[sys.executable, "-c", "pass"]])
         self.assertEqual(outcome, VerificationOutcome.VERIFIED)
         row = self.store._connection.execute("""SELECT child_pid,child_process_start,child_process_group,
-            child_host_id,child_boot_id,child_owner_instance_id FROM verification_command_results""").fetchone()
+            child_process_session,child_host_id,child_boot_id,child_owner_instance_id
+            FROM verification_command_results""").fetchone()
         identity = local_host_boot_identity()
         self.assertIsInstance(row[0], int); self.assertTrue(row[1]); self.assertEqual(row[2], row[0])
-        self.assertEqual((row[3], row[4], row[5]), (identity.host_id, identity.boot_id, "runner"))
+        self.assertEqual(row[3], row[0])
+        self.assertEqual((row[4], row[5], row[6]), (identity.host_id, identity.boot_id, "runner"))
 
     def test_unproven_group_death_retains_lease_and_unresolved_command_evidence(self):
         from engineering_flow.verification import VerificationProcessGroupDeathUnknown
@@ -200,12 +239,39 @@ class Mds4Slice3RunnerTests(unittest.TestCase):
         self.assertIsNotNone(lease)
         self.assertTrue(lease["child_pid"]); self.assertTrue(lease["child_process_start"])
         self.assertEqual(self.store.get_workflow(workflow.id).status, WorkflowStatus.HUMAN_ATTENTION)
-        attempt = self.store._connection.execute("SELECT status,classification FROM verification_attempts").fetchone()
-        self.assertEqual(tuple(attempt), ("unknown", "verification_unknown"))
+        attempt = self.store._connection.execute(
+            "SELECT status,classification,final_inspection_json FROM verification_attempts").fetchone()
+        self.assertEqual(tuple(attempt[:2]), ("unknown", "verification_unknown"))
+        identity_evidence = json.loads(attempt[2])["identity"]
+        self.assertEqual(set(identity_evidence), {"pid", "process_start", "process_group",
+            "process_session", "machine_id", "boot_id", "owner_instance_id", "owner_pid",
+            "workflow_id", "attempt_id", "lease_id", "operation_id", "command_result_id"})
         command = self.store._connection.execute("SELECT argv_json,intent_at,result_at,child_pid,child_process_start FROM verification_command_results").fetchone()
         self.assertIn(sys.executable, command[0]); self.assertTrue(command[1]); self.assertIsNone(command[2])
         self.assertTrue(command[3]); self.assertTrue(command[4])
         self.assertEqual(self.store._connection.execute("SELECT count(*) FROM events WHERE type='verification.attempt.terminal'").fetchone()[0], 0)
+
+    def test_unknown_retention_persistence_failure_rolls_back_every_projection(self):
+        from engineering_flow.verification import VerificationProcessGroupDeathUnknown
+        class UnprovenRunner(VerificationCommandRunner):
+            @classmethod
+            def _terminate_group(cls, process_group):
+                raise VerificationProcessGroupDeathUnknown("test cannot prove group death")
+        workflow, preflight, orchestrator = self.prepare([[sys.executable, "-c", "pass"]])
+        orchestrator.runner = UnprovenRunner(self.root)
+        self.store._connection.execute("""CREATE TRIGGER fail_unknown_event BEFORE INSERT ON events
+            WHEN NEW.type='verification.attempt.unknown_retained'
+            BEGIN SELECT RAISE(ABORT, 'fault injected'); END""")
+        with self.assertRaises(DomainFailure):
+            orchestrator.run(preflight)
+        attempt = self.store._connection.execute(
+            "SELECT status,classification,final_inspection_json FROM verification_attempts").fetchone()
+        self.assertEqual(tuple(attempt), ("verifying", None, None))
+        self.assertEqual(self.store.get_workflow(workflow.id).status, WorkflowStatus.VERIFYING)
+        self.assertEqual(self.store._connection.execute(
+            "SELECT status FROM operations WHERE kind='verification'").fetchone()[0], "pending")
+        self.assertIsNotNone(self.store.active_workspace_operation_lease(
+            RepositoryInspector(self.root).repository_key()))
 
     def test_retained_unknown_lease_blocks_a_successor_operation(self):
         from engineering_flow.verification import VerificationProcessGroupDeathUnknown
