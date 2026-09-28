@@ -553,18 +553,25 @@ class VerificationRecoveryService:
                                      workflow: Mapping[str, Any] | None,
                                      task_state: Mapping[str, Any] | None,
                                      operation: Mapping[str, Any] | None,
-                                     execution: Mapping[str, Any] | None) -> None:
+                                     execution: Mapping[str, Any] | None, *,
+                                     live_owned_projection: bool = False) -> None:
         if workflow is None or task_state is None or operation is None or execution is None:
             raise ValidationFailure("verification recovery lifecycle evidence is incomplete")
         if attempt.get("status") == "verifying":
-            expected = (WorkflowStatus.VERIFYING.value, "verifying", "pending", "intent")
+            # A prior exact live-owned projection changes only the workflow
+            # presentation to HUMAN_ATTENTION; the attempt remains actively
+            # owned and must be recoverable idempotently.
+            expected_status = (WorkflowStatus.HUMAN_ATTENTION.value
+                if live_owned_projection else WorkflowStatus.VERIFYING.value)
+            expected = ("verifying", "pending", "intent")
             if (execution.get("terminal_result") is not None
                     or attempt.get("final_inspection_json") is not None
                     or attempt.get("classification") is not None
                     or attempt.get("finished_at") is not None):
                 raise ValidationFailure("verification execution result is inconsistent with active recovery")
         elif attempt.get("status") == "unknown":
-            expected = (WorkflowStatus.HUMAN_ATTENTION.value, "implementation_completed", "unknown", "unknown")
+            expected_status = WorkflowStatus.HUMAN_ATTENTION.value
+            expected = ("implementation_completed", "unknown", "unknown")
             try:
                 terminal_result = json.loads(execution["terminal_result"])
             except (KeyError, TypeError, json.JSONDecodeError) as exc:
@@ -573,9 +580,9 @@ class VerificationRecoveryService:
                 raise ValidationFailure("verification unknown execution result is inconsistent")
         else:
             raise ValidationFailure("verification attempt lifecycle is invalid for recovery")
-        actual = (workflow.get("status"), task_state.get("status"),
-            operation.get("status"), execution.get("lifecycle"))
-        if (workflow.get("stage") != Stage.TASK_EXECUTION.value or actual != expected):
+        actual = (task_state.get("status"), operation.get("status"), execution.get("lifecycle"))
+        if (workflow.get("stage") != Stage.TASK_EXECUTION.value
+                or workflow.get("status") != expected_status or actual != expected):
             raise ValidationFailure("verification recovery lifecycle projections are inconsistent")
 
     def _retain(self, lease: Mapping[str, Any], evidence: Mapping[str, Any],
@@ -613,7 +620,9 @@ class VerificationRecoveryService:
                                    workflow: Mapping[str, Any] | None,
                                    task_state: Mapping[str, Any] | None,
                                    commands: list[Mapping[str, Any]],
-                                   workflow_id: str) -> tuple[Mapping[str, Any] | None, Mapping[str, Any]]:
+                                   workflow_id: str, *,
+                                   live_owned_projection: bool = False,
+                                   ) -> tuple[Mapping[str, Any] | None, Mapping[str, Any]]:
         """Validate the durable command prefix against its tracked manifest."""
         if (attempt.get("workflow_id") != workflow_id
                 or lease.get("workflow_id") != workflow_id
@@ -630,7 +639,8 @@ class VerificationRecoveryService:
                 or execution.get("request_hash") != attempt.get("request_hash")):
             raise ValidationFailure("verification attempt, workflow, operation, or execution linkage is inconsistent")
         self._validate_recovery_lifecycle(
-            attempt, workflow, task_state, operation, execution)
+            attempt, workflow, task_state, operation, execution,
+            live_owned_projection=live_owned_projection)
         try:
             current_identity = self.identity or local_host_boot_identity()
         except Exception as exc:
@@ -833,7 +843,8 @@ class VerificationRecoveryService:
         try:
             command, last_command = self._validate_command_evidence(lease, attempt,
                 context["operation"], context["execution"], context["workflow"],
-                context["task_state"], commands, workflow_id)
+                context["task_state"], commands, workflow_id,
+                live_owned_projection=context.get("live_owned_projection") is True)
         except Exception as exc:
             return self._retain(lease, evidence, VerificationRecoveryOutcome.STATE_INCONSISTENT,
                 f"verification recovery evidence is unsafe: {exc}",
@@ -850,6 +861,12 @@ class VerificationRecoveryService:
                     return self._retain(lease, evidence, VerificationRecoveryOutcome.PROCESS_ALIVE_OWNED,
                         "verification process remains alive with exact persisted ownership",
                         authority=authority_evidence)
+                self.store.project_live_verification_recovery_attention(
+                    attempt["id"], lease["lease_id"], owner_instance_id=lease["owner_instance_id"],
+                    command_result_id=command["id"], final_inspection={
+                        "recovery_classification": VerificationRecoveryOutcome.PROCESS_ALIVE_OWNED.value,
+                        "identity": evidence, "authority": authority_evidence,
+                    }, detail="verification process remains alive with exact persisted ownership")
                 return VerificationRecoveryOutcome.PROCESS_ALIVE_OWNED
             if observation is not ProcessGroupObservation.DEAD:
                 outcome = self._OBSERVATION_OUTCOMES.get(observation,

@@ -6,6 +6,7 @@ from unittest import mock
 
 from engineering_flow.domain import (ConflictFailure, DomainFailure, ValidationFailure,
     WorkflowStatus)
+from engineering_flow.cli import _event_payload
 from engineering_flow.process_identity import (HostBootIdentity, ProcessGroupObservation,
     observe_exact_process_group)
 from engineering_flow.repository import RepositoryInspector, control_state_fingerprint
@@ -132,6 +133,131 @@ class Mds4Slice4RecoveryTests(unittest.TestCase):
         self.assertIsNone(self.store._connection.execute(
             "SELECT result_at FROM verification_command_results").fetchone()[0])
         signal_group.assert_not_called()
+
+    def test_exact_alive_process_projects_human_attention_without_changing_ownership(self):
+        workflow, intent = self.pending_attempt()
+        before = self.recovery_rows(intent)
+        self.assertEqual(self.service(ProcessGroupObservation.ALIVE_OWNED).reconcile(workflow.id),
+            VerificationRecoveryOutcome.PROCESS_ALIVE_OWNED)
+        after = self.recovery_rows(intent)
+        # Only the workflow safety projection and its audit event may change.
+        self.assertEqual(after[0], before[0])
+        self.assertEqual(after[2:5], before[2:5])
+        self.assertEqual(after[6:], before[6:])
+        self.assertEqual(self.store.get_workflow(workflow.id).status, WorkflowStatus.HUMAN_ATTENTION)
+        self.assertEqual(sum(kind == "verification.recovery.live_owned" for kind, _ in after[5]), 1)
+        self.assertEqual(self.service(ProcessGroupObservation.ALIVE_OWNED).reconcile(workflow.id),
+            VerificationRecoveryOutcome.PROCESS_ALIVE_OWNED)
+        self.assertEqual(sum(kind == "verification.recovery.live_owned" for kind, _ in
+            self.recovery_rows(intent)[5]), 1)
+
+    def test_human_attention_active_lifecycle_requires_live_owned_projection(self):
+        workflow, intent = self.pending_attempt()
+        self.store._connection.execute("UPDATE workflows SET status='human_attention' WHERE id=?",
+            (workflow.id,))
+        self.assertEqual(self.service(ProcessGroupObservation.ALIVE_OWNED).reconcile(workflow.id),
+            VerificationRecoveryOutcome.STATE_INCONSISTENT)
+        self.assertFalse(any(kind == "verification.recovery.live_owned" for kind, _ in
+            self.recovery_rows(intent)[5]))
+
+    def test_live_projection_event_failure_rolls_back_without_releasing_or_rewriting(self):
+        workflow, intent = self.pending_attempt()
+        before = self.recovery_rows(intent)
+        self.store._connection.execute("""CREATE TRIGGER fail_live_projection BEFORE INSERT ON events
+            WHEN NEW.type='verification.recovery.live_owned'
+            BEGIN SELECT RAISE(ABORT, 'fault injected'); END""")
+        with self.assertRaises(DomainFailure):
+            self.service(ProcessGroupObservation.ALIVE_OWNED).reconcile(workflow.id)
+        self.assertEqual(self.recovery_rows(intent), before)
+
+    def test_legacy_unknown_raw_evidence_is_frozen_before_recovery_merge(self):
+        workflow, intent = self.pending_attempt()
+        self.store.retain_verification_unknown(intent["attempt_id"], intent["lease_id"],
+            owner_instance_id="recover-owner", final_inspection={"temporary": "seed"}, detail="seed")
+        legacy = '{"identity":{"legacy":true},"unknown_future":{"left":"absent elsewhere"}}'
+        self.store._connection.execute("""UPDATE verification_attempts
+            SET final_inspection_json=? WHERE id=?""", (legacy, intent["attempt_id"]))
+        self.assertEqual(self.service(ProcessGroupObservation.ALIVE_OWNED).reconcile(workflow.id),
+            VerificationRecoveryOutcome.PROCESS_ALIVE_OWNED)
+        retained = json.loads(self.store._connection.execute(
+            "SELECT final_inspection_json FROM verification_attempts WHERE id=?",
+            (intent["attempt_id"],)).fetchone()[0])
+        self.assertEqual(retained["original_unknown_evidence"], {
+            "format": "legacy-final-inspection-json-v1", "raw": legacy})
+        self.assertEqual(retained["unknown_future"], {"left": "absent elsewhere"})
+        self.assertEqual(retained["recovery_observations"][0]["classification"], "process_alive_owned")
+
+    def test_legacy_unknown_nonobject_and_invalid_json_are_retained_verbatim(self):
+        for legacy in ('["legacy",{"future":true}]', '"legacy scalar"', '{not json'):
+            with self.subTest(legacy=legacy):
+                self.reset_fixture()
+                workflow, intent = self.pending_attempt()
+                self.store.retain_verification_unknown(intent["attempt_id"], intent["lease_id"],
+                    owner_instance_id="recover-owner", final_inspection={"temporary": "seed"}, detail="seed")
+                self.store._connection.execute("UPDATE verification_attempts SET final_inspection_json=? WHERE id=?",
+                    (legacy, intent["attempt_id"]))
+                self.assertEqual(self.service(ProcessGroupObservation.ALIVE_OWNED).reconcile(workflow.id),
+                    VerificationRecoveryOutcome.PROCESS_ALIVE_OWNED)
+                retained = json.loads(self.store._connection.execute(
+                    "SELECT final_inspection_json FROM verification_attempts WHERE id=?",
+                    (intent["attempt_id"],)).fetchone()[0])
+                self.assertEqual(retained["original_unknown_evidence"]["raw"], legacy)
+
+    def test_recovery_observation_deduplication_is_global_and_distinct_values_append(self):
+        workflow, intent = self.pending_attempt()
+        self.store.retain_verification_unknown(intent["attempt_id"], intent["lease_id"],
+            owner_instance_id="recover-owner", final_inspection={"temporary": "seed"}, detail="seed")
+        self.assertEqual(self.service(ProcessGroupObservation.PID_REUSED).reconcile(workflow.id),
+            VerificationRecoveryOutcome.PID_REUSED)
+        self.assertEqual(self.service(ProcessGroupObservation.ALIVE_OWNED).reconcile(workflow.id),
+            VerificationRecoveryOutcome.PROCESS_ALIVE_OWNED)
+        self.assertEqual(self.service(ProcessGroupObservation.PID_REUSED).reconcile(workflow.id),
+            VerificationRecoveryOutcome.PID_REUSED)
+        retained = json.loads(self.store._connection.execute(
+            "SELECT final_inspection_json FROM verification_attempts WHERE id=?",
+            (intent["attempt_id"],)).fetchone()[0])
+        self.assertEqual([item["classification"] for item in retained["recovery_observations"]],
+            ["pid_reused", "process_alive_owned"])
+
+    def test_mixed_recovery_observations_deduplicate_a_valid_exact_replay(self):
+        workflow, intent = self.pending_attempt()
+        self.assertEqual(self.service(ProcessGroupObservation.PID_REUSED).reconcile(workflow.id),
+            VerificationRecoveryOutcome.PID_REUSED)
+        retained = json.loads(self.store._connection.execute(
+            "SELECT final_inspection_json FROM verification_attempts WHERE id=?",
+            (intent["attempt_id"],)).fetchone()[0])
+        valid_observation = retained["recovery_observations"][0]
+        malformed_observation = ["malformed historical observation"]
+        retained["recovery_observations"] = [valid_observation, malformed_observation]
+        self.store._connection.execute("UPDATE verification_attempts SET final_inspection_json=? WHERE id=?",
+            (json.dumps(retained), intent["attempt_id"]))
+        events_before = self.store._connection.execute("""SELECT count(*) FROM events WHERE workflow_id=?
+            AND type='verification.recovery.unknown_retained'""", (workflow.id,)).fetchone()[0]
+
+        self.assertEqual(self.service(ProcessGroupObservation.PID_REUSED).reconcile(workflow.id),
+            VerificationRecoveryOutcome.PID_REUSED)
+
+        after = json.loads(self.store._connection.execute(
+            "SELECT final_inspection_json FROM verification_attempts WHERE id=?",
+            (intent["attempt_id"],)).fetchone()[0])
+        self.assertEqual(after["recovery_observations"],
+            [valid_observation, malformed_observation])
+        self.assertEqual(self.store._connection.execute("""SELECT count(*) FROM events WHERE workflow_id=?
+            AND type='verification.recovery.unknown_retained'""", (workflow.id,)).fetchone()[0], events_before)
+
+    def test_recovery_read_models_show_classification_and_lease_without_process_identity(self):
+        workflow, intent = self.pending_attempt()
+        self.service(ProcessGroupObservation.ALIVE_OWNED).reconcile(workflow.id)
+        projection = self.store.list_verification_attempt_projections(workflow.id)[0]
+        self.assertEqual(projection["recovery_classification"], "process_alive_owned")
+        self.assertTrue(projection["lease_held"])
+        self.assertFalse({"pid", "owner_pid", "process_start", "process_group", "process_session"}
+            & set(projection))
+        event = next(event for event in self.store.list_events(workflow.id)
+            if event.type == "verification.recovery.live_owned")
+        rendered = json.dumps(_event_payload(event), sort_keys=True)
+        self.assertNotIn("4242", rendered)
+        self.assertNotIn("start-1", rendered)
 
     def test_non_passing_command_never_authorizes_a_successor(self):
         cases = {
@@ -808,6 +934,72 @@ class Mds4Slice4RecoveryTests(unittest.TestCase):
             VerificationRecoveryOutcome.STATE_INCONSISTENT)
         self.assertIsNotNone(self.store.active_verification_recovery_context(workflow.id))
         self.assertEqual(self.store.get_workflow(workflow.id).status, WorkflowStatus.HUMAN_ATTENTION)
+
+    def test_inconsistent_linkage_exact_observation_is_deduplicated(self):
+        workflow, intent = self.pending_attempt()
+        evidence = {"linkage": "lease operation differs", "future_evidence": {"version": 1}}
+        kwargs = {"workflow_id": workflow.id, "lease_id": intent["lease_id"],
+            "attempt_id": intent["attempt_id"], "operation_id": intent["operation_id"],
+            "owner_instance_id": "recover-owner", "evidence": evidence,
+            "detail": "verification linkage is inconsistent"}
+        self.store.retain_inconsistent_verification_lease(**kwargs)
+        self.store.retain_inconsistent_verification_lease(**kwargs)
+        events = self.store._connection.execute("""SELECT payload FROM events WHERE workflow_id=?
+            AND type='verification.recovery.inconsistent_lease'""", (workflow.id,)).fetchall()
+        self.assertEqual(len(events), 1)
+
+    def test_inconsistent_linkage_distinct_observation_appends(self):
+        workflow, intent = self.pending_attempt()
+        base = {"workflow_id": workflow.id, "lease_id": intent["lease_id"],
+            "attempt_id": intent["attempt_id"], "operation_id": intent["operation_id"],
+            "owner_instance_id": "recover-owner", "detail": "verification linkage is inconsistent"}
+        self.store.retain_inconsistent_verification_lease(**base,
+            evidence={"linkage": "lease operation differs", "future_evidence": {"version": 1}})
+        self.store.retain_inconsistent_verification_lease(**base,
+            evidence={"linkage": "lease operation differs", "future_evidence": {"version": 2}})
+        events = self.store._connection.execute("""SELECT payload FROM events WHERE workflow_id=?
+            AND type='verification.recovery.inconsistent_lease' ORDER BY sequence ASC""", (workflow.id,)).fetchall()
+        self.assertEqual(len(events), 2)
+        self.assertEqual([json.loads(row["payload"])["identity"]["future_evidence"]["version"]
+            for row in events], [1, 2])
+
+    def test_recovery_event_projection_allowlists_safe_fields(self):
+        event = mock.Mock()
+        event.sequence, event.type, event.stage = 1, "verification.recovery.live_owned", None
+        event.artifact_id, event.execution_id, event.created_at = None, None, "now"
+        event.payload = {"attempt_id": "attempt-safe", "classification": "process_alive_owned",
+            "reason": "raw diagnostic", "observation": {"pid": 4242, "raw_output": "secret",
+                "environment": {"TOKEN": "secret"}, "owner_pid": 111,
+                "process_start": "start", "process_group": 4242, "process_session": 4242,
+                "machine_id": "host", "boot_id": "boot", "owner_instance_id": "owner",
+                "future": "not safe"},
+            "future_field": "not safe"}
+        projected = _event_payload(event)["payload"]
+        self.assertEqual(projected, {"attempt_id": "attempt-safe",
+            "classification": "process_alive_owned", "lease_held": True})
+        rendered = json.dumps(_event_payload(event), sort_keys=True)
+        for sensitive in ("4242", "secret", "start", "host", "boot", "owner"):
+            self.assertNotIn(sensitive, rendered)
+
+    def test_recovery_event_projection_excludes_unknown_fields_but_preserves_other_events(self):
+        recovery = mock.Mock()
+        recovery.sequence, recovery.type, recovery.stage = 1, "verification.recovery.unknown_retained", None
+        recovery.artifact_id, recovery.execution_id, recovery.created_at = None, None, "now"
+        recovery.payload = {"attempt_id": "attempt-safe", "observation": {
+            "classification": "process_dead_changed", "raw_output": "secret", "future": "not safe"},
+            "new_top_level_evidence": "not safe"}
+        self.assertEqual(_event_payload(recovery)["payload"], {"attempt_id": "attempt-safe",
+            "classification": "process_dead_changed", "lease_held": True})
+        future = mock.Mock()
+        future.sequence, future.type, future.stage = 2, "verification.recovery.future", None
+        future.artifact_id, future.execution_id, future.created_at = None, None, "now"
+        future.payload = {"arbitrary_future_evidence": {"raw_output": "secret"}}
+        self.assertEqual(_event_payload(future)["payload"], {})
+        ordinary = mock.Mock()
+        ordinary.sequence, ordinary.type, ordinary.stage = 3, "verification.command.completed", None
+        ordinary.artifact_id, ordinary.execution_id, ordinary.created_at = None, None, "now"
+        ordinary.payload = {"unchanged": {"future": "still present"}}
+        self.assertEqual(_event_payload(ordinary)["payload"], ordinary.payload)
 
     def test_incomplete_persisted_identity_fails_closed(self):
         workflow, _ = self.pending_attempt()

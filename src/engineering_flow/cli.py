@@ -223,13 +223,20 @@ def _plan_payload(store: WorkflowStore, workflow: Workflow, *, projection: Any =
         state.task_contract_id: state.status.value
         for state in store.list_task_implementation_states(workflow.id, artifact.id)
     }
+    verification_attempts = store.list_verification_attempt_projections(workflow.id)
+    verification_by_task = {
+        attempt["task_contract_id"]: attempt for attempt in verification_attempts
+    }
     raw_plan = plan.get("plan") if isinstance(plan, dict) else None
     raw_tasks = raw_plan.get("tasks") if isinstance(raw_plan, dict) else None
     if isinstance(raw_tasks, list):
         for task in raw_tasks:
             if isinstance(task, dict) and isinstance(task.get("id"), str):
                 task["implementation_status"] = states.get(task["id"], "pending")
-                task["verification_status"] = "not_run"
+                verification = verification_by_task.get(task["id"])
+                task["verification_status"] = ("not_run" if verification is None
+                    else verification["classification"] or verification["recovery_classification"]
+                    or verification["status"])
     attempts = store.list_implementation_attempts(workflow.id)
     latest_attempt = attempts[-1] if attempts else None
     if latest_attempt and isinstance(latest_attempt.get("changed_paths_json"), str):
@@ -272,7 +279,15 @@ def _plan_payload(store: WorkflowStore, workflow: Workflow, *, projection: Any =
                               "attempt_id": lease.get("attempt_id"),
                               "lease_held": True,
                           }),
-                          "verification_status": "not_run",
+                          "verification_status": ("not_run" if not verification_attempts
+                              else verification_attempts[-1]["classification"]
+                              or verification_attempts[-1]["recovery_classification"]
+                              or verification_attempts[-1]["status"]),
+                          "verification": {
+                              "attempt_count": len(verification_attempts),
+                              "latest_attempt": (verification_attempts[-1]
+                                  if verification_attempts else None),
+                          },
                       },
                       **projection_data, **plan}}
 
@@ -322,6 +337,7 @@ def _task_payload(store: WorkflowStore, task: Any) -> dict[str, Any]:
 
 def _event_payload(event: Any) -> dict[str, Any]:
     payload = dict(event.payload)
+    payload = _recovery_event_payload(event.type, payload)
     return {
         "sequence": event.sequence,
         "type": event.type,
@@ -335,6 +351,55 @@ def _event_payload(event: Any) -> dict[str, Any]:
         "payload": payload,
         "created_at": event.created_at,
     }
+
+
+def _recovery_event_payload(event_type: str, payload: dict[str, Any]) -> dict[str, Any]:
+    """Expose only a fixed safe summary for verification recovery evidence.
+
+    Recovery payloads deliberately retain raw process and repository evidence
+    durably.  Logs are a separate trust boundary: unknown fields and nested
+    evidence never cross it.  Non-recovery events retain their existing
+    presentation unchanged.
+    """
+    recovery_types = {
+        "verification.recovery.ambiguous_context": ("state_inconsistent", True),
+        "verification.recovery.inconsistent_lease": ("state_inconsistent", True),
+        "verification.recovery.live_owned": ("process_alive_owned", True),
+    }
+    safe_classifications = {
+        "ambiguous_ownership", "different_boot", "different_machine",
+        "identity_mismatch", "incomplete_identity", "inspection_failure",
+        "pid_reused", "process_dead_changed", "process_dead_unchanged",
+        "process_alive_owned", "repository_inspection_failure", "state_inconsistent",
+        "verification_unknown",
+    }
+    classification: str | None = None
+    lease_held: bool | None = None
+    if event_type in recovery_types:
+        classification, lease_held = recovery_types[event_type]
+    elif event_type == "verification.recovery.unknown_retained":
+        observation = payload.get("observation")
+        if isinstance(observation, dict):
+            observed = observation.get("classification")
+            if observed in safe_classifications:
+                classification = observed
+        lease_held = True
+    elif event_type == "verification.attempt.terminal" and "recovery" in payload:
+        if payload.get("outcome") == "interrupted_unchanged":
+            classification = "process_dead_unchanged"
+            lease_held = False
+    else:
+        # A future recovery event has no approved presentation contract yet.
+        # Its durable payload must therefore remain private by default.
+        return {} if event_type.startswith("verification.recovery.") else payload
+
+    safe: dict[str, Any] = {"lease_held": lease_held}
+    attempt_id = payload.get("attempt_id")
+    if isinstance(attempt_id, str):
+        safe["attempt_id"] = attempt_id
+    if classification is not None:
+        safe["classification"] = classification
+    return safe
 
 
 def _result_document(command: str, *, workflow: Workflow | None = None, error_code: str | None = None,

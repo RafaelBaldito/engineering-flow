@@ -1808,6 +1808,59 @@ class WorkflowStore:
             ORDER BY sequence DESC LIMIT 1""", (workflow_id, producer_operation_id, request_hash)).fetchone()
         return dict(row) if row is not None else None
 
+    def list_verification_attempt_projections(self, workflow_id: str) -> list[Mapping[str, Any]]:
+        """Return presentation-safe recovery state without process/output evidence."""
+        rows = self._connection.execute("""SELECT id,task_contract_id,sequence,status,classification,
+            final_inspection_json,started_at,finished_at FROM verification_attempts
+            WHERE workflow_id=? ORDER BY sequence""", (workflow_id,)).fetchall()
+        projections: list[Mapping[str, Any]] = []
+        for row in rows:
+            recovery_classification = None
+            observation_count = 0
+            try:
+                final = json.loads(row["final_inspection_json"]) if row["final_inspection_json"] else {}
+            except (TypeError, json.JSONDecodeError):
+                final = {}
+            if isinstance(final, dict):
+                classification = final.get("recovery_classification")
+                if isinstance(classification, str):
+                    recovery_classification = classification
+                observations = final.get("recovery_observations")
+                if isinstance(observations, list):
+                    observation_count = len(observations)
+            # Live-owned recovery intentionally leaves the active attempt
+            # unchanged.  Its durable classification therefore lives on the
+            # recovery event, not in final_inspection_json.
+            if self._has_live_verification_recovery_projection_unlocked(
+                    self._connection, workflow_id, row["id"]):
+                recovery_classification = "process_alive_owned"
+            lease_held = self._connection.execute("""SELECT 1 FROM workspace_operation_leases
+                WHERE attempt_id=? AND operation_kind='verification'""", (row["id"],)).fetchone() is not None
+            projections.append({"attempt_id": row["id"], "task_contract_id": row["task_contract_id"],
+                "sequence": row["sequence"], "status": row["status"],
+                "classification": row["classification"],
+                "recovery_classification": recovery_classification,
+                "recovery_observation_count": observation_count, "lease_held": lease_held,
+                "started_at": row["started_at"], "finished_at": row["finished_at"]})
+        return projections
+
+    @staticmethod
+    def _has_live_verification_recovery_projection_unlocked(
+        conn: sqlite3.Connection, workflow_id: str, attempt_id: str,
+    ) -> bool:
+        """Return whether this exact attempt has the live-owned projection."""
+        rows = conn.execute("""SELECT payload FROM events WHERE workflow_id=?
+            AND type='verification.recovery.live_owned'""", (workflow_id,)).fetchall()
+        for row in rows:
+            try:
+                payload = json.loads(row["payload"])
+            except (TypeError, json.JSONDecodeError):
+                continue
+            # Do not surface the process evidence contained in the event.
+            if isinstance(payload, dict) and payload.get("attempt_id") == attempt_id:
+                return True
+        return False
+
     def active_verification_recovery_context(self, workflow_id: str) -> Mapping[str, Any] | None:
         """Load raw unresolved VERIFY ownership and command evidence.
 
@@ -1858,7 +1911,10 @@ class WorkflowStore:
                 "execution": None if execution is None else dict(execution),
                 "workflow": None if workflow is None else dict(workflow),
                 "task_state": None if task_state is None else dict(task_state),
-                "commands": [dict(row) for row in commands], "command_state": command_state}
+                "commands": [dict(row) for row in commands], "command_state": command_state,
+                "live_owned_projection": attempt is not None
+                    and self._has_live_verification_recovery_projection_unlocked(
+                        self._connection, workflow_id, attempt["id"])}
 
     def retain_ambiguous_verification_recovery(self, workflow_id: str, *,
                                                evidence: Mapping[str, Any],
@@ -2097,9 +2153,19 @@ class WorkflowStore:
         if workflow is None or operation is None or execution is None or len(task_states) != 1:
             raise ConflictFailure("verification durable authority is incomplete")
         task_state = task_states[0]
-        expected_projection = ((WorkflowStatus.VERIFYING.value, "verifying", "pending", "intent")
-            if attempt["status"] == "verifying" else
-            (WorkflowStatus.HUMAN_ATTENTION.value, "implementation_completed", "unknown", "unknown"))
+        if attempt["status"] == "verifying":
+            # This exact event is the only structural exception to the active
+            # VERIFYING projection.  It changes workflow presentation only;
+            # the attempt, task, operation, execution, and lease stay active.
+            live_owned_projection = self._has_live_verification_recovery_projection_unlocked(
+                conn, workflow_id, attempt["id"])
+            expected_projection = (
+                WorkflowStatus.HUMAN_ATTENTION.value if live_owned_projection
+                else WorkflowStatus.VERIFYING.value,
+                "verifying", "pending", "intent")
+        else:
+            expected_projection = (WorkflowStatus.HUMAN_ATTENTION.value,
+                "implementation_completed", "unknown", "unknown")
         actual_projection = (workflow["status"], task_state["status"], operation["status"], execution["lifecycle"])
         if (workflow["stage"] != Stage.TASK_EXECUTION.value
                 or actual_projection != expected_projection
@@ -2389,36 +2455,47 @@ class WorkflowStore:
         """Shared sticky UNKNOWN projection; the exact lease is only touched."""
         if attempt["status"] not in {"verifying", "unknown"}:
             raise ConflictFailure("retained verification unknown is not recoverable")
+        raw_prior = attempt["final_inspection_json"]
         prior: dict[str, Any] = {}
-        if attempt["final_inspection_json"]:
+        loaded: object = None
+        if raw_prior is not None:
             try:
-                loaded = json.loads(attempt["final_inspection_json"])
+                loaded = json.loads(raw_prior)
             except (TypeError, json.JSONDecodeError):
                 loaded = None
             if isinstance(loaded, dict):
-                prior = loaded
+                prior = dict(loaded)
             else:
                 # Corruption cannot be allowed to prevent the UNKNOWN/HUMAN
                 # projection.  Preserve the exact raw bytes in the replacement
                 # envelope so the earlier evidence remains recoverable.
-                prior = {"corrupt_prior_evidence_raw": attempt["final_inspection_json"]}
+                prior = {"corrupt_prior_evidence_raw": raw_prior}
+        # Pre-4D UNKNOWN rows have no immutable source envelope.  Freeze their
+        # *stored bytes*, rather than a repaired JSON value, before any merge.
+        # This deliberately preserves malformed JSON, scalars, lists, and
+        # absent object fields without imposing a schema on historical proof.
+        legacy_unknown = (attempt["status"] == "unknown"
+            and "original_unknown_evidence" not in prior)
         observations = prior.get("recovery_observations", [])
         if not isinstance(observations, list):
             prior["corrupt_recovery_observations"] = observations
             observations = []
-        elif any(not isinstance(item, dict) for item in observations):
-            prior["corrupt_recovery_observations"] = observations
-            observations = []
 
         merged = dict(prior)
+        if legacy_unknown:
+            merged["original_unknown_evidence"] = {
+                "format": "legacy-final-inspection-json-v1",
+                "raw": raw_prior,
+            }
         if not prior:
             merged.update(final_inspection)
-            merged["original_unknown_evidence"] = {
-                "classification": final_inspection.get(
-                    "recovery_classification", "verification_unknown"),
-                "detail": detail,
-                "evidence": dict(final_inspection),
-            }
+            if not legacy_unknown:
+                merged["original_unknown_evidence"] = {
+                    "classification": final_inspection.get(
+                        "recovery_classification", "verification_unknown"),
+                    "detail": detail,
+                    "evidence": dict(final_inspection),
+                }
         else:
             # Earlier repository/control/identity evidence remains directly
             # recoverable as well as in the immutable original/history entry.
@@ -2435,10 +2512,17 @@ class WorkflowStore:
 
         if recovery:
             observation = self._unknown_observation(final_inspection, detail)
-            if observations and observations[-1] == observation:
+            # Historical observations are append-only evidence.  A malformed
+            # list member must not prevent an exact match among the valid
+            # mapping entries from suppressing a replay.
+            duplicate = any(observation == item for item in observations
+                if isinstance(item, dict))
+            if not duplicate:
+                observations = [*observations, observation]
+                merged["recovery_observations"] = observations
+            elif not legacy_unknown:
+                # An exact replay has already made every durable projection.
                 return
-            observations = [*observations, observation]
-            merged["recovery_observations"] = observations
 
         now = _now()
         conn.execute("""UPDATE verification_attempts SET status='unknown',classification='verification_unknown',
@@ -2461,11 +2545,72 @@ class WorkflowStore:
              attempt["operation_id"], attempt["workflow_id"], lease["owner_instance_id"]))
         if updated.rowcount != 1:
             raise PersistenceFailure("verification UNKNOWN transition lost exact lease ownership")
-        self._event_unlocked(conn, attempt["workflow_id"],
-            "verification.recovery.unknown_retained" if recovery
-            else "verification.attempt.unknown_retained",
-            stage=Stage.TASK_EXECUTION, execution_id=attempt["execution_id"],
-            payload={"attempt_id": attempt["id"], "reason": detail})
+        if not recovery or not duplicate:
+            payload: dict[str, Any] = {"attempt_id": attempt["id"], "reason": detail}
+            if recovery:
+                payload["observation"] = observation
+            self._event_unlocked(conn, attempt["workflow_id"],
+                "verification.recovery.unknown_retained" if recovery
+                else "verification.attempt.unknown_retained",
+                stage=Stage.TASK_EXECUTION, execution_id=attempt["execution_id"], payload=payload)
+
+    def project_live_verification_recovery_attention(
+        self, attempt_id: str, lease_id: str, *, owner_instance_id: str,
+        command_result_id: str, final_inspection: Mapping[str, Any], detail: str,
+    ) -> None:
+        """Project an exactly-owned live verifier without changing its ownership.
+
+        This intentionally has no terminal/UNKNOWN side effects: it is the
+        narrow recovery-only escape hatch through the unresolved-ownership
+        guard, and is therefore safe for a live child that must not be adopted
+        or signalled by recovery.
+        """
+        if (not isinstance(final_inspection, Mapping) or not isinstance(detail, str) or not detail
+                or not isinstance(command_result_id, str) or not command_result_id):
+            raise ValidationFailure("live verification recovery evidence is invalid")
+        with self._transaction() as conn:
+            attempt_hint = conn.execute("SELECT workflow_id FROM verification_attempts WHERE id=?",
+                (attempt_id,)).fetchone()
+            if attempt_hint is None:
+                raise ConflictFailure("live verification recovery attempt is missing")
+            attempt, lease, workflow, *_ = self._verification_transition_context_unlocked(
+                conn, attempt_hint["workflow_id"], attempt_id=attempt_id, lease_id=lease_id,
+                owner_instance_id=owner_instance_id)
+            command = conn.execute("""SELECT * FROM verification_command_results
+                WHERE id=? AND verification_attempt_id=?""", (command_result_id, attempt_id)).fetchone()
+            expected_identity = {
+                "pid": None if command is None else command["child_pid"],
+                "process_start": None if command is None else command["child_process_start"],
+                "process_group": None if command is None else command["child_process_group"],
+                "process_session": None if command is None else command["child_process_session"],
+                "machine_id": None if command is None else command["child_host_id"],
+                "boot_id": None if command is None else command["child_boot_id"],
+                "owner_instance_id": lease["owner_instance_id"], "owner_pid": lease["owner_pid"],
+                "workflow_id": lease["workflow_id"], "attempt_id": lease["attempt_id"],
+                "lease_id": lease["lease_id"], "operation_id": lease["operation_id"],
+                "command_result_id": command_result_id,
+            }
+            if (attempt["status"] != "verifying" or command is None or command["result_at"] is not None
+                    or not isinstance(final_inspection.get("identity"), Mapping)
+                    or dict(final_inspection["identity"]) != expected_identity
+                    or any(command[field] != lease[field] for field in (
+                        "child_pid", "child_process_start", "child_process_group", "child_process_session"))
+                    or command["child_owner_instance_id"] != lease["owner_instance_id"]
+                    or command["child_host_id"] != lease["owner_host_id"]
+                    or command["child_boot_id"] != lease["owner_boot_id"]):
+                raise ConflictFailure("live verification recovery lacks exact active child ownership")
+            now = _now()
+            conn.execute("UPDATE workflows SET stage=?,status=?,updated_at=? WHERE id=?",
+                (Stage.TASK_EXECUTION.value, WorkflowStatus.HUMAN_ATTENTION.value, now, attempt["workflow_id"]))
+            payload = {"attempt_id": attempt_id, "reason": detail,
+                "classification": "process_alive_owned", "observation": dict(final_inspection)}
+            encoded = _json(payload)
+            prior = conn.execute("""SELECT 1 FROM events WHERE workflow_id=?
+                AND type='verification.recovery.live_owned' AND payload=?""",
+                (attempt["workflow_id"], encoded)).fetchone()
+            if prior is None:
+                self._event_unlocked(conn, attempt["workflow_id"], "verification.recovery.live_owned",
+                    stage=Stage.TASK_EXECUTION, execution_id=attempt["execution_id"], payload=payload)
 
     def retain_verification_unknown(self, attempt_id: str, lease_id: str, *, owner_instance_id: str,
                                     final_inspection: Mapping[str, Any], detail: str) -> None:
@@ -2527,12 +2672,18 @@ class WorkflowStore:
                 raise ConflictFailure("inconsistent verification lease workflow is missing")
             conn.execute("UPDATE workflows SET stage=?,status=?,updated_at=? WHERE id=?",
                 (Stage.TASK_EXECUTION.value, WorkflowStatus.HUMAN_ATTENTION.value, _now(), workflow_id))
+            # The event payload is the durable observation.  Suppress only an
+            # exact canonical replay, so later conflicting or future evidence
+            # remains append-only and auditable.
+            payload = {"attempt_id": attempt_id, "reason": detail, "identity": dict(evidence)}
+            encoded = _json(payload)
             prior = conn.execute("""SELECT 1 FROM events WHERE workflow_id=?
-                AND type='verification.recovery.inconsistent_lease'""", (workflow_id,)).fetchone()
+                AND type='verification.recovery.inconsistent_lease' AND payload=?""",
+                (workflow_id, encoded)).fetchone()
             if prior is None:
                 self._event_unlocked(conn, workflow_id, "verification.recovery.inconsistent_lease",
                     stage=Stage.TASK_EXECUTION,
-                    payload={"attempt_id": attempt_id, "reason": detail, "identity": dict(evidence)})
+                    payload=payload)
 
     def list_implementation_attempts(self, workflow_id: str) -> list[Mapping[str, Any]]:
         """Return bounded operational evidence for the CLI status projection."""
