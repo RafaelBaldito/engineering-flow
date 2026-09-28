@@ -1,4 +1,5 @@
 import json
+import hashlib
 import os
 import sqlite3
 import subprocess
@@ -45,14 +46,21 @@ class Mds4Slice2PersistenceTests(unittest.TestCase):
             self.store.finish_implementation_attempt(intent["attempt_id"], intent["lease_id"], status="succeeded", classification="completed_changed", final=inspector.capture().as_payload(), workspace_changed=True, owner_instance_id=intent["owner_instance_id"])
         return workflow, contract, intent, inspector.repository_key()
 
-    def verification_intent(self):
+    def verification_intent(self, *, commands=None):
         workflow, contract, producer, key = self.producer()
         authority = self.store.load_approved_v2_plan_authority(workflow.id)
         authority_sha256 = authority_binding_sha256(authority,
             task_contract_id=contract.id, task_contract_sha256=contract.payload_sha256())
         producer_evidence = self.store.load_successful_implementation_producer(workflow.id,
             producer["operation_id"], contract.id, contract.payload_sha256())
-        kwargs = dict(repository_key=key, canonical_root=str(self.root), producer_operation_id=producer["operation_id"], task_contract_id=contract.id, task_contract_sha256=contract.payload_sha256(), authority_sha256=authority_sha256, request_hash="b" * 64, manifest_binding={"path":"manifest"}, baseline=dict(producer_evidence.final_repository), owner_instance_id="verify-owner", owner_pid=os.getpid(), owner_host_id="host", owner_boot_id="boot")
+        commands = commands or [{"id": "unit", "argv": ["python", "-m", "unittest"], "timeout_seconds": 30}]
+        binding = {"path": "manifest", "commands": commands,
+            "canonical_commands_sha256": hashlib.sha256(json.dumps(
+                {"version": 1, "commands": commands}, sort_keys=True,
+                separators=(",", ":")).encode()).hexdigest()}
+        baseline = dict(producer_evidence.final_repository)
+        baseline["control_state_fingerprint"] = "0" * 64
+        kwargs = dict(repository_key=key, canonical_root=str(self.root), producer_operation_id=producer["operation_id"], task_contract_id=contract.id, task_contract_sha256=contract.payload_sha256(), authority_sha256=authority_sha256, request_hash="b" * 64, manifest_binding=binding, baseline=baseline, owner_instance_id="verify-owner", owner_pid=os.getpid(), owner_host_id="host", owner_boot_id="boot")
         return workflow, contract, key, kwargs, self.store.create_verification_intent(workflow.id, **kwargs)
 
     def start_verification_command(self, intent, command):
@@ -72,11 +80,11 @@ class Mds4Slice2PersistenceTests(unittest.TestCase):
 
     def test_command_evidence_is_ordered_immutable_and_terminal_success_releases_exact_lease(self):
         workflow, contract, key, kwargs, intent = self.verification_intent()
-        command = self.store.record_verification_command_intent(intent["attempt_id"], intent["lease_id"], owner_instance_id="verify-owner", ordinal=1, command_id="unit", canonical_command_sha256="c" * 64, argv=["python", "-m", "unittest"], timeout_seconds=30)
+        command = self.store.record_verification_command_intent(intent["attempt_id"], intent["lease_id"], owner_instance_id="verify-owner", ordinal=1, command_id="unit", canonical_command_sha256=self.store._command_hash(kwargs["manifest_binding"]["commands"][0]), argv=["python", "-m", "unittest"], timeout_seconds=30)
         with self.assertRaises(ConflictFailure):
             self.store.record_verification_command_intent(intent["attempt_id"], intent["lease_id"], owner_instance_id="verify-owner", ordinal=1, command_id="other", canonical_command_sha256="d" * 64, argv=["false"], timeout_seconds=1)
         self.start_verification_command(intent, command)
-        self.store.record_verification_command_result(intent["attempt_id"], intent["lease_id"], command, owner_instance_id="verify-owner", exit_code=0, timed_out=False, output_sha256=None, output_bytes=0, output_truncated=False, post_command_inspection={"fingerprint":"same"}, classification="passed")
+        self.store.record_verification_command_result(intent["attempt_id"], intent["lease_id"], command, owner_instance_id="verify-owner", exit_code=0, timed_out=False, output_sha256="0" * 64, output_bytes=0, output_truncated=False, post_command_inspection={"repository": {key: value for key, value in kwargs["baseline"].items() if key != "control_state_fingerprint"}, "control_state_fingerprint": "0" * 64, "safe": True}, classification="passed")
         with self.assertRaises(ConflictFailure):
             self.store.finish_verification_attempt(intent["attempt_id"], intent["lease_id"], owner_instance_id="wrong", outcome="verified", final_inspection={})
         self.store.finish_verification_attempt(intent["attempt_id"], intent["lease_id"], owner_instance_id="verify-owner", outcome="verified", final_inspection={"fingerprint":"same"})
@@ -131,13 +139,20 @@ class Mds4Slice2PersistenceTests(unittest.TestCase):
         self.assertEqual(self.store.active_workspace_operation_lease(key)["owner_instance_id"], "implement-owner")
 
     def test_command_intents_are_serial_and_strictly_typed(self):
-        workflow, contract, key, kwargs, intent = self.verification_intent()
-        args = dict(owner_instance_id="verify-owner", command_id="unit", canonical_command_sha256="c" * 64, argv=["python"], timeout_seconds=30)
+        commands = [
+            {"id": "unit", "argv": ["python", "-m", "unittest"], "timeout_seconds": 30},
+            {"id": "next", "argv": ["python", "-c", "pass"], "timeout_seconds": 30},
+        ]
+        workflow, contract, key, kwargs, intent = self.verification_intent(commands=commands)
+        args = dict(owner_instance_id="verify-owner", command_id=commands[0]["id"],
+            canonical_command_sha256=self.store._command_hash(commands[0]), argv=commands[0]["argv"],
+            timeout_seconds=commands[0]["timeout_seconds"])
+        second_args = dict(owner_instance_id="verify-owner", command_id=commands[1]["id"],
+            canonical_command_sha256=self.store._command_hash(commands[1]), argv=commands[1]["argv"],
+            timeout_seconds=commands[1]["timeout_seconds"])
         with self.assertRaises(ConflictFailure):
-            self.store.record_verification_command_intent(intent["attempt_id"], intent["lease_id"], ordinal=2, **args)
+            self.store.record_verification_command_intent(intent["attempt_id"], intent["lease_id"], ordinal=2, **second_args)
         first = self.store.record_verification_command_intent(intent["attempt_id"], intent["lease_id"], ordinal=1, **args)
-        with self.assertRaises(ConflictFailure):
-            self.store.record_verification_command_intent(intent["attempt_id"], intent["lease_id"], ordinal=2, **{**args, "command_id":"next"})
         with self.assertRaises(ValidationFailure):
             self.store.record_verification_command_intent(intent["attempt_id"], intent["lease_id"], ordinal=True, **args)
         with self.assertRaises(ValidationFailure):
@@ -147,10 +162,10 @@ class Mds4Slice2PersistenceTests(unittest.TestCase):
         with self.assertRaises(ValidationFailure):
             self.store.record_verification_command_result(intent["attempt_id"], intent["lease_id"], first, owner_instance_id="verify-owner", exit_code=0, timed_out=False, output_sha256=None, output_bytes=True, output_truncated=False, post_command_inspection={}, classification="passed")
         self.start_verification_command(intent, first)
-        self.store.record_verification_command_result(intent["attempt_id"], intent["lease_id"], first, owner_instance_id="verify-owner", exit_code=0, timed_out=False, output_sha256=None, output_bytes=0, output_truncated=False, post_command_inspection={}, classification="passed")
+        self.store.record_verification_command_result(intent["attempt_id"], intent["lease_id"], first, owner_instance_id="verify-owner", exit_code=0, timed_out=False, output_sha256="0" * 64, output_bytes=0, output_truncated=False, post_command_inspection={"repository": {key: value for key, value in kwargs["baseline"].items() if key != "control_state_fingerprint"}, "control_state_fingerprint": kwargs["baseline"]["control_state_fingerprint"], "safe": True}, classification="passed")
         with self.assertRaises(ConflictFailure):
-            self.store.record_verification_command_intent(intent["attempt_id"], intent["lease_id"], ordinal=2, **args)
-        self.store.record_verification_command_intent(intent["attempt_id"], intent["lease_id"], ordinal=2, **{**args, "command_id":"next"})
+            self.store.record_verification_command_intent(intent["attempt_id"], intent["lease_id"], ordinal=2, **{**second_args, "command_id":"wrong"})
+        self.store.record_verification_command_intent(intent["attempt_id"], intent["lease_id"], ordinal=2, **second_args)
 
     def test_legacy_lease_migration_is_restart_safe_and_preserves_owner_fields(self):
         workflow, contract, intent, key = self.producer()

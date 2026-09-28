@@ -20,7 +20,7 @@ class Mds4Slice4RecoveryTests(unittest.TestCase):
     tearDown = slice3_tests.Mds4Slice3RunnerTests.tearDown
     prepare = slice3_tests.Mds4Slice3RunnerTests.prepare
 
-    def pending_attempt(self, commands=None):
+    def pending_attempt(self, commands=None, *, start=True):
         workflow, preflight, orchestrator = self.prepare(commands or [["/bin/true"]])
         inspector = RepositoryInspector(self.root)
         baseline = inspector.capture().as_payload()
@@ -35,7 +35,8 @@ class Mds4Slice4RecoveryTests(unittest.TestCase):
             manifest_binding={"path": binding.path, "head_sha": binding.head_sha,
                 "head_blob_sha256": binding.head_blob_sha256,
                 "worktree_sha256": binding.worktree_sha256,
-                "canonical_commands_sha256": binding.canonical_commands_sha256},
+                "canonical_commands_sha256": binding.canonical_commands_sha256,
+                "commands": [command.as_payload() for command in binding.manifest.commands]},
             baseline=baseline, owner_instance_id="recover-owner",
             owner_pid=111, owner_host_id="host", owner_boot_id="boot")
         command = preflight.manifest_binding.manifest.commands[0]
@@ -44,10 +45,11 @@ class Mds4Slice4RecoveryTests(unittest.TestCase):
             ordinal=1, command_id=command.id,
             canonical_command_sha256=orchestrator._command_hash(command), argv=command.argv,
             timeout_seconds=command.timeout_seconds)
-        self.store.record_verification_command_started(intent["attempt_id"], intent["lease_id"],
-            command_result_id, owner_instance_id="recover-owner", child_pid=4242,
-            child_process_start="start-1", child_process_group=4242,
-            child_process_session=4242, child_host_id="host", child_boot_id="boot")
+        if start:
+            self.store.record_verification_command_started(intent["attempt_id"], intent["lease_id"],
+                command_result_id, owner_instance_id="recover-owner", child_pid=4242,
+                child_process_start="start-1", child_process_group=4242,
+                child_process_session=4242, child_host_id="host", child_boot_id="boot")
         return workflow, intent
 
     def complete_current_command(self, intent):
@@ -130,6 +132,117 @@ class Mds4Slice4RecoveryTests(unittest.TestCase):
         self.assertIsNone(self.store._connection.execute(
             "SELECT result_at FROM verification_command_results").fetchone()[0])
         signal_group.assert_not_called()
+
+    def test_non_passing_command_never_authorizes_a_successor(self):
+        cases = {
+            "failed": dict(exit_code=1, timed_out=False, output_truncated=False, safe=True),
+            "timed_out": dict(exit_code=None, timed_out=True, output_truncated=False, safe=True),
+            "output_limited": dict(exit_code=0, timed_out=False, output_truncated=True, safe=True),
+            "spawn_blocked": dict(exit_code=None, timed_out=False, output_truncated=False, safe=True),
+            "repository_mutated": dict(exit_code=0, timed_out=False, output_truncated=False, safe=False),
+        }
+        for classification, facts in cases.items():
+            with self.subTest(classification=classification):
+                self.reset_fixture()
+                workflow, intent = self.pending_attempt([["/bin/true"], ["/bin/true"]],
+                    start=classification != "spawn_blocked")
+                command_id = self.store._connection.execute(
+                    "SELECT id FROM verification_command_results WHERE verification_attempt_id=?",
+                    (intent["attempt_id"],)).fetchone()[0]
+                snapshot = RepositoryInspector(self.root).capture().as_payload()
+                inspection = {"repository": snapshot,
+                    "control_state_fingerprint": control_state_fingerprint(self.root),
+                    "safe": facts["safe"]}
+                self.store.record_verification_command_result(intent["attempt_id"], intent["lease_id"], command_id,
+                    owner_instance_id="recover-owner", output_sha256="0" * 64, output_bytes=0,
+                    post_command_inspection=inspection, classification=classification,
+                    **{key: value for key, value in facts.items() if key != "safe"})
+                bound = json.loads(self.store._connection.execute(
+                    "SELECT manifest_binding_json FROM verification_attempts WHERE id=?",
+                    (intent["attempt_id"],)).fetchone()[0])["commands"][1]
+                with self.assertRaises(ConflictFailure):
+                    self.store.record_verification_command_intent(intent["attempt_id"], intent["lease_id"],
+                        owner_instance_id="recover-owner", ordinal=2, command_id=bound["id"],
+                        canonical_command_sha256=self.store._command_hash(bound),
+                        argv=bound["argv"], timeout_seconds=bound["timeout_seconds"])
+                self.assertEqual(self.store._connection.execute(
+                    "SELECT count(*) FROM verification_command_results WHERE verification_attempt_id=?",
+                    (intent["attempt_id"],)).fetchone()[0], 1)
+
+    def test_contradictory_passing_result_rolls_back_and_blocks_a_successor(self):
+        workflow, intent = self.pending_attempt([["/bin/true"], ["/bin/true"]])
+        command_id = self.store._connection.execute(
+            "SELECT id FROM verification_command_results WHERE verification_attempt_id=?",
+            (intent["attempt_id"],)).fetchone()[0]
+        snapshot = RepositoryInspector(self.root).capture().as_payload()
+        with self.assertRaises(ConflictFailure):
+            self.store.record_verification_command_result(intent["attempt_id"], intent["lease_id"], command_id,
+                owner_instance_id="recover-owner", exit_code=1, timed_out=False,
+                output_sha256="0" * 64, output_bytes=0, output_truncated=False,
+                post_command_inspection={"repository": snapshot,
+                    "control_state_fingerprint": control_state_fingerprint(self.root), "safe": True},
+                classification="passed")
+        bound = json.loads(self.store._connection.execute(
+            "SELECT manifest_binding_json FROM verification_attempts WHERE id=?",
+            (intent["attempt_id"],)).fetchone()[0])["commands"][1]
+        with self.assertRaises(ConflictFailure):
+            self.store.record_verification_command_intent(intent["attempt_id"], intent["lease_id"],
+                owner_instance_id="recover-owner", ordinal=2, command_id=bound["id"],
+                canonical_command_sha256=self.store._command_hash(bound), argv=bound["argv"],
+                timeout_seconds=bound["timeout_seconds"])
+        self.assertIsNotNone(self.store.active_workspace_operation_lease(
+            RepositoryInspector(self.root).repository_key()))
+
+    def test_early_verified_and_corrupt_recovery_prefix_fail_closed_before_observation(self):
+        workflow, intent = self.pending_attempt([["/bin/true"], ["/bin/true"]])
+        with self.assertRaises(ConflictFailure):
+            self.store.finish_verification_attempt(intent["attempt_id"], intent["lease_id"],
+                owner_instance_id="recover-owner", outcome="verified", final_inspection={})
+        self.store._connection.execute("UPDATE verification_command_results SET ordinal=2 WHERE verification_attempt_id=?",
+            (intent["attempt_id"],))
+        observer = mock.Mock(return_value=ProcessGroupObservation.DEAD)
+        service = VerificationRecoveryService(self.store, identity=HostBootIdentity("host", "boot"),
+            observer=observer)
+        self.assertEqual(service.reconcile(workflow.id), VerificationRecoveryOutcome.STATE_INCONSISTENT)
+        observer.assert_not_called()
+        self.assertIsNotNone(self.store.active_workspace_operation_lease(
+            RepositoryInspector(self.root).repository_key()))
+
+    def test_corrupt_completed_passing_identity_cannot_authorize_a_successor(self):
+        workflow, intent = self.pending_attempt([["/bin/true"], ["/bin/true"]])
+        self.complete_current_command(intent)
+        self.store._connection.execute("""UPDATE verification_command_results
+            SET child_process_start=NULL WHERE verification_attempt_id=?""", (intent["attempt_id"],))
+        bound = json.loads(self.store._connection.execute(
+            "SELECT manifest_binding_json FROM verification_attempts WHERE id=?",
+            (intent["attempt_id"],)).fetchone()[0])["commands"][1]
+        with self.assertRaises(ConflictFailure):
+            self.store.record_verification_command_intent(intent["attempt_id"], intent["lease_id"],
+                owner_instance_id="recover-owner", ordinal=2, command_id=bound["id"],
+                canonical_command_sha256=self.store._command_hash(bound), argv=bound["argv"],
+                timeout_seconds=bound["timeout_seconds"])
+
+    def test_corrupt_completed_passing_identity_cannot_authorize_terminalization(self):
+        workflow, intent = self.pending_attempt()
+        self.complete_current_command(intent)
+        self.store._connection.execute("""UPDATE verification_command_results
+            SET child_owner_instance_id='other-owner' WHERE verification_attempt_id=?""",
+            (intent["attempt_id"],))
+        with self.assertRaises(ConflictFailure):
+            self.store.finish_verification_attempt(intent["attempt_id"], intent["lease_id"],
+                owner_instance_id="recover-owner", outcome="verified", final_inspection={})
+        self.assertIsNotNone(self.store.active_workspace_operation_lease(
+            RepositoryInspector(self.root).repository_key()))
+
+    def test_corrupt_completed_passing_identity_cannot_authorize_recovery_release(self):
+        workflow, intent = self.pending_attempt()
+        self.complete_current_command(intent)
+        self.store._connection.execute("""UPDATE verification_command_results
+            SET child_process_session=0 WHERE verification_attempt_id=?""", (intent["attempt_id"],))
+        with self.assertRaises(ConflictFailure):
+            self.store.finish_interrupted_verification_recovery(self.recovery_decision(workflow))
+        self.assertIsNotNone(self.store.active_workspace_operation_lease(
+            RepositoryInspector(self.root).repository_key()))
 
     def test_dead_unchanged_is_interrupted_and_exact_lease_is_released_idempotently(self):
         workflow, intent = self.pending_attempt()

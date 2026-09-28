@@ -600,11 +600,12 @@ class VerificationRecoveryService:
             "authority_sha256", "request_hash")}
 
     @staticmethod
-    def _binding_payload(binding: VerificationManifestBinding) -> dict[str, str]:
+    def _binding_payload(binding: VerificationManifestBinding) -> dict[str, Any]:
         return {"path": binding.path, "head_sha": binding.head_sha,
             "head_blob_sha256": binding.head_blob_sha256,
             "worktree_sha256": binding.worktree_sha256,
-            "canonical_commands_sha256": binding.canonical_commands_sha256}
+            "canonical_commands_sha256": binding.canonical_commands_sha256,
+            "commands": [command.as_payload() for command in binding.manifest.commands]}
 
     def _validate_command_evidence(self, lease: Mapping[str, Any], attempt: Mapping[str, Any],
                                    operation: Mapping[str, Any] | None,
@@ -825,6 +826,10 @@ class VerificationRecoveryService:
                 evidence=evidence,
                 detail="verification attempt, lease, workflow, or operation linkage is inconsistent")
             return VerificationRecoveryOutcome.STATE_INCONSISTENT
+        if context.get("command_state") not in {"UNRESOLVED", "PASSING_PREFIX", "COMPLETE_PASS"}:
+            return self._retain(lease, evidence, VerificationRecoveryOutcome.STATE_INCONSISTENT,
+                "verification recovery command prefix is not a valid passing prefix",
+                authority=authority_evidence)
         try:
             command, last_command = self._validate_command_evidence(lease, attempt,
                 context["operation"], context["execution"], context["workflow"],
@@ -953,7 +958,9 @@ class DeterministicVerificationOrchestrator:
                 manifest_binding={"path": preflight.manifest_binding.path, "head_sha": preflight.manifest_binding.head_sha,
                     "head_blob_sha256": preflight.manifest_binding.head_blob_sha256,
                     "worktree_sha256": preflight.manifest_binding.worktree_sha256,
-                    "canonical_commands_sha256": preflight.manifest_binding.canonical_commands_sha256},
+                    "canonical_commands_sha256": preflight.manifest_binding.canonical_commands_sha256,
+                    "commands": [command.as_payload()
+                                 for command in preflight.manifest_binding.manifest.commands]},
                 baseline=initial_payload, owner_instance_id=self.owner_instance_id, owner_pid=os.getpid(),
                 owner_host_id=host_identity.host_id, owner_boot_id=host_identity.boot_id)
         except Exception:

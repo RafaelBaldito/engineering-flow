@@ -1619,6 +1619,12 @@ class WorkflowStore:
                    (repository_key, canonical_root, producer_operation_id, task_contract_id,
                     task_contract_sha256, owner_instance_id, owner_host_id)):
             raise ValidationFailure("verification intent has incomplete identity bindings")
+        # The aggregate manifest hash is not enough to establish the final
+        # ordinal after a restart.  The full normalized list is immutable
+        # attempt authority; old bindings without it are deliberately legacy
+        # evidence and cannot authorize a command transition.
+        normalized_commands = self._normalize_verification_commands(manifest_binding)
+        bound_manifest = {**dict(manifest_binding), "commands": normalized_commands}
         with self._transaction() as conn:
             existing = conn.execute("""SELECT id, lease_id, execution_id, operation_id, status, classification
                 FROM verification_attempts WHERE workflow_id=? AND producer_operation_id=? AND request_hash=?
@@ -1657,7 +1663,7 @@ class WorkflowStore:
                 (attempt_id, workflow_id, producer_operation_id, execution_id, operation_id, lease_id,
                  producer.feature_artifact_id, producer.feature_sha256, producer.plan_artifact_id, producer.plan_sha256,
                  producer.plan_revision, producer.plan_id, producer.approval_id, task_contract_id, task_contract_sha256,
-                 authority_sha256, request_hash, _json(manifest_binding), _json(baseline), sequence, now, now, now))
+                 authority_sha256, request_hash, _json(bound_manifest), _json(baseline), sequence, now, now, now))
             conn.execute("""INSERT INTO workspace_operation_leases
                 (repository_key,lease_id,operation_kind,attempt_id,operation_id,workflow_id,canonical_root,
                  owner_instance_id,owner_pid,owner_host_id,owner_boot_id,acquired_at,updated_at)
@@ -1675,6 +1681,124 @@ class WorkflowStore:
                 execution_id=execution_id, payload={"attempt_id": attempt_id, "lease_id": lease_id,
                                                      "producer_operation_id": producer_operation_id})
         return {"attempt_id": attempt_id, "lease_id": lease_id, "execution_id": execution_id, "operation_id": operation_id}
+
+    @staticmethod
+    def _normalize_verification_commands(manifest_binding: Mapping[str, Any]) -> list[dict[str, Any]]:
+        """Validate the immutable ordered command authority stored on an attempt."""
+        commands = manifest_binding.get("commands") if isinstance(manifest_binding, Mapping) else None
+        aggregate = manifest_binding.get("canonical_commands_sha256") if isinstance(manifest_binding, Mapping) else None
+        if not isinstance(commands, list) or not commands or not isinstance(aggregate, str):
+            raise ValidationFailure("verification command binding is incomplete")
+        normalized: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for command in commands:
+            if (not isinstance(command, Mapping) or set(command) != {"id", "argv", "timeout_seconds"}
+                    or not isinstance(command["id"], str) or not command["id"]
+                    or command["id"] in seen or not isinstance(command["argv"], list)
+                    or not command["argv"] or any(not isinstance(arg, str) or not arg for arg in command["argv"])
+                    or type(command["timeout_seconds"]) is not int or command["timeout_seconds"] < 1):
+                raise ValidationFailure("verification command binding is invalid")
+            seen.add(command["id"])
+            normalized.append({"id": command["id"], "argv": list(command["argv"]),
+                               "timeout_seconds": command["timeout_seconds"]})
+        actual = hashlib.sha256(_json({"version": 1, "commands": normalized}).encode()).hexdigest()
+        if aggregate != actual:
+            raise ValidationFailure("verification command binding hash is inconsistent")
+        return normalized
+
+    @staticmethod
+    def _command_hash(command: Mapping[str, Any]) -> str:
+        return hashlib.sha256(_json(dict(command)).encode()).hexdigest()
+
+    def _verification_command_state_unlocked(self, conn: sqlite3.Connection,
+                                               attempt: sqlite3.Row) -> tuple[str, list[sqlite3.Row]]:
+        """Return the only durable command-prefix states accepted by VERIFY.
+
+        INVALID includes legacy aggregate-only bindings and every corrupt or
+        impossible prefix.  Callers must retain ownership rather than infer a
+        successor or terminal outcome from such evidence.
+        """
+        rows = conn.execute("SELECT * FROM verification_command_results WHERE verification_attempt_id=? ORDER BY ordinal,id",
+                            (attempt["id"],)).fetchall()
+        try:
+            binding = json.loads(attempt["manifest_binding_json"])
+            bound = self._normalize_verification_commands(binding)
+            baseline = json.loads(attempt["baseline_repository_json"])
+            expected_control = baseline["control_state_fingerprint"]
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError, ValidationFailure):
+            return "INVALID", rows
+        if not isinstance(expected_control, str) or len(expected_control) != 64:
+            return "INVALID", rows
+        lease = conn.execute("""SELECT owner_instance_id,owner_host_id,owner_boot_id
+            FROM workspace_operation_leases WHERE lease_id=? AND attempt_id=?
+              AND operation_kind='verification'""",
+            (attempt["lease_id"], attempt["id"])).fetchone()
+        if lease is None:
+            return "INVALID", rows
+        saw_nonpass = False
+        for ordinal, row in enumerate(rows, 1):
+            if ordinal > len(bound) or row["ordinal"] != ordinal:
+                return "INVALID", rows
+            expected = bound[ordinal - 1]
+            if (row["command_id"] != expected["id"] or row["argv_json"] != _json(expected["argv"])
+                    or row["timeout_seconds"] != expected["timeout_seconds"]
+                    or row["canonical_command_sha256"] != self._command_hash(expected)
+                    or not row["intent_at"] or saw_nonpass):
+                return "INVALID", rows
+            if row["result_at"] is None:
+                if ordinal != len(rows):
+                    return "INVALID", rows
+                return "UNRESOLVED", rows
+            classification = row["classification"]
+            if (classification not in {"passed", "failed", "timed_out", "output_limited", "spawn_blocked", "repository_mutated"}
+                    or row["timed_out"] not in {0, 1} or row["output_truncated"] not in {0, 1}
+                    or type(row["output_bytes"]) is not int or row["output_bytes"] < 0
+                    or not isinstance(row["output_sha256"], str) or not re.fullmatch(r"[0-9a-f]{64}", row["output_sha256"])):
+                return "INVALID", rows
+            try:
+                inspection = json.loads(row["post_command_inspection_json"])
+            except (TypeError, json.JSONDecodeError):
+                return "INVALID", rows
+            safe = (isinstance(inspection, dict) and inspection.get("safe") is True
+                    and inspection.get("repository") == {key: value for key, value in baseline.items()
+                                                          if key != "control_state_fingerprint"}
+                    and inspection.get("control_state_fingerprint") == expected_control)
+            facts_match = ((classification == "passed" and row["exit_code"] == 0 and not row["timed_out"] and not row["output_truncated"])
+                or (classification == "failed" and type(row["exit_code"]) is int and row["exit_code"] != 0 and not row["timed_out"] and not row["output_truncated"])
+                or (classification == "timed_out" and row["timed_out"] == 1 and not row["output_truncated"])
+                or (classification == "output_limited" and not row["timed_out"] and row["output_truncated"] == 1)
+                or (classification == "spawn_blocked" and row["exit_code"] is None and not row["timed_out"] and not row["output_truncated"]
+                    and row["child_pid"] is None)
+                or (classification == "repository_mutated" and not safe))
+            if not facts_match:
+                return "INVALID", rows
+            if classification == "passed":
+                historical_identity_is_coherent = (
+                    isinstance(lease["owner_instance_id"], str) and lease["owner_instance_id"]
+                    and isinstance(lease["owner_host_id"], str) and lease["owner_host_id"]
+                    and isinstance(lease["owner_boot_id"], str) and lease["owner_boot_id"]
+                    and isinstance(row["child_owner_instance_id"], str)
+                    and row["child_owner_instance_id"] == lease["owner_instance_id"]
+                    and isinstance(row["child_host_id"], str)
+                    and row["child_host_id"] == lease["owner_host_id"]
+                    and isinstance(row["child_boot_id"], str)
+                    and row["child_boot_id"] == lease["owner_boot_id"]
+                    and type(row["child_pid"]) is int and row["child_pid"] > 0
+                    and isinstance(row["child_process_start"], str) and row["child_process_start"]
+                    and type(row["child_process_group"]) is int
+                    and row["child_process_group"] == row["child_pid"]
+                    and type(row["child_process_session"]) is int
+                    and row["child_process_session"] == row["child_pid"])
+                if not safe or not historical_identity_is_coherent:
+                    return "INVALID", rows
+                continue
+            if classification == "repository_mutated" or not safe:
+                return "UNSAFE", rows
+            saw_nonpass = True
+            if ordinal != len(rows):
+                return "INVALID", rows
+            return "KNOWN_NONPASS", rows
+        return ("EMPTY" if not rows else "COMPLETE_PASS" if len(rows) == len(bound) else "PASSING_PREFIX"), rows
 
     def find_verification_attempt(self, workflow_id: str, producer_operation_id: str,
                                   request_hash: str) -> Mapping[str, Any] | None:
@@ -1727,12 +1851,14 @@ class WorkflowStore:
                 task_state = task_states[0]
         commands = self._connection.execute("""SELECT * FROM verification_command_results
             WHERE verification_attempt_id=? ORDER BY ordinal""", (lease["attempt_id"],)).fetchall()
+        command_state = ("INVALID" if attempt is None else
+            self._verification_command_state_unlocked(self._connection, attempt)[0])
         return {"lease": lease, "attempt": None if attempt is None else dict(attempt),
                 "operation": None if operation is None else dict(operation),
                 "execution": None if execution is None else dict(execution),
                 "workflow": None if workflow is None else dict(workflow),
                 "task_state": None if task_state is None else dict(task_state),
-                "commands": [dict(row) for row in commands]}
+                "commands": [dict(row) for row in commands], "command_state": command_state}
 
     def retain_ambiguous_verification_recovery(self, workflow_id: str, *,
                                                evidence: Mapping[str, Any],
@@ -1779,22 +1905,24 @@ class WorkflowStore:
             attempt = conn.execute("SELECT status FROM verification_attempts WHERE id=? AND lease_id=?", (attempt_id, lease_id)).fetchone()
             if lease is None or attempt is None or attempt["status"] != "verifying":
                 raise ConflictFailure("verification command intent lacks exact active lease ownership")
+            full_attempt = conn.execute("SELECT * FROM verification_attempts WHERE id=?", (attempt_id,)).fetchone()
+            state, rows = self._verification_command_state_unlocked(conn, full_attempt)
             existing = conn.execute("SELECT * FROM verification_command_results WHERE verification_attempt_id=? AND ordinal=?",
                 (attempt_id, ordinal)).fetchone()
             if existing is not None:
                 if (existing["command_id"], existing["canonical_command_sha256"], existing["argv_json"], existing["timeout_seconds"]) != (
                         command_id, canonical_command_sha256, _json(list(argv)), timeout_seconds):
                     raise ConflictFailure("verification command ordinal is already bound differently")
+                if state != "UNRESOLVED" or not rows or rows[-1]["id"] != existing["id"]:
+                    raise ConflictFailure("verification command prefix does not permit idempotent intent")
                 return existing["id"]
-            if ordinal > 1:
-                previous = conn.execute("""SELECT result_at FROM verification_command_results
-                    WHERE verification_attempt_id=? AND ordinal=?""", (attempt_id, ordinal - 1)).fetchone()
-                if previous is None or previous["result_at"] is None:
-                    raise ConflictFailure("verification command ordinal requires the previous terminal result")
-            unresolved = conn.execute("""SELECT 1 FROM verification_command_results
-                WHERE verification_attempt_id=? AND result_at IS NULL""", (attempt_id,)).fetchone()
-            if unresolved is not None:
-                raise ConflictFailure("verification command intent is already unresolved")
+            if state not in {"EMPTY", "PASSING_PREFIX"} or ordinal != len(rows) + 1:
+                raise ConflictFailure("verification command prefix does not permit a successor")
+            bound = self._normalize_verification_commands(json.loads(full_attempt["manifest_binding_json"]))
+            expected = bound[ordinal - 1]
+            if (command_id, _json(list(argv)), timeout_seconds, canonical_command_sha256) != (
+                    expected["id"], _json(expected["argv"]), expected["timeout_seconds"], self._command_hash(expected)):
+                raise ConflictFailure("verification command intent does not match immutable binding")
             command_result_id, now = str(uuid.uuid4()), _now()
             conn.execute("""INSERT INTO verification_command_results
                 (id,verification_attempt_id,ordinal,command_id,canonical_command_sha256,argv_json,timeout_seconds,intent_at,created_at,updated_at)
@@ -1857,7 +1985,10 @@ class WorkflowStore:
                 raise ConflictFailure("verification child host/boot authority is inconsistent")
             command = conn.execute("""SELECT * FROM verification_command_results
                 WHERE id=? AND verification_attempt_id=?""", (command_result_id, attempt_id)).fetchone()
+            attempt = conn.execute("SELECT * FROM verification_attempts WHERE id=?", (attempt_id,)).fetchone()
+            state, rows = self._verification_command_state_unlocked(conn, attempt)
             if (command is None or command["result_at"] is not None
+                    or state != "UNRESOLVED" or not rows or rows[-1]["id"] != command_result_id
                     or any(command[field] is not None for field in (
                         "child_pid", "child_process_start", "child_process_group",
                         "child_process_session", "child_host_id", "child_boot_id",
@@ -1894,7 +2025,7 @@ class WorkflowStore:
                 (attempt_id,)).fetchone()
             if attempt_hint is None:
                 raise ConflictFailure("verification command result lacks an attempt")
-            _, lease, *_ = self._verification_transition_context_unlocked(conn,
+            attempt, lease, *_ = self._verification_transition_context_unlocked(conn,
                 attempt_hint["workflow_id"], attempt_id=attempt_id, lease_id=lease_id,
                 owner_instance_id=owner_instance_id)
             row = conn.execute("SELECT * FROM verification_command_results WHERE id=? AND verification_attempt_id=?",
@@ -1923,6 +2054,9 @@ class WorkflowStore:
                 (now, lease_id, attempt_id, lease["operation_id"], lease["workflow_id"], owner_instance_id))
             if cleared.rowcount != 1:
                 raise PersistenceFailure("verification command result lost exact lease ownership")
+            state, _ = self._verification_command_state_unlocked(conn, attempt)
+            if state == "INVALID":
+                raise ConflictFailure("verification command result contradicts durable facts")
 
     @staticmethod
     def _verification_authority_evidence(attempt: sqlite3.Row) -> dict[str, Any]:
@@ -2093,14 +2227,21 @@ class WorkflowStore:
                     final_inspection=final_inspection,
                     detail=detail or "verification outcome is unknown", recovery=False)
                 return
-            unresolved = conn.execute("""SELECT 1 FROM verification_command_results
-                WHERE verification_attempt_id=? AND result_at IS NULL LIMIT 1""",
-                (attempt["id"],)).fetchone()
-            if (unresolved is not None or any(lease[field] is not None for field in (
+            command_state, commands = self._verification_command_state_unlocked(conn, attempt)
+            if (any(lease[field] is not None for field in (
                     "child_pid", "child_process_start", "child_process_group",
                     "child_process_session"))):
                 raise ConflictFailure(
                     "verification normal completion retains unresolved child ownership")
+            if (outcome == "verified" and command_state != "COMPLETE_PASS"):
+                raise ConflictFailure("verified requires the complete passing command sequence")
+            if outcome == "verification_failed" and (command_state != "KNOWN_NONPASS"
+                    or commands[-1]["classification"] not in {"failed", "timed_out", "output_limited"}):
+                raise ConflictFailure("verification failure requires the first safe non-passing command")
+            if outcome == "verification_blocked" and not (command_state == "EMPTY"
+                    or (command_state == "KNOWN_NONPASS"
+                        and commands[-1]["classification"] == "spawn_blocked")):
+                raise ConflictFailure("verification blocked requires a safe spawn-blocked command")
             self._project_verification_terminal_unlocked(conn, attempt, lease, outcome=outcome,
                 final_inspection=final_inspection, detail=detail)
             deleted = conn.execute("""DELETE FROM workspace_operation_leases WHERE repository_key=?
@@ -2130,10 +2271,9 @@ class WorkflowStore:
                 conn, decision.workflow_id)
             if attempt["status"] != "verifying":
                 raise ConflictFailure("UNKNOWN verification ownership cannot be released")
-            commands = conn.execute("""SELECT * FROM verification_command_results
-                WHERE verification_attempt_id=? ORDER BY ordinal""", (attempt["id"],)).fetchall()
-            if not commands or any(row["ordinal"] != ordinal for ordinal, row in enumerate(commands, 1)):
-                raise ConflictFailure("verification recovery command authority is incomplete")
+            state, commands = self._verification_command_state_unlocked(conn, attempt)
+            if state not in {"UNRESOLVED", "PASSING_PREFIX", "COMPLETE_PASS"}:
+                raise ConflictFailure("verification recovery command prefix is not a valid passing prefix")
             unresolved = [row for row in commands if row["result_at"] is None]
             if len(unresolved) > 1 or (unresolved and unresolved[0]["id"] != commands[-1]["id"]):
                 raise ConflictFailure("verification recovery command state is ambiguous")
