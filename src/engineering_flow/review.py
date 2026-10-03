@@ -235,14 +235,15 @@ class ReviewRecoveryService:
         raw_result = attempt["terminal_result"]
         if raw_result:
             try:
-                result = json.loads(raw_result)
-                parse_reviewer_result(result)
+                parse_reviewer_result(json.loads(raw_result))
             except (TypeError, json.JSONDecodeError, ValidationFailure):
                 return self.store.recover_review_attempt(attempt["id"], classification="malformed_result",
                     detail="review recovery found malformed persisted terminal result", evidence=evidence)
+            # REVIEW persists no durable Reviewer-completion receipt. A raw,
+            # syntactically valid payload alone cannot prove that a Reviewer
+            # completed this exact intent, so recovery cannot project it.
             return self.store.recover_review_attempt(attempt["id"], classification="ambiguous_evidence",
-                detail="review recovery projects persisted valid terminal result", evidence=evidence,
-                reviewer_result=result)
+                detail="review recovery found unproven persisted terminal result", evidence=evidence)
         if (attempt["execution_lifecycle"] == "failed"
                 and attempt["failure_classification"] in {"provider", "provider_runtime_failure"}):
             return self.store.recover_review_attempt(attempt["id"], classification="provider_runtime_failure",
@@ -379,18 +380,18 @@ class ReviewAttemptOrchestrator:
         if pre_dispatch.fingerprint != preflight.verification["repository_fingerprint"]:
             raise ValidationFailure("repository drifted from verified REVIEW evidence before dispatch")
 
+        protected_control = control_state_fingerprint(pre_dispatch.canonical_root)
         intent = self.store.create_review_intent(workflow_id,
             task_contract_id=task_contract_id, task_contract_sha256=task_contract_sha256,
             authority_sha256=preflight.authority_sha256,
             verification_evidence_sha256=preflight.verification["verification_evidence_sha256"],
             request_hash=preflight.request_hash,
             repository_fingerprint=preflight.verification["repository_fingerprint"],
-            protected_control_sha256=control_state_fingerprint(pre_dispatch.canonical_root))
+            protected_control_sha256=protected_control)
         if not intent["created"]:
             # A retained prior intent is an explicit 5.4B recovery boundary.
             # This execution entry must never adopt or redispatch it.
             raise ValidationFailure("active REVIEW attempt requires recovery classification before dispatch")
-        protected_control = control_state_fingerprint(pre_dispatch.canonical_root)
         if self.before_dispatch:
             self.before_dispatch()
         try:

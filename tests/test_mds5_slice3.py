@@ -91,6 +91,26 @@ class Mds5Slice3Tests(unittest.TestCase):
         self.assertEqual(runtime.requests, [])
         self.assertEqual(self.store._connection.execute("SELECT count(*) FROM review_attempts").fetchone()[0], 0)
 
+    def test_before_dispatch_control_state_drift_stops_reviewer(self):
+        gitignore = self.root / ".gitignore"
+        gitignore.write_text(gitignore.read_text() + ".engineering-flow/control-state\n")
+        workflow, verification = self.verified()
+        control = self.root / ".engineering-flow" / "control-state"
+        control.write_text("original\n")
+        runtime = RecordingReviewer(self.passed)
+        runner = ReviewAttemptOrchestrator(self.store, runtime,
+            before_dispatch=lambda: control.write_text("drift\n"))
+        self.assertIsNone(runner.run_once(workflow.id,
+            task_contract_id=verification.producer.task_contract_id,
+            task_contract_sha256=verification.producer.task_contract_sha256))
+        self.assertEqual(runtime.requests, [])
+        self.assertEqual(self.store.get_workflow(workflow.id).status, WorkflowStatus.HUMAN_ATTENTION)
+        attempt = self.store._connection.execute(
+            "SELECT outcome,abnormal_classification FROM review_attempts").fetchone()
+        self.assertEqual(tuple(attempt), ("HUMAN_ATTENTION", "protected_state_drift"))
+        self.assertEqual(self.store._connection.execute(
+            "SELECT count(*) FROM review_findings").fetchone()[0], 0)
+
     def test_post_dispatch_repository_drift_never_becomes_a_normal_review_result(self):
         workflow, verification = self.verified()
         runtime = RecordingReviewer(self.passed, mutate=lambda: (self.root / "source.py").write_text("drift\n"))

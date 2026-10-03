@@ -63,15 +63,20 @@ class Mds5Slice4BRecoveryTests(unittest.TestCase):
         self.assertEqual(self.store.get_workflow(workflow.id).status, WorkflowStatus.REVIEW_FAILED)
         self.assert_no_side_effect_work()
 
-    def test_persisted_valid_terminal_result_is_projected_once(self):
+    def test_unproven_persisted_valid_terminal_result_fails_closed(self):
         workflow, _, intent = self.retained()
-        self.store._connection.execute("UPDATE executions SET lifecycle='completed',terminal_result=? WHERE id=?", (json.dumps(self.passed), intent["execution_id"]))
-        self.store._connection.execute("UPDATE operations SET status='completed' WHERE id=?", (intent["operation_id"],))
+        state = self.store._connection.execute("""SELECT o.status,e.lifecycle
+            FROM operations o JOIN executions e ON e.id=o.related_record_id WHERE o.id=?""",
+            (intent["operation_id"],)).fetchone()
+        self.assertEqual(tuple(state), ("pending", "intent"))
+        self.store._connection.execute("UPDATE executions SET terminal_result=? WHERE id=?", (json.dumps(self.passed), intent["execution_id"]))
         recovery = ReviewRecoveryService(self.store)
-        self.assertEqual(recovery.recover(workflow.id), "terminal_result")
+        self.assertEqual(recovery.recover(workflow.id), "ambiguous_evidence")
         self.assertEqual(recovery.recover(workflow.id), "already_terminal")
-        self.assertEqual(self.store.get_workflow(workflow.id).status, WorkflowStatus.TASK_REVIEW_PASSED)
-        self.assertEqual(self.store._connection.execute("SELECT count(*) FROM events WHERE type='review.attempt.terminal'").fetchone()[0], 1)
+        self.assertEqual(self.store.get_workflow(workflow.id).status, WorkflowStatus.HUMAN_ATTENTION)
+        self.assertEqual(self.store._connection.execute("SELECT count(*) FROM review_findings").fetchone()[0], 0)
+        self.assertEqual(self.store._connection.execute(
+            "SELECT count(*) FROM events WHERE type='review.attempt.terminal'").fetchone()[0], 0)
 
     def test_live_or_ownership_uncertain_execution_fails_closed(self):
         workflow, _, _ = self.retained()
