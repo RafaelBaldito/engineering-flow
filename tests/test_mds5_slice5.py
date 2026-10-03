@@ -128,7 +128,7 @@ class Mds5Slice5CliTests(unittest.TestCase):
         document = cli._result_document("status", workflow=self.store.get_workflow(workflow.id), data=self.payload(workflow))
         output = io.StringIO(); render_result(document, mode=OutputMode.HUMAN, stream=output)
         self.assertLess(output.getvalue().index("R-2"), output.getvalue().index("R-1"))
-        self.assertIn("no FIX", output.getvalue())
+        self.assertIn("bounded FIX", output.getvalue())
         self.assert_no_excluded_work()
 
     def test_review_failed_presentation(self):
@@ -146,7 +146,7 @@ class Mds5Slice5CliTests(unittest.TestCase):
         document = cli._result_document("logs", workflow=self.store.get_workflow(workflow.id), data=self.payload(workflow))
         output = io.StringIO(); render_result(document, mode=OutputMode.HUMAN, stream=output)
         self.assertIn("HUMAN_ATTENTION", output.getvalue())
-        self.assertIn("no Reviewer dispatch", output.getvalue())
+        self.assertIn("no Fixer, verifier, or Reviewer dispatch", output.getvalue())
 
     def test_logs_json_is_one_safe_document(self):
         workflow, _ = self.verified()

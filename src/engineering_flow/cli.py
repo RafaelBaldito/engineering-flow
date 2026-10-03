@@ -37,6 +37,7 @@ from .orchestrator import (CodexImplementationWriter, ImplementationAttemptOrche
                            IntakeOrchestrator, PlanningOrchestrator, V2HappyPathCoordinator,
                            V2PlanOrchestrator)
 from .review import ReviewContinuationService
+from .fix import FixContinuationService
 from .presentation import (OutputMode, create_progress_renderer, interactive_prompt_eligible,
                            prompt_for_clarification, prompt_for_plan_decision,
                            prompt_for_implementation_start,
@@ -230,6 +231,7 @@ def _plan_payload(store: WorkflowStore, workflow: Workflow, *, projection: Any =
     }
     review_attempts = store.list_review_attempt_projections(workflow.id)
     review_by_task = {attempt["task_contract_id"]: attempt for attempt in review_attempts}
+    fix_attempts = store.list_fix_attempt_projections(workflow.id)
     raw_plan = plan.get("plan") if isinstance(plan, dict) else None
     raw_tasks = raw_plan.get("tasks") if isinstance(raw_plan, dict) else None
     if isinstance(raw_tasks, list):
@@ -297,6 +299,10 @@ def _plan_payload(store: WorkflowStore, workflow: Workflow, *, projection: Any =
                           "review": {
                               "attempt_count": len(review_attempts),
                               "latest_attempt": review_attempts[0] if review_attempts else None,
+                          },
+                          "fix": {
+                              "attempt_count": len(fix_attempts),
+                              "latest_attempt": fix_attempts[0] if fix_attempts else None,
                           },
                       },
                       **projection_data, **plan}}
@@ -378,6 +384,12 @@ def _recovery_event_payload(event_type: str, payload: dict[str, Any]) -> dict[st
         safe = {key: payload[key] for key in ("attempt_id", "outcome", "classification", "finding_count", "recovery")
                 if key in payload}
         return safe
+    if event_type.startswith("fix."):
+        return {key: payload[key] for key in (
+            "attempt_id", "fix_attempt_id", "source_review_attempt_id", "verification_attempt_id",
+            "review_cycle", "max_review_cycles", "classification", "lease_retained",
+            "provider_result_sha256", "repository_fingerprint", "finding_ids",
+        ) if key in payload}
     recovery_types = {
         "verification.recovery.ambiguous_context": ("state_inconsistent", True),
         "verification.recovery.inconsistent_lease": ("state_inconsistent", True),
@@ -529,6 +541,13 @@ def _continue_approved_implementation(
 def _continue_review(workflow_id: str, *, store: WorkflowStore, runtime: Any) -> Workflow:
     """Invoke one review-layer continuation; CLI owns neither selection nor recovery."""
     ReviewContinuationService(store, runtime).continue_once(workflow_id)
+    return store.get_workflow(workflow_id)
+
+
+def _continue_fix(workflow_id: str, *, store: WorkflowStore, runtime: Any,
+                  max_review_cycles: int) -> Workflow:
+    """Invoke one remediation continuation; CLI owns no lifecycle policy."""
+    FixContinuationService(store, runtime, max_review_cycles=max_review_cycles).continue_once(workflow_id)
     return store.get_workflow(workflow_id)
 
 
@@ -861,6 +880,10 @@ def _run_command(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
                         interactive=(not args.json_output and interactive_prompt_eligible(sys.stdin, sys.stdout, sys.stderr)),
                         no_color=args.no_color,
                     )
+                elif (existing.status in {WorkflowStatus.TASK_CHANGES_REQUESTED, WorkflowStatus.FIXING}
+                      or store.has_retained_fix_attempt(existing.id)):
+                    workflow = _continue_fix(existing.id, store=store, runtime=plan_orchestrator.runtime,
+                        max_review_cycles=config.max_review_cycles)
                 elif (existing.status in {WorkflowStatus.PLAN_APPROVED, WorkflowStatus.IMPLEMENTATION_FAILED}
                       or store.active_implementation_lease(existing.id) is not None):
                     # The implementation orchestrator owns all authority,

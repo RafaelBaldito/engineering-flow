@@ -32,7 +32,7 @@ def control_state_fingerprint(root: str | Path) -> str:
     rows: list[bytes] = []
     for path in sorted(control.rglob("*")):
         if (("implementation-runtime" in path.parts or "verification-runtime" in path.parts
-             or "review-runtime" in path.parts) or not path.is_file()
+             or "review-runtime" in path.parts or "fix-runtime" in path.parts) or not path.is_file()
                 # SQLite/WAL bytes necessarily change as the parent persists
                 # lifecycle evidence.  Authority rows are revalidated by the
                 # store instead of pretending these volatile bytes are stable.

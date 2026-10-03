@@ -240,8 +240,8 @@ class RuntimeExecutionRequest:
         if self.execution_contract is ExecutionContract.LEGACY and any(capability_fields):
             raise ValueError("legacy requests cannot carry a canonical capability binding")
         if self.implementation_profile is not None:
-            if self.role is not Role.DEVELOPER or self.work_kind is not WorkKind.DEVELOP:
-                raise ValueError("implementation profile requires Developer IMPLEMENT work")
+            if self.role is not Role.DEVELOPER or self.work_kind not in (WorkKind.DEVELOP, WorkKind.FIX):
+                raise ValueError("implementation profile requires Developer IMPLEMENT or FIX work")
             if not self.requested_model or not self.requested_reasoning:
                 raise ValueError("implementation routing requires model and reasoning")
         elif self.requested_model is not None or self.requested_reasoning is not None:

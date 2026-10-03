@@ -93,6 +93,7 @@ class WorkflowStatus(_ValueEnum):
     REVIEW_FAILED = "review_failed"
     TASK_REVIEW_PASSED = "task_review_passed"
     TASK_CHANGES_REQUESTED = "task_changes_requested"
+    FIXING = "fixing"
 
 
 def is_terminal_workflow_status(status: WorkflowStatus) -> bool:
@@ -160,6 +161,7 @@ class TaskImplementationStatus(_ValueEnum):
     HUMAN_ATTENTION = "human_attention"
     REVIEW_PASSED = "review_passed"
     CHANGES_REQUESTED = "changes_requested"
+    FIXING = "fixing"
 
 
 class VerificationOutcome(_ValueEnum):

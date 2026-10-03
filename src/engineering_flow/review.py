@@ -297,7 +297,7 @@ class ReviewAttemptOrchestrator:
 
     def _resolver(self) -> ReviewPreflightResolver:
         return ReviewPreflightResolver(self.store.load_approved_v2_plan_authority,
-            self.store.load_successful_implementation_producer, self.store.load_verified_review_evidence)
+            self.store.load_successful_producer, self.store.load_verified_review_evidence)
 
     @staticmethod
     def _same_snapshot(first: RepositorySnapshot, second: RepositorySnapshot) -> bool:

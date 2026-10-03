@@ -679,7 +679,7 @@ class VerificationRecoveryService:
         authoritative_hash = authority_binding_sha256(authority,
             task_contract_id=attempt["task_contract_id"],
             task_contract_sha256=attempt["task_contract_sha256"])
-        producer = self.store.load_successful_implementation_producer(workflow_id,
+        producer = self.store.load_successful_producer(workflow_id,
             attempt["producer_operation_id"], attempt["task_contract_id"],
             attempt["task_contract_sha256"])
         if ((attempt.get("feature_artifact_id"), attempt.get("feature_sha256"))
@@ -940,7 +940,7 @@ class DeterministicVerificationOrchestrator:
             if authority_binding_sha256(authority, task_contract_id=preflight.producer.task_contract_id,
                 task_contract_sha256=preflight.producer.task_contract_sha256) != preflight.authority_sha256:
                 return False
-            producer = self.store.load_successful_implementation_producer(preflight.authority.workflow.id,
+            producer = self.store.load_successful_producer(preflight.authority.workflow.id,
                 preflight.producer.operation_id, preflight.producer.task_contract_id,
                 preflight.producer.task_contract_sha256)
             return producer == preflight.producer and VerificationManifestResolver(self.root).validate_unchanged(

@@ -340,7 +340,7 @@ class WorkflowStore:
             plan_sha256 TEXT NOT NULL CHECK(length(plan_sha256) = 64),
             task_contract_id TEXT NOT NULL,
             task_contract_sha256 TEXT NOT NULL CHECK(length(task_contract_sha256) = 64),
-            status TEXT NOT NULL CHECK(status IN ('pending', 'implementing', 'implementation_completed', 'implementation_failed', 'implementation_unknown', 'verifying', 'verification_failed', 'verified')),
+            status TEXT NOT NULL CHECK(status IN ('pending', 'implementing', 'implementation_completed', 'implementation_failed', 'implementation_unknown', 'verifying', 'verification_failed', 'verified', 'reviewing', 'review_failed', 'human_attention', 'review_passed', 'changes_requested', 'fixing')),
             selected_at TEXT,
             updated_at TEXT NOT NULL,
             UNIQUE(workflow_id, plan_artifact_id, task_contract_id)
@@ -440,6 +440,38 @@ class WorkflowStore:
         BEFORE UPDATE ON review_attempts WHEN OLD.status='terminal' BEGIN
             SELECT RAISE(ABORT, 'terminal review attempts are immutable');
         END;
+        CREATE TABLE IF NOT EXISTS fix_attempts (
+            id TEXT PRIMARY KEY, workflow_id TEXT NOT NULL REFERENCES workflows(id),
+            source_review_attempt_id TEXT NOT NULL REFERENCES review_attempts(id),
+            source_reviewer_result_sha256 TEXT NOT NULL CHECK(length(source_reviewer_result_sha256) = 64),
+            source_producer_operation_id TEXT NOT NULL REFERENCES operations(id),
+            source_verification_attempt_id TEXT NOT NULL REFERENCES verification_attempts(id),
+            source_verification_evidence_sha256 TEXT NOT NULL CHECK(length(source_verification_evidence_sha256) = 64),
+            execution_id TEXT NOT NULL UNIQUE REFERENCES executions(id), operation_id TEXT NOT NULL UNIQUE REFERENCES operations(id),
+            lease_id TEXT NOT NULL UNIQUE, feature_artifact_id TEXT NOT NULL REFERENCES artifacts(id), feature_sha256 TEXT NOT NULL,
+            plan_artifact_id TEXT NOT NULL REFERENCES artifacts(id), plan_sha256 TEXT NOT NULL, plan_revision INTEGER NOT NULL,
+            plan_id TEXT NOT NULL, approval_id TEXT NOT NULL REFERENCES approvals(id), task_contract_id TEXT NOT NULL,
+            task_contract_sha256 TEXT NOT NULL, authority_sha256 TEXT NOT NULL CHECK(length(authority_sha256) = 64),
+            remediation_cycle_ordinal INTEGER NOT NULL CHECK(remediation_cycle_ordinal > 0),
+            fix_attempt_ordinal INTEGER NOT NULL CHECK(fix_attempt_ordinal = 1),
+            max_review_cycles INTEGER NOT NULL CHECK(max_review_cycles > 0), request_hash TEXT NOT NULL CHECK(length(request_hash) = 64),
+            requested_profile TEXT NOT NULL, requested_provider TEXT NOT NULL, baseline_repository_json TEXT NOT NULL,
+            final_repository_json TEXT, status TEXT NOT NULL, outcome TEXT, provider_result_sha256 TEXT,
+            abnormal_evidence_json TEXT, started_at TEXT, finished_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+            UNIQUE(source_review_attempt_id, source_reviewer_result_sha256, fix_attempt_ordinal)
+        );
+        CREATE TABLE IF NOT EXISTS fix_attempt_finding_bindings (
+            id TEXT PRIMARY KEY, fix_attempt_id TEXT NOT NULL REFERENCES fix_attempts(id),
+            review_finding_row_id TEXT NOT NULL REFERENCES review_findings(id), source_ordinal INTEGER NOT NULL CHECK(source_ordinal > 0),
+            finding_id TEXT NOT NULL, finding_sha256 TEXT NOT NULL CHECK(length(finding_sha256) = 64),
+            severity TEXT NOT NULL, created_at TEXT NOT NULL,
+            UNIQUE(fix_attempt_id, source_ordinal), UNIQUE(fix_attempt_id, review_finding_row_id),
+            UNIQUE(fix_attempt_id, finding_id)
+        );
+        CREATE TRIGGER IF NOT EXISTS fix_attempt_finding_bindings_no_update
+        BEFORE UPDATE ON fix_attempt_finding_bindings BEGIN SELECT RAISE(ABORT, 'fix finding bindings are immutable'); END;
+        CREATE TRIGGER IF NOT EXISTS fix_attempt_finding_bindings_no_delete
+        BEFORE DELETE ON fix_attempt_finding_bindings BEGIN SELECT RAISE(ABORT, 'fix finding bindings are immutable'); END;
         CREATE TABLE IF NOT EXISTS operations (
             id TEXT PRIMARY KEY,
             idempotency_key TEXT NOT NULL UNIQUE,
@@ -721,7 +753,7 @@ class WorkflowStore:
                 task_state_sql = self._connection.execute(
                     "SELECT sql FROM sqlite_master WHERE type='table' AND name='task_implementation_states'"
                 ).fetchone()["sql"]
-                if "'review_failed'" not in task_state_sql:
+                if "'fixing'" not in task_state_sql:
                     self._connection.executescript("""
                         ALTER TABLE task_implementation_states RENAME TO task_implementation_states_legacy;
                         CREATE TABLE task_implementation_states (
@@ -731,7 +763,7 @@ class WorkflowStore:
                             plan_sha256 TEXT NOT NULL CHECK(length(plan_sha256) = 64),
                             task_contract_id TEXT NOT NULL,
                             task_contract_sha256 TEXT NOT NULL CHECK(length(task_contract_sha256) = 64),
-                            status TEXT NOT NULL CHECK(status IN ('pending', 'implementing', 'implementation_completed', 'implementation_failed', 'implementation_unknown', 'verifying', 'verification_failed', 'verified', 'reviewing', 'review_failed', 'human_attention', 'review_passed', 'changes_requested')),
+                            status TEXT NOT NULL CHECK(status IN ('pending', 'implementing', 'implementation_completed', 'implementation_failed', 'implementation_unknown', 'verifying', 'verification_failed', 'verified', 'reviewing', 'review_failed', 'human_attention', 'review_passed', 'changes_requested', 'fixing')),
                             selected_at TEXT,
                             updated_at TEXT NOT NULL,
                             UNIQUE(workflow_id, plan_artifact_id, task_contract_id)
@@ -1288,6 +1320,7 @@ class WorkflowStore:
                             WorkflowStatus.REVIEWING,
                             WorkflowStatus.TASK_REVIEW_PASSED,
                             WorkflowStatus.TASK_CHANGES_REQUESTED,
+                            WorkflowStatus.FIXING,
                         })
                         or (allow_human_attention and workflow.stage is Stage.TASK_EXECUTION
                             and workflow.status is WorkflowStatus.HUMAN_ATTENTION))):
@@ -1334,11 +1367,11 @@ class WorkflowStore:
         return ApprovedV2PlanAuthority(workflow, feature_artifact, feature,
                                        plan_artifact, plan, approval)
 
-    def load_successful_implementation_producer(
+    def load_successful_producer(
         self, workflow_id: str, operation_id: str, task_contract_id: str,
         task_contract_sha256: str,
     ) -> SuccessfulImplementationProducer:
-        """Load only durable MDS #3 IMPLEMENT evidence eligible for VERIFY.
+        """Load one exact successful IMPLEMENT or FIX evidence chain for VERIFY.
 
         The join deliberately proves all relationships at the persistence
         boundary, so callers cannot turn an arbitrary completed operation ID
@@ -1346,7 +1379,11 @@ class WorkflowStore:
         """
         if not operation_id:
             raise ValidationFailure("verification requires a producer operation")
-        row = self._connection.execute("""SELECT o.id AS operation_id, o.kind AS operation_kind,
+        operation = self._connection.execute("SELECT kind FROM operations WHERE id=?", (operation_id,)).fetchone()
+        if operation is None:
+            raise ValidationFailure("verification producer operation is missing")
+        if operation["kind"] == "implementation":
+            row = self._connection.execute("""SELECT o.id AS operation_id, o.kind AS operation_kind,
             o.workflow_id AS operation_workflow_id, o.status AS operation_status,
             o.related_record_id AS operation_execution_id, a.*, e.workflow_id AS execution_workflow_id,
             e.lifecycle AS execution_lifecycle, e.role AS execution_role, e.request_hash AS execution_request_hash,
@@ -1356,19 +1393,82 @@ class WorkflowStore:
             LEFT JOIN executions e ON e.id=a.execution_id
             LEFT JOIN workflows w ON w.id=o.workflow_id
             WHERE o.id=?""", (operation_id,)).fetchone()
+        elif operation["kind"] == "fix":
+            row = self._connection.execute("""SELECT o.id AS operation_id, o.kind AS operation_kind,
+                o.workflow_id AS operation_workflow_id, o.status AS operation_status,
+                o.related_record_id AS operation_execution_id, a.*, e.workflow_id AS execution_workflow_id,
+                e.lifecycle AS execution_lifecycle, e.role AS execution_role, e.request_hash AS execution_request_hash,
+                w.repository_path AS workflow_repository_path
+                FROM operations o
+                LEFT JOIN fix_attempts a ON a.operation_id=o.id
+                LEFT JOIN executions e ON e.id=a.execution_id
+                LEFT JOIN workflows w ON w.id=o.workflow_id
+                WHERE o.id=?""", (operation_id,)).fetchone()
+        else:
+            raise ValidationFailure("verification producer operation has an unsupported kind")
         if row is None:
             raise ValidationFailure("verification producer operation is missing")
-        if (row["operation_kind"] != "implementation" or row["operation_status"] != OperationStatus.COMPLETED.value
+        if (row["operation_kind"] not in {"implementation", "fix"} or row["operation_status"] != OperationStatus.COMPLETED.value
                 or row["operation_workflow_id"] != workflow_id or row["workflow_id"] != workflow_id
                 or row["execution_workflow_id"] != workflow_id or row["operation_execution_id"] != row["execution_id"]
                 or row["execution_lifecycle"] != ExecutionLifecycle.COMPLETED.value
                 or row["execution_role"] != Role.DEVELOPER.value):
-            raise ValidationFailure("verification producer operation is not a successful IMPLEMENT operation")
-        if (row["result_classification"] != "completed_changed" or row["status"] not in {"completed", "succeeded"}
+            raise ValidationFailure("verification producer operation is not a successful IMPLEMENT operation"
+                                    if row["operation_kind"] == "implementation" else
+                                    "verification producer operation is not a successful FIX operation")
+        successful = ((row["operation_kind"] == "implementation"
+                       and row["result_classification"] == "completed_changed"
+                       and row["status"] in {"completed", "succeeded"})
+                      or (row["operation_kind"] == "fix"
+                          and row["status"] == "completed" and row["outcome"] == "completed"
+                          and isinstance(row["provider_result_sha256"], str)))
+        if (not successful
                 or row["task_contract_id"] != task_contract_id
                 or row["task_contract_sha256"] != task_contract_sha256
                 or row["request_hash"] != row["execution_request_hash"]):
-            raise ValidationFailure("verification producer operation does not match the selected implementation")
+            raise ValidationFailure("verification producer operation does not match the selected implementation"
+                                    if row["operation_kind"] == "implementation" else
+                                    "verification FIX producer operation does not match the selected task")
+        if row["operation_kind"] == "fix":
+            source = self._connection.execute("""SELECT r.id,r.outcome,r.reviewer_result_sha256,
+                r.task_contract_id,r.task_contract_sha256,r.producer_operation_id,r.verification_attempt_id,
+                r.verification_evidence_sha256
+                FROM review_attempts r WHERE r.id=?""", (row["source_review_attempt_id"],)).fetchone()
+            bindings = self._connection.execute("""SELECT b.source_ordinal,b.finding_id,b.severity,b.finding_sha256,
+                b.review_finding_row_id,f.review_attempt_id,f.ordinal,f.finding_id AS source_finding_id,
+                f.severity AS source_severity,f.category,f.description,f.path,f.line,f.requirement_reference
+                FROM fix_attempt_finding_bindings b LEFT JOIN review_findings f ON f.id=b.review_finding_row_id
+                WHERE b.fix_attempt_id=? ORDER BY b.source_ordinal""", (row["id"],)).fetchall()
+            findings = self._connection.execute("""SELECT id,ordinal,finding_id,severity,category,description,path,line,
+                requirement_reference FROM review_findings WHERE review_attempt_id=? ORDER BY ordinal""",
+                (row["source_review_attempt_id"],)).fetchall()
+            exact_bindings = len(bindings) == len(findings) and bool(findings)
+            if exact_bindings:
+                for binding, finding in zip(bindings, findings):
+                    payload = {"id": finding["finding_id"], "severity": finding["severity"],
+                        "category": finding["category"], "description": finding["description"],
+                        "path": finding["path"], "line": finding["line"],
+                        "requirement_reference": finding["requirement_reference"]}
+                    exact_bindings = (binding["review_finding_row_id"] == finding["id"]
+                        and binding["review_attempt_id"] == row["source_review_attempt_id"]
+                        and binding["source_ordinal"] == finding["ordinal"]
+                        and binding["finding_id"] == finding["finding_id"]
+                        and binding["severity"] == finding["severity"]
+                        and binding["source_finding_id"] == finding["finding_id"]
+                        and binding["source_severity"] == finding["severity"]
+                        and binding["finding_sha256"] == hashlib.sha256(_json(payload).encode()).hexdigest())
+                    if not exact_bindings:
+                        break
+            required_blocking = any(finding["severity"] == "blocking" for finding in findings)
+            if (source is None or source["outcome"] != "CHANGES_REQUESTED"
+                    or source["reviewer_result_sha256"] != row["source_reviewer_result_sha256"]
+                    or source["task_contract_id"] != task_contract_id
+                    or source["task_contract_sha256"] != task_contract_sha256
+                    or source["producer_operation_id"] != row["source_producer_operation_id"]
+                    or source["verification_attempt_id"] != row["source_verification_attempt_id"]
+                    or source["verification_evidence_sha256"] != row["source_verification_evidence_sha256"]
+                    or not exact_bindings or not required_blocking):
+                raise ValidationFailure("verification FIX producer provenance is stale or inconsistent")
         raw_final = row["final_repository_json"]
         try:
             final = json.loads(raw_final) if raw_final else None
@@ -1403,6 +1503,13 @@ class WorkflowStore:
             final_repository_sha256=digest, final_repository_fingerprint=fingerprint,
         )
 
+    # Kept as a compatibility entry point for MDS #4/#5 callers.  Its
+    # implementation is deliberately generalized at the producer seam above.
+    def load_successful_implementation_producer(self, workflow_id: str, operation_id: str,
+                                                task_contract_id: str, task_contract_sha256: str,
+                                                ) -> SuccessfulImplementationProducer:
+        return self.load_successful_producer(workflow_id, operation_id, task_contract_id, task_contract_sha256)
+
     def load_verified_review_evidence(self, workflow_id: str, task_contract_id: str,
                                       task_contract_sha256: str, *,
                                       allow_reviewing: bool = False) -> Mapping[str, Any]:
@@ -1432,12 +1539,16 @@ class WorkflowStore:
             e.request_hash AS execution_request_hash FROM verification_attempts a
             JOIN operations o ON o.id=a.operation_id JOIN executions e ON e.id=a.execution_id
             WHERE a.workflow_id=? AND a.task_contract_id=? AND a.task_contract_sha256=?
-              AND a.status='terminal' AND a.classification='verified'""",
+              AND a.status='terminal' AND a.classification='verified'
+            ORDER BY a.finished_at DESC, a.rowid DESC""",
             (workflow_id, task_contract_id, task_contract_sha256)).fetchall()
-        if len(rows) != 1:
-            raise ValidationFailure("REVIEW requires exactly one terminal verified attempt")
+        if not rows:
+            raise ValidationFailure("REVIEW requires a terminal verified attempt")
+        # A post-FIX re-verification is a new immutable attempt.  The newest
+        # terminal record is the only candidate for a future fresh REVIEW;
+        # earlier verification evidence remains historical provenance.
         row = rows[0]
-        producer = self.load_successful_implementation_producer(workflow_id, row["producer_operation_id"], task_contract_id, task_contract_sha256)
+        producer = self.load_successful_producer(workflow_id, row["producer_operation_id"], task_contract_id, task_contract_sha256)
         expected_authority = hashlib.sha256(_json({"workflow_id": workflow_id,
             "feature_artifact_id": authority.feature_contract_artifact.id, "feature_sha256": authority.feature_contract_artifact.sha256,
             "plan_artifact_id": authority.plan_artifact.id, "plan_sha256": authority.plan_artifact.sha256,
@@ -1477,6 +1588,488 @@ class WorkflowStore:
         return {"attempt_id": row["id"], "producer_operation_id": row["producer_operation_id"],
             "verification_request_hash": row["request_hash"], "verification_authority_sha256": row["authority_sha256"],
             "verification_evidence_sha256": digest, "repository_fingerprint": final.get("fingerprint")}
+
+    def load_fix_source_review_evidence(self, workflow_id: str, task_contract_id: str,
+                                        task_contract_sha256: str) -> Mapping[str, Any]:
+        """Load one immutable MDS #5 CHANGES_REQUESTED result for FIX preflight.
+
+        This is intentionally a read-only projection.  It neither creates a
+        Fix attempt nor interprets provider claims as a resolved finding.
+        """
+        from .review import parse_reviewer_result
+
+        authority = self.load_approved_v2_plan_authority(workflow_id)
+        if (authority.workflow.stage is not Stage.TASK_EXECUTION
+                or authority.workflow.status is not WorkflowStatus.TASK_CHANGES_REQUESTED):
+            raise ValidationFailure("FIX requires TASK_CHANGES_REQUESTED workflow authority")
+        task = next((item for item in authority.plan.tasks if item.id == task_contract_id), None)
+        if task is None or task.payload_sha256() != task_contract_sha256:
+            raise ValidationFailure("FIX Task Contract does not match approved authority")
+        state_rows = self._connection.execute("""SELECT * FROM task_implementation_states
+            WHERE workflow_id=? AND plan_artifact_id=? AND task_contract_id=?""",
+            (workflow_id, authority.plan_artifact.id, task_contract_id)).fetchall()
+        if (len(state_rows) != 1 or state_rows[0]["status"] != "changes_requested"
+                or state_rows[0]["plan_sha256"] != authority.plan_artifact.sha256
+                or state_rows[0]["task_contract_sha256"] != task_contract_sha256):
+            raise ValidationFailure("FIX task state is not exactly changes_requested")
+        rows = self._connection.execute("""SELECT a.*, e.terminal_result
+            FROM review_attempts a JOIN executions e ON e.id=a.execution_id
+            WHERE a.workflow_id=? AND a.task_contract_id=? AND a.task_contract_sha256=?
+              AND a.status='terminal' ORDER BY a.sequence""",
+            (workflow_id, task_contract_id, task_contract_sha256)).fetchall()
+        if not rows:
+            raise ValidationFailure("FIX requires a terminal source review")
+        # Earlier terminal reviews are immutable historical evidence, not an
+        # ambiguity.  The highest durable task-scoped review cycle is the only
+        # unresolved round that may authorize this FIX.
+        newest = max(row["sequence"] for row in rows)
+        candidates = [row for row in rows if row["sequence"] == newest]
+        if len(candidates) != 1:
+            raise ValidationFailure("FIX current source review cycle is ambiguous")
+        row = candidates[0]
+        if row["outcome"] != "CHANGES_REQUESTED" or not row["reviewer_result_sha256"]:
+            raise ValidationFailure("FIX source review is not CHANGES_REQUESTED")
+        expected_authority = hashlib.sha256(_json({"workflow_id": workflow_id,
+            "feature_artifact_id": authority.feature_contract_artifact.id, "feature_sha256": authority.feature_contract_artifact.sha256,
+            "plan_artifact_id": authority.plan_artifact.id, "plan_sha256": authority.plan_artifact.sha256,
+            "plan_id": authority.plan.id, "plan_revision": authority.plan.revision,
+            "approval_id": authority.approval.id, "task_contract_id": task_contract_id,
+            "task_contract_sha256": task_contract_sha256}).encode()).hexdigest()
+        if row["authority_sha256"] != expected_authority:
+            raise ValidationFailure("FIX source review authority is stale or inconsistent")
+        self.load_successful_producer(workflow_id, row["producer_operation_id"],
+            task_contract_id, task_contract_sha256)
+        try:
+            raw_result = json.loads(row["terminal_result"])
+            result = parse_reviewer_result(raw_result)
+        except (TypeError, json.JSONDecodeError, ValidationFailure) as exc:
+            raise ValidationFailure("FIX source reviewer result is missing or malformed") from exc
+        findings = self._connection.execute("""SELECT ordinal,finding_id,severity,category,description,
+            path,line,requirement_reference FROM review_findings WHERE review_attempt_id=? ORDER BY ordinal""",
+            (row["id"],)).fetchall()
+        persisted = [{"id": item["finding_id"], "severity": item["severity"], "category": item["category"],
+                      "description": item["description"], "path": item["path"], "line": item["line"],
+                      "requirement_reference": item["requirement_reference"]} for item in findings]
+        if (result.outcome != "CHANGES_REQUESTED" or result.sha256() != row["reviewer_result_sha256"]
+                or [item.as_payload() for item in result.findings] != persisted
+                or not any(item.severity == "blocking" for item in result.findings)):
+            raise ValidationFailure("FIX source findings are stale, incomplete, or inconsistent")
+        return {"attempt_id": row["id"], "producer_operation_id": row["producer_operation_id"],
+            "verification_attempt_id": row["verification_attempt_id"],
+            "reviewer_result_sha256": row["reviewer_result_sha256"], "authority_sha256": row["authority_sha256"],
+            "verification_evidence_sha256": row["verification_evidence_sha256"],
+            "repository_fingerprint": row["repository_fingerprint"], "protected_control_sha256": row["protected_control_sha256"], "task_contract_id": task_contract_id,
+            "task_contract_sha256": task_contract_sha256, "review_cycle": row["sequence"],
+            "summary": result.summary, "findings": persisted}
+
+    def create_fix_intent(
+        self, workflow_id: str, *, repository_key: str, canonical_root: str,
+        task_contract_id: str, task_contract_sha256: str, source_review_attempt_id: str,
+        source_reviewer_result_sha256: str, source_producer_operation_id: str,
+        source_verification_attempt_id: str, source_verification_evidence_sha256: str,
+        authority_sha256: str, request_hash: str, max_review_cycles: int,
+        baseline: Mapping[str, Any], owner_instance_id: str, owner_pid: int,
+        owner_host_id: str, owner_boot_id: str | None = None,
+        requested_profile: str = "efficient", requested_provider: str = "fix",
+    ) -> dict[str, str | bool]:
+        """Atomically persist one evidence-bound FIX intent without dispatching it.
+
+        Every source binding is reloaded from immutable MDS #5 evidence while
+        this transaction owns the writer lock.  A retry is deliberately not a
+        legal outcome here: only ordinal one can be inserted for a source.
+        """
+        for value, name in ((task_contract_sha256, "task_contract_sha256"),
+                            (source_reviewer_result_sha256, "source_reviewer_result_sha256"),
+                            (source_verification_evidence_sha256, "source_verification_evidence_sha256"),
+                            (authority_sha256, "authority_sha256"), (request_hash, "request_hash")):
+            self._require_sha256(value, name)
+        if (type(max_review_cycles) is not int or max_review_cycles < 1
+                or not isinstance(baseline, Mapping)
+                or not all(isinstance(value, str) and value for value in (
+                    repository_key, canonical_root, task_contract_id, source_review_attempt_id,
+                    source_producer_operation_id, source_verification_attempt_id,
+                    owner_instance_id, owner_host_id, requested_profile, requested_provider))):
+            raise ValidationFailure("FIX intent has incomplete identity bindings")
+        with self._transaction() as conn:
+            existing = conn.execute("""SELECT * FROM fix_attempts WHERE source_review_attempt_id=?
+                AND source_reviewer_result_sha256=? AND fix_attempt_ordinal=1""",
+                (source_review_attempt_id, source_reviewer_result_sha256)).fetchone()
+            if existing is not None:
+                exact = (existing["workflow_id"] == workflow_id
+                    and existing["task_contract_id"] == task_contract_id
+                    and existing["task_contract_sha256"] == task_contract_sha256
+                    and existing["request_hash"] == request_hash
+                    and existing["authority_sha256"] == authority_sha256
+                    and existing["source_producer_operation_id"] == source_producer_operation_id
+                    and existing["source_verification_attempt_id"] == source_verification_attempt_id
+                    and existing["source_verification_evidence_sha256"] == source_verification_evidence_sha256
+                    and existing["max_review_cycles"] == max_review_cycles
+                    and existing["status"] == "fixing")
+                lease = conn.execute("""SELECT 1 FROM workspace_operation_leases WHERE lease_id=?
+                    AND attempt_id=? AND operation_id=? AND operation_kind='fix'""",
+                    (existing["lease_id"], existing["id"], existing["operation_id"])).fetchone()
+                if not exact or lease is None:
+                    raise ConflictFailure("existing FIX intent is not safely reusable")
+                return {"attempt_id": existing["id"], "lease_id": existing["lease_id"],
+                        "execution_id": existing["execution_id"], "operation_id": existing["operation_id"],
+                        "created": False}
+            if conn.execute("SELECT 1 FROM workspace_operation_leases WHERE repository_key=?", (repository_key,)).fetchone():
+                raise ConflictFailure("target workspace already has an unresolved operation lease")
+            authority = self.load_approved_v2_plan_authority(workflow_id)
+            if (authority.workflow.stage is not Stage.TASK_EXECUTION
+                    or authority.workflow.status is not WorkflowStatus.TASK_CHANGES_REQUESTED):
+                raise ConflictFailure("FIX intent requires TASK_CHANGES_REQUESTED")
+            source = self.load_fix_source_review_evidence(workflow_id, task_contract_id, task_contract_sha256)
+            if (source["attempt_id"] != source_review_attempt_id
+                    or source["reviewer_result_sha256"] != source_reviewer_result_sha256
+                    or source["producer_operation_id"] != source_producer_operation_id
+                    or source["verification_attempt_id"] != source_verification_attempt_id
+                    or source["verification_evidence_sha256"] != source_verification_evidence_sha256
+                    or source["authority_sha256"] != authority_sha256):
+                raise ConflictFailure("FIX source review authority is stale or inconsistent")
+            source_control = source.get("protected_control_sha256")
+            if (not isinstance(source_control, str) or len(source_control) != 64
+                    or baseline.get("control_state_fingerprint") != source_control):
+                raise ConflictFailure("FIX protected control state is stale or inconsistent")
+            if source["review_cycle"] >= max_review_cycles:
+                raise ConflictFailure("FIX source review reached max_review_cycles")
+            task = next((item for item in authority.plan.tasks if item.id == task_contract_id), None)
+            if task is None or task.payload_sha256() != task_contract_sha256:
+                raise ConflictFailure("FIX Task Contract no longer matches approved Plan")
+            source_rows = conn.execute("""SELECT * FROM review_findings WHERE review_attempt_id=?
+                ORDER BY ordinal""", (source_review_attempt_id,)).fetchall()
+            expected = source["findings"]
+            if len(source_rows) != len(expected) or not source_rows:
+                raise ConflictFailure("FIX source findings are incomplete or inconsistent")
+            for ordinal, (row, finding) in enumerate(zip(source_rows, expected), 1):
+                payload = {"id": row["finding_id"], "severity": row["severity"], "category": row["category"],
+                           "description": row["description"], "path": row["path"], "line": row["line"],
+                           "requirement_reference": row["requirement_reference"]}
+                if row["ordinal"] != ordinal or payload != finding:
+                    raise ConflictFailure("FIX source finding bindings are stale or foreign")
+            if not any(row["severity"] == "blocking" for row in source_rows):
+                raise ConflictFailure("FIX source review has no blocking findings")
+            state = conn.execute("""SELECT id FROM task_implementation_states WHERE workflow_id=?
+                AND plan_artifact_id=? AND task_contract_id=? AND task_contract_sha256=? AND status='changes_requested'""",
+                (workflow_id, authority.plan_artifact.id, task_contract_id, task_contract_sha256)).fetchone()
+            if state is None:
+                raise ConflictFailure("FIX intent requires exactly changes_requested task state")
+            now, attempt_id, lease_id, execution_id, operation_id = (
+                _now(), str(uuid.uuid4()), str(uuid.uuid4()), str(uuid.uuid4()), str(uuid.uuid4()))
+            session = self._create_session_unlocked(conn, workflow_id, requested_provider, Role.DEVELOPER,
+                                                    work_kind=WorkKind.FIX)
+            conn.execute("""INSERT INTO executions
+                (id,workflow_id,session_id,role,request_hash,lifecycle,capability_report,work_kind,created_at,updated_at)
+                VALUES (?,?,?,?,?,'intent','{}',?,?,?)""",
+                (execution_id, workflow_id, session.id, Role.DEVELOPER.value, request_hash, WorkKind.FIX.value, now, now))
+            conn.execute("""INSERT INTO operations
+                (id,idempotency_key,kind,workflow_id,status,related_record_id,work_kind,created_at,updated_at)
+                VALUES (?,?,?,?,?,?,?, ?,?)""",
+                (operation_id, f"fix:{attempt_id}", "fix", workflow_id, "pending", execution_id,
+                 WorkKind.FIX.value, now, now))
+            conn.execute("""INSERT INTO fix_attempts
+                (id,workflow_id,source_review_attempt_id,source_reviewer_result_sha256,source_producer_operation_id,
+                 source_verification_attempt_id,source_verification_evidence_sha256,execution_id,operation_id,lease_id,
+                 feature_artifact_id,feature_sha256,plan_artifact_id,plan_sha256,plan_revision,plan_id,approval_id,
+                 task_contract_id,task_contract_sha256,authority_sha256,remediation_cycle_ordinal,fix_attempt_ordinal,
+                 max_review_cycles,request_hash,requested_profile,requested_provider,baseline_repository_json,status,
+                 created_at,updated_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,?,?,?,?,?,'fixing',?,?)""",
+                (attempt_id, workflow_id, source_review_attempt_id, source_reviewer_result_sha256,
+                 source_producer_operation_id, source_verification_attempt_id, source_verification_evidence_sha256,
+                 execution_id, operation_id, lease_id, authority.feature_contract_artifact.id,
+                 authority.feature_contract_artifact.sha256, authority.plan_artifact.id, authority.plan_artifact.sha256,
+                 authority.plan.revision, authority.plan.id, authority.approval.id, task_contract_id,
+                 task_contract_sha256, authority_sha256, source["review_cycle"], max_review_cycles, request_hash,
+                 requested_profile, requested_provider, _json(dict(baseline)), now, now))
+            for row in source_rows:
+                finding_payload = {"id": row["finding_id"], "severity": row["severity"], "category": row["category"],
+                    "description": row["description"], "path": row["path"], "line": row["line"],
+                    "requirement_reference": row["requirement_reference"]}
+                conn.execute("""INSERT INTO fix_attempt_finding_bindings
+                    (id,fix_attempt_id,review_finding_row_id,source_ordinal,finding_id,finding_sha256,severity,created_at)
+                    VALUES (?,?,?,?,?,?,?,?)""", (str(uuid.uuid4()), attempt_id, row["id"], row["ordinal"],
+                    row["finding_id"], hashlib.sha256(_json(finding_payload).encode()).hexdigest(), row["severity"], now))
+            conn.execute("""INSERT INTO workspace_operation_leases
+                (repository_key,lease_id,operation_kind,attempt_id,operation_id,workflow_id,canonical_root,
+                 owner_instance_id,owner_pid,owner_host_id,owner_boot_id,acquired_at,updated_at)
+                VALUES (?,?,'fix',?,?,?,?,?,?,?,?,?,?)""",
+                (repository_key, lease_id, attempt_id, operation_id, workflow_id, canonical_root,
+                 owner_instance_id, owner_pid, owner_host_id, owner_boot_id, now, now))
+            conn.execute("UPDATE task_implementation_states SET status='fixing',updated_at=? WHERE id=?", (now, state["id"]))
+            conn.execute("UPDATE workflows SET stage=?,status=?,updated_at=? WHERE id=?",
+                (Stage.TASK_EXECUTION.value, WorkflowStatus.FIXING.value, now, workflow_id))
+            self._event_unlocked(conn, workflow_id, "fix.attempt.created", stage=Stage.TASK_EXECUTION,
+                execution_id=execution_id, payload={"attempt_id": attempt_id, "lease_id": lease_id,
+                    "source_review_attempt_id": source_review_attempt_id, "review_cycle": source["review_cycle"],
+                    "max_review_cycles": max_review_cycles, "finding_ids": [row["finding_id"] for row in source_rows]})
+        return {"attempt_id": attempt_id, "lease_id": lease_id, "execution_id": execution_id,
+                "operation_id": operation_id, "created": True}
+
+    def project_review_cycle_limit(self, workflow_id: str, *, task_contract_id: str,
+                                   task_contract_sha256: str, source_review_attempt_id: str,
+                                   review_cycle: int, max_review_cycles: int) -> None:
+        """Make the terminal, at-limit CHANGES_REQUESTED round a human stop.
+
+        This is a projection only: it retains the immutable review and creates
+        neither a FIX intent nor a retry path.
+        """
+        with self._transaction() as conn:
+            authority = self.load_approved_v2_plan_authority(workflow_id)
+            source = self.load_fix_source_review_evidence(workflow_id, task_contract_id, task_contract_sha256)
+            if (review_cycle < max_review_cycles or source["attempt_id"] != source_review_attempt_id
+                    or source["review_cycle"] != review_cycle):
+                raise ConflictFailure("review-cycle limit authority is stale or inconsistent")
+            state = conn.execute("""SELECT * FROM task_implementation_states WHERE workflow_id=?
+                AND plan_artifact_id=? AND task_contract_id=? AND task_contract_sha256=?""",
+                (workflow_id, authority.plan_artifact.id, task_contract_id, task_contract_sha256)).fetchone()
+            workflow = conn.execute("SELECT * FROM workflows WHERE id=?", (workflow_id,)).fetchone()
+            if (state is None or workflow is None or state["status"] != "changes_requested"
+                    or workflow["stage"] != Stage.TASK_EXECUTION.value
+                    or workflow["status"] != WorkflowStatus.TASK_CHANGES_REQUESTED.value):
+                raise ConflictFailure("review-cycle limit requires current changes_requested authority")
+            now = _now()
+            conn.execute("UPDATE task_implementation_states SET status='human_attention',updated_at=? WHERE id=?",
+                         (now, state["id"]))
+            conn.execute("UPDATE workflows SET status=?,updated_at=? WHERE id=?",
+                         (WorkflowStatus.HUMAN_ATTENTION.value, now, workflow_id))
+            self._event_unlocked(conn, workflow_id, "review.limit_reached", stage=Stage.TASK_EXECUTION,
+                payload={"source_review_attempt_id": source_review_attempt_id, "review_cycle": review_cycle,
+                    "max_review_cycles": max_review_cycles})
+
+    def update_fix_baseline(self, attempt_id: str, lease_id: str, baseline: Mapping[str, Any]) -> None:
+        """Bind the accepted pre-spawn protected-control evidence to one FIX."""
+        with self._transaction() as conn:
+            result = conn.execute("""UPDATE fix_attempts SET baseline_repository_json=?,updated_at=?
+                WHERE id=? AND lease_id=? AND status='fixing'""",
+                (_json(dict(baseline)), _now(), attempt_id, lease_id))
+            if result.rowcount != 1:
+                raise ConflictFailure("FIX baseline ownership mismatch")
+
+    def record_fix_provider_started(self, attempt_id: str, lease_id: str,
+                                    evidence: Mapping[str, Any]) -> None:
+        """Persist only runtime-observed child identity for the active FIX."""
+        with self._transaction() as conn:
+            row = conn.execute("SELECT execution_id FROM fix_attempts WHERE id=? AND lease_id=? AND status='fixing'",
+                               (attempt_id, lease_id)).fetchone()
+            if row is None:
+                raise ConflictFailure("FIX attempt/lease ownership mismatch")
+            pid, group, start, session = (evidence.get("pid"), evidence.get("process_group"),
+                                          evidence.get("process_start"), evidence.get("process_session"))
+            pid = pid if type(pid) is int and pid > 0 else None
+            group = group if type(group) is int and group > 0 else None
+            session = session if type(session) is int and session > 0 else None
+            start = start if isinstance(start, str) and start else None
+            now = _now()
+            changed = conn.execute("""UPDATE workspace_operation_leases
+                SET child_pid=?,child_process_start=?,child_process_group=?,child_process_session=?,updated_at=?
+                WHERE lease_id=? AND attempt_id=? AND operation_kind='fix'""",
+                (pid, start, group, session, now, lease_id, attempt_id))
+            if changed.rowcount != 1:
+                raise ConflictFailure("FIX attempt lease is not active")
+            conn.execute("UPDATE executions SET lifecycle='running',updated_at=? WHERE id=?", (now, row["execution_id"]))
+
+    def finish_fix_attempt(self, attempt_id: str, lease_id: str, *, result_payload: Mapping[str, Any],
+                           result_sha256: str, final: Mapping[str, Any], provider: str,
+                           provider_session_id: str | None, provider_execution_id: str | None) -> None:
+        """Record only a normal, proven completed FIX; retain its lease for Slice 6.5.
+
+        Abnormal, interrupted, unchanged, and ownership-uncertain outcomes are
+        deliberately not classified here.  Slice 6.4 owns their transitions.
+        """
+        self._require_sha256(result_sha256, "FIX provider result sha256")
+        if not isinstance(result_payload, Mapping) or not isinstance(final, Mapping) or not provider:
+            raise ValidationFailure("FIX completion evidence is incomplete")
+        with self._transaction() as conn:
+            attempt = conn.execute("SELECT * FROM fix_attempts WHERE id=? AND lease_id=? AND status='fixing'",
+                                   (attempt_id, lease_id)).fetchone()
+            if attempt is None:
+                raise ConflictFailure("FIX completion requires an active attempt")
+            lease = conn.execute("""SELECT * FROM workspace_operation_leases WHERE lease_id=? AND attempt_id=?
+                AND operation_id=? AND operation_kind='fix'""",
+                (lease_id, attempt_id, attempt["operation_id"])).fetchone()
+            operation = conn.execute("SELECT * FROM operations WHERE id=?", (attempt["operation_id"],)).fetchone()
+            execution = conn.execute("SELECT * FROM executions WHERE id=?", (attempt["execution_id"],)).fetchone()
+            workflow = conn.execute("SELECT * FROM workflows WHERE id=?", (attempt["workflow_id"],)).fetchone()
+            state = conn.execute("""SELECT * FROM task_implementation_states WHERE workflow_id=?
+                AND plan_artifact_id=? AND task_contract_id=?""",
+                (attempt["workflow_id"], attempt["plan_artifact_id"], attempt["task_contract_id"])).fetchone()
+            exact = (lease is not None and operation is not None and execution is not None and workflow is not None
+                and state is not None and operation["kind"] == "fix" and operation["status"] == "pending"
+                and operation["related_record_id"] == execution["id"] and execution["role"] == Role.DEVELOPER.value
+                and execution["work_kind"] == WorkKind.FIX.value and execution["request_hash"] == attempt["request_hash"]
+                and execution["lifecycle"] == "running"
+                and workflow["stage"] == Stage.TASK_EXECUTION.value and workflow["status"] == WorkflowStatus.FIXING.value
+                and state["status"] == "fixing"
+                and all(lease[field] is not None for field in ("child_pid", "child_process_start",
+                    "child_process_group", "child_process_session"))
+                and isinstance(provider_session_id, str) and bool(provider_session_id)
+                and isinstance(provider_execution_id, str) and bool(provider_execution_id))
+            if not exact:
+                raise ConflictFailure("FIX completion durable authority is inconsistent")
+            now = _now()
+            conn.execute("""UPDATE fix_attempts SET status='completed',outcome='completed',provider_result_sha256=?,
+                final_repository_json=?,finished_at=?,updated_at=? WHERE id=?""",
+                (result_sha256, _json(dict(final)), now, now, attempt_id))
+            conn.execute("""UPDATE executions SET lifecycle='completed',terminal_result=?,provider_execution_id=?,
+                updated_at=? WHERE id=?""", (_json(dict(result_payload)), provider_execution_id, now, execution["id"]))
+            conn.execute("UPDATE operations SET status='completed',updated_at=? WHERE id=?", (now, operation["id"]))
+            if provider_session_id:
+                conn.execute("UPDATE sessions SET provider_session_id=?,updated_at=? WHERE id=?",
+                             (provider_session_id, now, execution["session_id"]))
+            self._event_unlocked(conn, attempt["workflow_id"], "fix.attempt.completed", stage=Stage.TASK_EXECUTION,
+                execution_id=execution["id"], payload={"attempt_id": attempt_id,
+                    "provider_result_sha256": result_sha256, "repository_fingerprint": final.get("fingerprint")})
+
+    def project_completed_fix_verification_attention(self, attempt_id: str, lease_id: str, *, detail: str) -> None:
+        """Stop a completed FIX whose deterministic VERIFY cannot safely start.
+
+        The completed provider evidence stays immutable and advisory.  This is
+        only the conservative MDS #6 boundary projection; it cannot restore
+        FIX authority or manufacture verification evidence.
+        """
+        with self._transaction() as conn:
+            attempt = conn.execute("SELECT * FROM fix_attempts WHERE id=? AND lease_id=? AND status='completed' AND outcome='completed'",
+                (attempt_id, lease_id)).fetchone()
+            lease = conn.execute("SELECT * FROM workspace_operation_leases WHERE lease_id=? AND attempt_id=? AND operation_id=? AND operation_kind='fix'",
+                (lease_id, attempt_id, attempt["operation_id"] if attempt else None)).fetchone()
+            if attempt is None or lease is None:
+                raise ConflictFailure("post-FIX verification stop requires exact completed FIX ownership")
+            state = conn.execute("""SELECT * FROM task_implementation_states WHERE workflow_id=? AND plan_artifact_id=?
+                AND task_contract_id=? AND status='fixing'""", (attempt["workflow_id"], attempt["plan_artifact_id"],
+                attempt["task_contract_id"])).fetchone()
+            workflow = conn.execute("SELECT * FROM workflows WHERE id=?", (attempt["workflow_id"],)).fetchone()
+            if state is None or workflow is None or workflow["stage"] != Stage.TASK_EXECUTION.value or workflow["status"] != WorkflowStatus.FIXING.value:
+                raise ConflictFailure("post-FIX verification stop has inconsistent lifecycle authority")
+            now = _now()
+            conn.execute("UPDATE task_implementation_states SET status='human_attention',updated_at=? WHERE id=?", (now, state["id"]))
+            conn.execute("UPDATE workflows SET status=?,updated_at=? WHERE id=?", (WorkflowStatus.HUMAN_ATTENTION.value, now, attempt["workflow_id"]))
+            released = conn.execute("""DELETE FROM workspace_operation_leases WHERE repository_key=? AND lease_id=? AND attempt_id=?
+                AND operation_id=? AND workflow_id=? AND operation_kind='fix'""", (lease["repository_key"], lease_id,
+                attempt_id, attempt["operation_id"], attempt["workflow_id"]))
+            if released.rowcount != 1:
+                raise PersistenceFailure("post-FIX verification stop could not release exact FIX lease")
+            self._event_unlocked(conn, attempt["workflow_id"], "fix.verification.blocked", stage=Stage.TASK_EXECUTION,
+                execution_id=attempt["execution_id"], payload={"fix_attempt_id": attempt_id,
+                    "classification": "verification_preflight_blocked", "detail": detail})
+
+    def recover_fix_attempt(self, attempt_id: str, lease_id: str, *, classification: str,
+                            detail: str, evidence: Mapping[str, Any], release_lease: bool) -> str:
+        """Atomically make one abnormal FIX observation durable.
+
+        This is intentionally a terminal recovery boundary: it never makes a
+        completed Fix eligible for VERIFY and it never restores changes_requested
+        as permission for another Fix.
+        """
+        if not classification or not detail or not isinstance(evidence, Mapping):
+            raise ValidationFailure("FIX recovery evidence is incomplete")
+        with self._transaction() as conn:
+            attempt = conn.execute("SELECT * FROM fix_attempts WHERE id=? AND lease_id=?",
+                                   (attempt_id, lease_id)).fetchone()
+            lease = conn.execute("SELECT * FROM workspace_operation_leases WHERE lease_id=? AND attempt_id=? "
+                                "AND operation_kind='fix'", (lease_id, attempt_id)).fetchone()
+            if attempt is None or lease is None:
+                raise ConflictFailure("FIX recovery attempt/lease ownership mismatch")
+            operation = conn.execute("SELECT * FROM operations WHERE id=?", (attempt["operation_id"],)).fetchone()
+            execution = conn.execute("SELECT * FROM executions WHERE id=?", (attempt["execution_id"],)).fetchone()
+            workflow = conn.execute("SELECT * FROM workflows WHERE id=?", (attempt["workflow_id"],)).fetchone()
+            state = conn.execute("SELECT * FROM task_implementation_states WHERE workflow_id=? AND plan_artifact_id=? "
+                                 "AND task_contract_id=?", (attempt["workflow_id"], attempt["plan_artifact_id"],
+                                                             attempt["task_contract_id"])).fetchone()
+            exact = (operation is not None and execution is not None and workflow is not None and state is not None
+                     and lease["operation_id"] == attempt["operation_id"]
+                     and operation["related_record_id"] == attempt["execution_id"]
+                     and operation["kind"] == "fix" and execution["work_kind"] == WorkKind.FIX.value
+                     and workflow["stage"] == Stage.TASK_EXECUTION.value)
+            if not exact:
+                release_lease = False
+                classification = "corrupt_linkage"
+                detail = "FIX recovery found corrupt durable linkage"
+            if attempt["status"] in {"abnormal", "unknown"}:
+                return attempt["status"]
+            if attempt["status"] != "fixing":
+                raise ConflictFailure("FIX recovery requires an unresolved FIX attempt")
+            now = _now()
+            status = "abnormal" if release_lease else "unknown"
+            outcome = "interrupted_unchanged" if release_lease else "unknown"
+            lifecycle = "failed" if release_lease else "unknown"
+            operation_status = "failed" if release_lease else "unknown"
+            payload = {"classification": classification, "detail": detail, "evidence": dict(evidence),
+                       "lease_retained": not release_lease}
+            conn.execute("UPDATE fix_attempts SET status=?,outcome=?,abnormal_evidence_json=?,finished_at=?,updated_at=? "
+                         "WHERE id=?", (status, outcome, _json(payload), now, now, attempt_id))
+            if execution is not None:
+                conn.execute("UPDATE executions SET lifecycle=?,failure_classification=?,failure_detail=?,updated_at=? WHERE id=?",
+                             (lifecycle, classification, detail, now, attempt["execution_id"]))
+            if operation is not None:
+                conn.execute("UPDATE operations SET status=?,updated_at=? WHERE id=?",
+                             (operation_status, now, attempt["operation_id"]))
+            # Human attention is sticky at this MDS boundary whether the lease
+            # was proven releasable or conservatively retained.
+            if state is not None:
+                conn.execute("UPDATE task_implementation_states SET status='human_attention',updated_at=? WHERE id=?",
+                             (now, state["id"]))
+            if workflow is not None:
+                conn.execute("UPDATE workflows SET status=?,updated_at=? WHERE id=?",
+                             (WorkflowStatus.HUMAN_ATTENTION.value, now, attempt["workflow_id"]))
+            if release_lease:
+                deleted = conn.execute("DELETE FROM workspace_operation_leases WHERE lease_id=? AND attempt_id=? "
+                                       "AND operation_id=? AND operation_kind='fix'", (lease_id, attempt_id,
+                                                                                         attempt["operation_id"]))
+                if deleted.rowcount != 1:
+                    raise ConflictFailure("FIX recovery lease release was not exact")
+            if workflow is not None:
+                self._event_unlocked(conn, attempt["workflow_id"], "fix.attempt.abnormal", stage=Stage.TASK_EXECUTION,
+                    execution_id=attempt["execution_id"], payload={"attempt_id": attempt_id,
+                        "classification": classification, "lease_retained": not release_lease})
+            return status
+
+    def retain_fix_recovery_unknown(self, attempt_id: str, *, classification: str,
+                                    detail: str, evidence: Mapping[str, Any]) -> str:
+        """Fail closed from a durable FIX attempt when its lease topology is unsafe.
+
+        This deliberately does not require, inspect, or release a lease.  The
+        active attempt is the authority for the unresolved writer boundary;
+        callers use this only after topology reconciliation cannot prove its
+        exact expected lease.  In particular, a foreign lease must remain
+        untouched.
+        """
+        if not classification or not detail or not isinstance(evidence, Mapping):
+            raise ValidationFailure("FIX recovery evidence is incomplete")
+        with self._transaction() as conn:
+            attempt = conn.execute("SELECT * FROM fix_attempts WHERE id=?", (attempt_id,)).fetchone()
+            if attempt is None:
+                raise ConflictFailure("FIX recovery attempt is unavailable")
+            if attempt["status"] in {"abnormal", "unknown"}:
+                return attempt["status"]
+            if attempt["status"] != "fixing":
+                raise ConflictFailure("FIX recovery requires an unresolved FIX attempt")
+            operation = conn.execute("SELECT * FROM operations WHERE id=?", (attempt["operation_id"],)).fetchone()
+            execution = conn.execute("SELECT * FROM executions WHERE id=?", (attempt["execution_id"],)).fetchone()
+            workflow = conn.execute("SELECT * FROM workflows WHERE id=?", (attempt["workflow_id"],)).fetchone()
+            state = conn.execute("SELECT * FROM task_implementation_states WHERE workflow_id=? AND plan_artifact_id=? "
+                                 "AND task_contract_id=?", (attempt["workflow_id"], attempt["plan_artifact_id"],
+                                                             attempt["task_contract_id"])).fetchone()
+            now = _now()
+            payload = {"classification": classification, "detail": detail, "evidence": dict(evidence),
+                       "lease_retained": True}
+            conn.execute("UPDATE fix_attempts SET status='unknown',outcome='unknown',abnormal_evidence_json=?,"
+                         "finished_at=?,updated_at=? WHERE id=?", (_json(payload), now, now, attempt_id))
+            if execution is not None:
+                conn.execute("UPDATE executions SET lifecycle='unknown',failure_classification=?,failure_detail=?,updated_at=? WHERE id=?",
+                             (classification, detail, now, attempt["execution_id"]))
+            if operation is not None:
+                conn.execute("UPDATE operations SET status='unknown',updated_at=? WHERE id=?", (now, attempt["operation_id"]))
+            if state is not None:
+                conn.execute("UPDATE task_implementation_states SET status='human_attention',updated_at=? WHERE id=?",
+                             (now, state["id"]))
+            if workflow is not None:
+                conn.execute("UPDATE workflows SET status=?,updated_at=? WHERE id=?",
+                             (WorkflowStatus.HUMAN_ATTENTION.value, now, attempt["workflow_id"]))
+                self._event_unlocked(conn, attempt["workflow_id"], "fix.attempt.abnormal", stage=Stage.TASK_EXECUTION,
+                    execution_id=attempt["execution_id"], payload={"attempt_id": attempt_id,
+                        "classification": classification, "lease_retained": True})
+            return "unknown"
 
     def create_review_intent(self, workflow_id: str, *, task_contract_id: str,
                              task_contract_sha256: str, authority_sha256: str,
@@ -1523,8 +2116,11 @@ class WorkflowStore:
                 raise ConflictFailure("review Task Contract no longer matches approved Plan")
             now, attempt_id, execution_id, operation_id = (
                 _now(), str(uuid.uuid4()), str(uuid.uuid4()), str(uuid.uuid4()))
-            sequence = int(conn.execute("SELECT COALESCE(MAX(sequence), 0)+1 FROM review_attempts WHERE workflow_id=? AND verification_attempt_id=?",
-                (workflow_id, evidence["attempt_id"])).fetchone()[0])
+            # A review cycle is task-scoped, not verification-attempt scoped:
+            # re-verification after a completed FIX starts the next immutable
+            # review round rather than resetting to cycle one.
+            sequence = int(conn.execute("SELECT COALESCE(MAX(sequence), 0)+1 FROM review_attempts WHERE workflow_id=? AND task_contract_id=?",
+                (workflow_id, task_contract_id)).fetchone()[0])
             session = self._create_session_unlocked(conn, workflow_id, "independent-review", Role.REVIEWER,
                                                     work_kind=WorkKind.REVIEW)
             conn.execute("""INSERT INTO executions
@@ -1825,6 +2421,39 @@ class WorkflowStore:
         return self._connection.execute("SELECT 1 FROM review_attempts WHERE workflow_id=? AND status!='terminal'",
             (workflow_id,)).fetchone() is not None
 
+    def list_fix_attempt_projections(self, workflow_id: str, *, limit: int = 20,
+                                     findings_limit: int = 100) -> list[dict[str, Any]]:
+        """Return bounded remediation evidence without provider/process details."""
+        if limit < 1 or findings_limit < 1:
+            raise ValidationFailure("fix projection limits must be positive")
+        rows = self._connection.execute("""SELECT a.id,a.task_contract_id,a.source_review_attempt_id,
+            a.source_reviewer_result_sha256,a.remediation_cycle_ordinal,a.fix_attempt_ordinal,
+            a.max_review_cycles,a.operation_id,a.status,a.outcome,a.provider_result_sha256,
+            a.created_at,a.finished_at,v.id AS verification_attempt_id,v.status AS verification_status,
+            v.classification AS verification_classification FROM fix_attempts a
+            LEFT JOIN verification_attempts v ON v.workflow_id=a.workflow_id AND v.producer_operation_id=a.operation_id
+            WHERE a.workflow_id=? ORDER BY a.created_at DESC LIMIT ?""", (workflow_id, limit)).fetchall()
+        projections: list[dict[str, Any]] = []
+        for row in rows:
+            bindings = self._connection.execute("""SELECT source_ordinal,finding_id,severity
+                FROM fix_attempt_finding_bindings WHERE fix_attempt_id=? ORDER BY source_ordinal LIMIT ?""",
+                (row["id"], findings_limit)).fetchall()
+            item = dict(row)
+            item["source_finding_ids"] = [binding["finding_id"] for binding in bindings]
+            item["source_finding_count"] = self._connection.execute(
+                "SELECT COUNT(*) FROM fix_attempt_finding_bindings WHERE fix_attempt_id=?", (row["id"],)
+            ).fetchone()[0]
+            item["source_findings_truncated"] = len(bindings) == findings_limit
+            item["blocking_finding_ids"] = [binding["finding_id"] for binding in bindings
+                                             if binding["severity"] == "blocking"]
+            projections.append(item)
+        return projections
+
+    def has_retained_fix_attempt(self, workflow_id: str) -> bool:
+        """Whether recovery, never a new FIX dispatch, owns this workflow."""
+        return self._connection.execute("SELECT 1 FROM fix_attempts WHERE workflow_id=? AND status IN ('fixing','unknown')",
+            (workflow_id,)).fetchone() is not None
+
     def retry_safe_failed_task_ids(self, workflow_id: str, plan_artifact_id: str) -> frozenset[str]:
         rows = self._connection.execute("""SELECT a.task_contract_id FROM implementation_attempts a
             WHERE a.workflow_id=? AND a.plan_artifact_id=? AND a.status='failed'
@@ -2099,10 +2728,8 @@ class WorkflowStore:
             if existing is not None and (existing["status"] != "terminal" or existing["classification"] != "interrupted_unchanged"):
                 return {"attempt_id": existing["id"], "lease_id": existing["lease_id"],
                         "execution_id": existing["execution_id"], "operation_id": existing["operation_id"]}
-            if conn.execute("SELECT 1 FROM workspace_operation_leases WHERE repository_key=?", (repository_key,)).fetchone():
-                raise ConflictFailure("target workspace already has an unresolved operation lease")
             authority = self.load_approved_v2_plan_authority(workflow_id, allow_human_attention=True)
-            producer = self.load_successful_implementation_producer(
+            producer = self.load_successful_producer(
                 workflow_id, producer_operation_id, task_contract_id, task_contract_sha256)
             if (producer.feature_artifact_id != authority.feature_contract_artifact.id
                     or producer.feature_sha256 != authority.feature_contract_artifact.sha256
@@ -2110,6 +2737,30 @@ class WorkflowStore:
                     or producer.plan_sha256 != authority.plan_artifact.sha256
                     or producer.approval_id != authority.approval.id):
                 raise ConflictFailure("verification producer no longer matches approved authority")
+            producer_kind = conn.execute("SELECT kind FROM operations WHERE id=?", (producer_operation_id,)).fetchone()
+            if producer_kind is None:
+                raise ConflictFailure("verification producer operation is missing")
+            handoff_fix = None
+            if producer_kind["kind"] == "fix":
+                handoff_fix = conn.execute("""SELECT a.*,l.repository_key,l.canonical_root,l.operation_id AS lease_operation_id
+                    FROM fix_attempts a JOIN workspace_operation_leases l ON l.lease_id=a.lease_id
+                    WHERE a.operation_id=? AND a.workflow_id=? AND a.status='completed' AND a.outcome='completed'
+                      AND l.operation_kind='fix'""", (producer_operation_id, workflow_id)).fetchone()
+                state = conn.execute("""SELECT status FROM task_implementation_states WHERE workflow_id=?
+                    AND plan_artifact_id=? AND task_contract_id=?""",
+                    (workflow_id, authority.plan_artifact.id, task_contract_id)).fetchone()
+                workflow = conn.execute("SELECT stage,status FROM workflows WHERE id=?", (workflow_id,)).fetchone()
+                if (handoff_fix is None or handoff_fix["repository_key"] != repository_key
+                        or handoff_fix["canonical_root"] != canonical_root
+                        or handoff_fix["lease_operation_id"] != producer_operation_id
+                        or state is None or state["status"] != "fixing" or workflow is None
+                        or workflow["stage"] != Stage.TASK_EXECUTION.value
+                        or workflow["status"] != WorkflowStatus.FIXING.value):
+                    raise ConflictFailure("post-FIX verification requires an exact completed FIX handoff")
+            elif producer_kind["kind"] != "implementation":
+                raise ConflictFailure("verification producer kind is unsupported")
+            elif conn.execute("SELECT 1 FROM workspace_operation_leases WHERE repository_key=?", (repository_key,)).fetchone():
+                raise ConflictFailure("target workspace already has an unresolved operation lease")
             now, attempt_id, lease_id, execution_id, operation_id = (
                 _now(), str(uuid.uuid4()), str(uuid.uuid4()), str(uuid.uuid4()), str(uuid.uuid4()))
             sequence = int(conn.execute("""SELECT COALESCE(MAX(sequence), 0) + 1 FROM verification_attempts
@@ -2131,22 +2782,34 @@ class WorkflowStore:
                  producer.feature_artifact_id, producer.feature_sha256, producer.plan_artifact_id, producer.plan_sha256,
                  producer.plan_revision, producer.plan_id, producer.approval_id, task_contract_id, task_contract_sha256,
                  authority_sha256, request_hash, _json(bound_manifest), _json(baseline), sequence, now, now, now))
+            if handoff_fix is not None:
+                released = conn.execute("""DELETE FROM workspace_operation_leases WHERE repository_key=?
+                    AND lease_id=? AND attempt_id=? AND operation_id=? AND workflow_id=? AND operation_kind='fix'""",
+                    (repository_key, handoff_fix["lease_id"], handoff_fix["id"], producer_operation_id, workflow_id))
+                if released.rowcount != 1:
+                    raise ConflictFailure("post-FIX verification lease handoff lost exact ownership")
             conn.execute("""INSERT INTO workspace_operation_leases
                 (repository_key,lease_id,operation_kind,attempt_id,operation_id,workflow_id,canonical_root,
                  owner_instance_id,owner_pid,owner_host_id,owner_boot_id,acquired_at,updated_at)
                 VALUES (?,?,'verification',?,?,?,?,?,?,?,?,?,?)""",
                 (repository_key, lease_id, attempt_id, operation_id, workflow_id, canonical_root,
                  owner_instance_id, owner_pid, owner_host_id, owner_boot_id, now, now))
+            predecessor_state = "fixing" if handoff_fix is not None else "implementation_completed"
             state_update = conn.execute("""UPDATE task_implementation_states SET status='verifying',updated_at=?
-                WHERE workflow_id=? AND plan_artifact_id=? AND task_contract_id=? AND status='implementation_completed'""",
-                (now, workflow_id, authority.plan_artifact.id, task_contract_id))
+                WHERE workflow_id=? AND plan_artifact_id=? AND task_contract_id=? AND status=?""",
+                (now, workflow_id, authority.plan_artifact.id, task_contract_id, predecessor_state))
             if state_update.rowcount != 1:
-                raise ConflictFailure("verification requires completed implementation task state")
+                raise ConflictFailure("verification requires its exact completed producer task state")
             conn.execute("UPDATE workflows SET stage=?,status=?,updated_at=? WHERE id=?",
                 (Stage.TASK_EXECUTION.value, WorkflowStatus.VERIFYING.value, now, workflow_id))
             self._event_unlocked(conn, workflow_id, "verification.attempt.created", stage=Stage.TASK_EXECUTION,
                 execution_id=execution_id, payload={"attempt_id": attempt_id, "lease_id": lease_id,
                                                      "producer_operation_id": producer_operation_id})
+            if handoff_fix is not None:
+                self._event_unlocked(conn, workflow_id, "fix.verification.started", stage=Stage.TASK_EXECUTION,
+                    execution_id=execution_id, payload={"fix_attempt_id": handoff_fix["id"],
+                        "verification_attempt_id": attempt_id, "producer_operation_id": producer_operation_id,
+                        "source_review_attempt_id": handoff_fix["source_review_attempt_id"]})
         return {"attempt_id": attempt_id, "lease_id": lease_id, "execution_id": execution_id, "operation_id": operation_id}
 
     @staticmethod
@@ -2666,7 +3329,7 @@ class WorkflowStore:
                 workflow_id, allow_human_attention=True)
             task = next(item for item in authority.plan.tasks
                 if item.id == attempt["task_contract_id"])
-            producer = self.load_successful_implementation_producer(
+            producer = self.load_successful_producer(
                 workflow_id, attempt["producer_operation_id"],
                 attempt["task_contract_id"], attempt["task_contract_sha256"])
         except (DomainFailure, StopIteration) as exc:
@@ -2708,9 +3371,14 @@ class WorkflowStore:
         recovery_event: bool = False,
     ) -> None:
         now = _now()
+        producer_kind = conn.execute("SELECT kind FROM operations WHERE id=?",
+            (attempt["producer_operation_id"],)).fetchone()
+        post_fix = producer_kind is not None and producer_kind["kind"] == "fix"
         task_status = ("verified" if outcome == "verified" else
+            "human_attention" if post_fix else
             "verification_failed" if outcome == "verification_failed" else "implementation_completed")
         workflow_status = (WorkflowStatus.TASK_VERIFIED.value if outcome == "verified" else
+            WorkflowStatus.HUMAN_ATTENTION.value if post_fix else
             WorkflowStatus.VERIFICATION_FAILED.value if outcome == "verification_failed"
             else WorkflowStatus.HUMAN_ATTENTION.value)
         execution_lifecycle = ("completed" if outcome == "verified" else

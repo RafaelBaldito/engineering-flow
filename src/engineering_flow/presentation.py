@@ -267,12 +267,35 @@ def render_review_summary(console: Console, document: Mapping[str, Any], plan: M
     elif status == "task_review_passed":
         console.print(Text("REVIEW_PASSED: this is not task acceptance or dependency release.", style="green"))
     elif status == "task_changes_requested":
-        console.print(Text("CHANGES_REQUESTED: no FIX or finding disposition was started.", style="yellow"))
+        console.print(Text("CHANGES_REQUESTED: a later explicit resume may start one bounded FIX.", style="yellow"))
+    elif status == "fixing":
+        console.print(Text("FIXING: a later resume performs recovery only; it never redispatches FIX.", style="yellow"))
     elif status == "review_failed":
         console.print(Text("REVIEW_FAILED: no retry, FIX, or successor selection was started.", style="red"))
     elif status == "human_attention":
-        console.print(Text("HUMAN_ATTENTION: recovery performed no Reviewer dispatch.", style="bold red"))
-    console.print(Text("MDS #5 performs no FIX, acceptance, dependency release, successor selection, final review, commit, push, or PR.", style="dim"))
+        console.print(Text("HUMAN_ATTENTION: recovery performed no Fixer, verifier, or Reviewer dispatch.", style="bold red"))
+    console.print(Text("MDS #6 performs no acceptance, dependency release, successor selection, final review, commit, push, or PR.", style="dim"))
+
+
+def render_fix_summary(console: Console, document: Mapping[str, Any], plan: Mapping[str, Any]) -> None:
+    implementation = plan.get("implementation")
+    fix = implementation.get("fix") if isinstance(implementation, Mapping) else None
+    latest = fix.get("latest_attempt") if isinstance(fix, Mapping) else None
+    if not isinstance(latest, Mapping):
+        return
+    console.print()
+    _heading(console, "FIX")
+    outcome = (latest.get("verification_classification") or latest.get("verification_status")
+               or latest.get("outcome") or latest.get("status") or "unknown")
+    _rows(console, [
+        ("Source review", latest.get("source_review_attempt_id", "unknown"), None),
+        ("Cycle", f"{latest.get('remediation_cycle_ordinal', '?')} / {latest.get('max_review_cycles', '?')}", None),
+        ("Fix attempt", latest.get("id", "unknown"), None),
+        ("Result", str(outcome).upper(), _semantic_style(document.get("status"))),
+    ])
+    finding_ids = latest.get("source_finding_ids")
+    if isinstance(finding_ids, list):
+        console.print(Text("Source findings: " + ", ".join(str(item) for item in finding_ids), style="dim"))
 
 
 def _render_legacy_summary(console: Console, document: Mapping[str, Any]) -> None:
@@ -321,6 +344,7 @@ def render_human(console: Console, document: Mapping[str, Any]) -> None:
         render_plan_summary(console, document, plan)
         render_implementation_summary(console, document, plan)
         render_review_summary(console, document, plan)
+        render_fix_summary(console, document, plan)
     elif not isinstance(intake, Mapping):
         _render_legacy_summary(console, document)
 
